@@ -5,6 +5,12 @@
 [functions]
   node_bundler = "esbuild"
 
+[[redirects]]
+  from = "/"
+  to = "/knowledge.html"
+  status = 200
+  force = true
+
 [[headers]]
   for = "/api/*"
   [headers.values]
