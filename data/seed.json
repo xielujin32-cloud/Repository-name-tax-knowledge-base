@@ -1,0 +1,124 @@
+{
+  "sources": [
+    {
+      "id": "source-chinatax",
+      "name": "国家税务总局政策法规库",
+      "authority": "国家税务总局",
+      "url": "https://fgk.chinatax.gov.cn/zcfgk/index.html",
+      "collectionUrl": "https://fgk.chinatax.gov.cn/zcfgk/index.html",
+      "collector": "chinatax-library",
+      "kind": "政策法规库",
+      "enabled": true,
+      "scanFrequency": "daily",
+      "lastScannedAt": null
+    },
+    {
+      "id": "source-mof",
+      "name": "财政部",
+      "authority": "财政部",
+      "url": "https://www.mof.gov.cn/",
+      "kind": "中央部门网站",
+      "enabled": true,
+      "scanFrequency": "daily",
+      "lastScannedAt": null
+    },
+    {
+      "id": "source-gov",
+      "name": "中国政府网政策",
+      "authority": "国务院",
+      "url": "https://www.gov.cn/zhengce/",
+      "collector": "gov-policy-library",
+      "collectionUrl": "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json",
+      "kind": "中央政府网站",
+      "enabled": true,
+      "scanFrequency": "daily",
+      "lastScannedAt": null
+    },
+    {
+      "id": "source-npc",
+      "name": "中国人大网",
+      "authority": "全国人民代表大会常务委员会",
+      "url": "https://www.npc.gov.cn/",
+      "collector": "npc-law-library",
+      "kind": "法律发布网站",
+      "enabled": true,
+      "scanFrequency": "daily",
+      "lastScannedAt": null
+    }
+  ],
+  "documents": [
+    {
+      "id": "doc-vat-law-2024",
+      "title": "中华人民共和国增值税法",
+      "documentNumber": "中华人民共和国主席令第四十一号",
+      "authority": "全国人民代表大会常务委员会",
+      "sourceId": "source-npc",
+      "officialUrl": "https://www.npc.gov.cn/npc/c2/c30834/202412/t20241225_442038.html",
+      "publishedAt": "2024-12-25",
+      "effectiveAt": "2026-01-01",
+      "status": "current",
+      "taxTypes": ["增值税"],
+      "summary": "规范增值税征收和缴纳的法律。",
+      "contentHash": "seed-vat-law-20241225",
+      "relations": [],
+      "sections": [
+        {
+          "id": "vat-1",
+          "label": "第一条",
+          "text": "为了健全有利于高质量发展的增值税制度，规范增值税的征收和缴纳，保护纳税人的合法权益，制定本法。"
+        },
+        {
+          "id": "vat-3",
+          "label": "第三条",
+          "text": "在中华人民共和国境内销售货物、服务、无形资产、不动产以及进口货物的单位和个人，为增值税的纳税人，应当依照本法规定缴纳增值税。"
+        },
+        {
+          "id": "vat-4",
+          "label": "第四条",
+          "text": "在境内发生应税交易的具体情形，按照销售货物、不动产、金融商品以及服务和无形资产的规则确定。"
+        }
+      ],
+      "createdAt": "2026-07-29T00:00:00.000Z",
+      "publishedToMembersAt": "2026-07-29T00:00:00.000Z"
+    },
+    {
+      "id": "doc-tax-collection-law",
+      "title": "中华人民共和国税收征收管理法",
+      "documentNumber": "主席令第四十九号",
+      "authority": "全国人民代表大会常务委员会",
+      "sourceId": "source-chinatax",
+      "officialUrl": "https://fgk.chinatax.gov.cn/zcfgk/c100009/c5195081/content.html",
+      "publishedAt": "2015-04-24",
+      "effectiveAt": "2015-04-24",
+      "status": "current",
+      "taxTypes": ["征收管理"],
+      "summary": "规范税收征收管理、保护纳税人合法权益的法律。",
+      "contentHash": "seed-tax-collection-law-20150424",
+      "relations": [],
+      "sections": [
+        {
+          "id": "collection-1",
+          "label": "第一条",
+          "text": "为了加强税收征收管理，规范税收征收和缴纳行为，保障国家税收收入，保护纳税人的合法权益，促进经济和社会发展，制定本法。"
+        },
+        {
+          "id": "collection-2",
+          "label": "第二条",
+          "text": "凡依法由税务机关征收的各种税收的征收管理，均适用本法。"
+        },
+        {
+          "id": "collection-3",
+          "label": "第三条",
+          "text": "税收的开征、停征以及减税、免税、退税、补税，依照法律的规定执行；法律授权国务院规定的，依照国务院制定的行政法规的规定执行。"
+        }
+      ],
+      "createdAt": "2026-07-29T00:00:00.000Z",
+      "publishedToMembersAt": "2026-07-29T00:00:00.000Z"
+    }
+  ],
+  "candidates": [],
+  "collections": [],
+  "bulkImports": [],
+  "audit": [],
+  "nextId": 1
+}

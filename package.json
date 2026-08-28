@@ -1,0 +1,14 @@
+{
+  "name": "tax-policy-knowledge-base",
+  "version": "0.1.0",
+  "private": true,
+  "description": "全国税法政策知识库首期 MVP",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test --test-isolation=none"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^11.0.1"
+  }
+}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>工商与税务表格模板｜财务工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="form-templates-standalone">
+    <main class="form-templates-page">
+      <a class="calculator-back" href="/">← 返回财务工作台</a>
+      <section class="form-templates-banner">
+        <p>财务工作台 · 团队资料沉淀</p>
+        <h1>工商与税务表格模板</h1>
+        <span>上传并整理常用的工商、税务业务表格，在需要时直接下载使用。</span>
+      </section>
+      <div class="form-templates-layout">
+        <section class="template-upload-panel">
+          <div class="accounting-heading"><h2>导入表格模板</h2><p>支持 Word、Excel、PDF、图片及其他常见业务文件。</p></div>
+          <form id="business-template-form" class="business-template-form">
+            <label>业务分类 *<select name="category" id="business-template-category" required><option value="industry">工商业务</option><option value="tax">税务业务</option></select></label>
+            <label id="business-template-subcategory-row">税务模板分类 *<select name="taxSubcategory" id="business-template-subcategory"><option value="importExport">进出口业务</option><option value="compliance">税务合规</option><option value="financialStatements">财务报表</option><option value="other">其他</option></select></label>
+            <label>模板名称 *<input name="title" required placeholder="例如：公司变更登记申请书" /></label>
+            <label class="wide">适用场景 / 填写说明<textarea name="description" placeholder="例如：适用于法定代表人、住所或经营范围变更；提交前请核对当地登记机关要求"></textarea></label>
+            <label class="wide">选择文件 *<input name="file" type="file" required accept=".doc,.docx,.xls,.xlsx,.pdf,.jpg,.jpeg,.png,.zip" /></label>
+            <button class="wide">导入模板文件</button>
+          </form>
+          <p class="local-storage-note">文件保存于当前浏览器的本地资料库。请勿上传含有客户身份信息、银行账号或其他敏感数据的文件。</p>
+        </section>
+        <section class="business-template-list-panel">
+          <div class="business-template-list-heading"><div><h2>已导入模板</h2><p id="business-template-count">0 个模板</p></div><div><select id="business-template-filter"><option value="">全部分类</option><option value="industry">工商业务</option><option value="tax">税务业务</option></select><select id="business-template-subcategory-filter"><option value="">全部税务模板</option><option value="importExport">进出口业务</option><option value="compliance">税务合规</option><option value="financialStatements">财务报表</option><option value="other">其他</option></select><input id="business-template-search" type="search" placeholder="搜索模板名称或说明" /></div></div>
+          <div id="business-template-list" class="business-template-list"></div>
+        </section>
+      </div>
+    </main>
+    <dialog id="business-template-preview" class="template-preview-dialog" aria-labelledby="template-preview-title">
+      <div class="template-preview-head">
+        <div><p>文件预览</p><h2 id="template-preview-title">模板预览</h2></div>
+        <button id="template-preview-close" class="template-preview-close" type="button" aria-label="关闭预览">×</button>
+      </div>
+      <div id="template-preview-body" class="template-preview-body"></div>
+      <div class="template-preview-actions"><button id="template-preview-download" class="template-download" type="button">下载文件</button></div>
+    </dialog>
+    <script type="module" src="/form-templates.js"></script>
+  </body>
+</html>

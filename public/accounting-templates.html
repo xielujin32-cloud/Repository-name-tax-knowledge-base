@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>会计模板库｜财务工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="accounting-standalone">
+    <main class="accounting-page">
+      <a class="calculator-back" href="/">← 返回财务工作台</a>
+      <section class="accounting-banner">
+        <p>财务工作台 · 团队知识沉淀</p>
+        <h1>会计模板库</h1>
+        <span>记录常用业务的会计准则、分录、税务口径和复核说明。</span>
+      </section>
+      <section class="standards-library" aria-labelledby="small-business-standard-title">
+        <div class="standards-heading"><div><p>已导入准则资料</p><h2 id="small-business-standard-title">小企业会计准则</h2><span>会计科目、主要账务处理和财务报表</span></div><b>66 个会计科目</b></div>
+        <p class="standards-source">来源：你提供的《小企业会计准则-会计科目、主要账务处理和财务报表》PDF（85 页）。点击科目可带入下方模板；具体业务处理仍应以准则原文和企业实际情况为准。</p>
+        <div class="standards-tools"><input id="standard-subject-search" type="search" placeholder="搜索科目名称或编号，例如：应收账款、1122" /><span id="standard-subject-count"></span></div>
+        <div id="standard-subject-list" class="standard-subject-list"></div>
+      </section>
+      <div class="accounting-layout">
+        <section class="accounting-editor">
+          <div class="accounting-heading"><h2>新增会计模板</h2><p>标有 * 的内容建议填写完整，方便团队后续检索与复核。</p></div>
+          <form id="accounting-template-form" class="accounting-form">
+            <label class="wide">模板名称 *<input name="title" required placeholder="例如：销售商品并开具增值税发票" /></label>
+            <label>业务分类 *<select name="category" required><option value="">请选择</option><option>收入</option><option>成本与存货</option><option>期间费用</option><option>资产</option><option>负债</option><option>权益</option><option>税费</option><option>其他</option></select></label>
+            <label>适用会计准则 / 制度<input name="standard" placeholder="例如：企业会计准则第14号——收入" /></label>
+            <label class="wide">业务场景说明<textarea name="scenario" placeholder="说明适用条件、关键业务事实或单据要求"></textarea></label>
+            <fieldset class="entry-fieldset wide"><legend>会计分录 *</legend>
+              <label>借方科目<input name="debitAccount" required placeholder="例如：银行存款" /></label>
+              <label>借方说明<input name="debitNote" placeholder="金额或核算说明" /></label>
+              <label>贷方科目<input name="creditAccount" required placeholder="例如：主营业务收入" /></label>
+              <label>贷方说明<input name="creditNote" placeholder="金额或核算说明" /></label>
+            </fieldset>
+            <label class="wide">税务口径 / 依据<input name="taxBasis" placeholder="例如：适用税率、政策文件或需核对事项" /></label>
+            <label class="wide">复核备注<textarea name="notes" placeholder="填写凭证附件、审批要求、常见风险或例外情形"></textarea></label>
+            <button class="wide">保存模板</button>
+          </form>
+          <p class="local-storage-note">数据仅保存在当前浏览器；清理浏览器数据会一并清除。后续可再接入团队云端共享与权限管理。</p>
+        </section>
+        <section class="accounting-list-panel">
+          <div class="accounting-list-heading"><div><h2>已保存模板</h2><p id="template-count">0 个模板</p></div><input id="template-search" type="search" placeholder="搜索名称、科目或依据" /></div>
+          <div id="accounting-template-list" class="accounting-template-list"></div>
+        </section>
+      </div>
+    </main>
+    <script type="module" src="/accounting-templates.js"></script>
+  </body>
+</html>

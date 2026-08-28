@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>税金测算中心｜财务工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      .tax-rate-reference { margin-top:15px; padding-top:14px; border-top:1px solid #cce3f2; }
+      .tax-rate-reference h4 { margin:0 0 10px; color:#1e689f; font-size:13px; }
+      .tax-rate-reference-table { width:100%; border-collapse:collapse; background:#fff; font-size:12px; }
+      .tax-rate-reference-table th,.tax-rate-reference-table td { padding:8px 9px; border:1px solid #cfe1ed; text-align:left; }
+      .tax-rate-reference-table th { color:#27628f; background:#e6f4ff; white-space:nowrap; }
+      .tax-rate-reference-table td:nth-child(1),.tax-rate-reference-table td:nth-child(3),.tax-rate-reference-table td:nth-child(4) { text-align:center; white-space:nowrap; }
+      @media (max-width:740px) { .tax-rate-reference { overflow:auto; }.tax-rate-reference-table { min-width:510px; } }
+    </style>
+  </head>
+  <body class="calculator-standalone">
+    <main class="calculator-page">
+      <a class="calculator-back" href="/">← 返回财务工作台</a>
+      <section class="calculator-page-banner">
+        <p>财务工作台</p>
+        <h1>税金测算中心</h1>
+        <span>选择税种、填写数据，实时查看测算结果与基础口径提示。</span>
+      </section>
+      <section class="tax-tool-shell">
+        <div class="tax-tool-heading">
+          <div><h3>选择测算税种</h3><p>测算仅供内部预算与复核，正式申报以主管税务机关和申报系统为准。</p></div>
+          <button id="tax-tool-reset" type="button" class="tax-reset">重置</button>
+        </div>
+        <div class="tax-tool-tabs" role="tablist" aria-label="测算税种">
+          <button type="button" class="active" data-tax-tool="personal">个人所得税</button>
+          <button type="button" data-tax-tool="vat">增值税及附加</button>
+          <button type="button" data-tax-tool="enterprise">企业所得税</button>
+          <button type="button" data-tax-tool="property">房产税</button>
+          <button type="button" data-tax-tool="business">经营所得税</button>
+          <button type="button" data-tax-tool="burden">税负率</button>
+        </div>
+        <div class="tax-tool-content">
+          <form id="tax-tool-form" class="tax-tool-form" autocomplete="off"><div id="tax-tool-fields" class="tax-tool-fields"></div></form>
+          <aside class="tax-tool-result" aria-live="polite">
+            <div class="tax-result-total"><span id="tax-result-label">预计应纳税额</span><strong id="tax-result-amount">¥0.00</strong></div>
+            <div id="tax-result-lines" class="tax-result-lines"></div>
+            <p id="tax-result-formula" class="tax-result-formula"></p>
+          </aside>
+        </div>
+        <div id="tax-tool-info" class="tax-tool-info"></div>
+      </section>
+    </main>
+    <script type="module" src="/workbench.js"></script>
+  </body>
+</html>

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>我的客户｜财务工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/clients.css" />
+    <style>
+      .clients-layout.list-only { grid-template-columns:1fr; }
+      #client-vault-gate { display:none !important; }
+      .client-preview { margin-top:13px; border-top:1px solid #e1ebf3; }
+      .client-preview summary { display:flex; align-items:center; justify-content:space-between; padding-top:12px; color:#2675b0; cursor:pointer; font-size:12px; font-weight:800; list-style:none; }
+      .client-preview summary::-webkit-details-marker { display:none; }
+      .client-preview summary::after { content:'⌄'; font-size:17px; transition:transform .15s ease; }
+      .client-preview[open] summary::after { transform:rotate(180deg); }
+      .client-preview .client-details { margin-top:13px; }
+      .client-table-wrap { overflow:auto; margin-top:20px; border:1px solid #dae7f0; border-radius:12px; }
+      .client-table { width:100%; min-width:1800px; border-collapse:collapse; color:#47657b; font-size:12px; }
+      .client-table th { padding:12px 10px; color:#2c5879; background:#edf7ff; font-weight:800; text-align:left; white-space:nowrap; }
+      .client-table td { padding:13px 10px; border-top:1px solid #e4edf3; vertical-align:top; line-height:1.55; white-space:nowrap; word-break:normal; }
+      .client-table td:first-child { min-width:150px; color:#173957; font-weight:800; }
+      .client-table .client-status { margin:0; white-space:nowrap; }
+      .client-table-actions { display:flex; gap:7px; white-space:nowrap; }
+    </style>
+  </head>
+  <body class="clients-standalone">
+    <main class="clients-page">
+      <a class="calculator-back" href="/">← 返回财务工作台</a>
+      <section class="clients-banner">
+        <p>财务工作台 · 日常工具</p>
+        <h1>我的客户</h1>
+        <span>服务信息与办税资料仅保存在当前浏览器，方便个人日常管理。</span>
+      </section>
+      <section id="client-vault-gate" class="client-vault-gate">
+        <form id="client-vault-setup" class="client-vault-card" hidden>
+          <span class="vault-icon">🔐</span><h2>设置客户资料库密码</h2><p>该密码用于加密本机客户资料。忘记密码无法恢复已有资料。</p>
+          <label>资料库密码<input name="password" type="password" autocomplete="new-password" minlength="8" required placeholder="至少 8 位" /></label>
+          <label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="再次输入资料库密码" /></label>
+          <button>创建加密资料库</button><small id="client-setup-message"></small>
+        </form>
+        <form id="client-vault-unlock" class="client-vault-card" hidden>
+          <span class="vault-icon">🔐</span><h2>解锁客户资料库</h2><p>请输入资料库密码后查看和管理客户信息。</p>
+          <label>资料库密码<input name="password" type="password" autocomplete="current-password" required placeholder="输入资料库密码" /></label>
+          <button>解锁资料库</button><small id="client-unlock-message"></small>
+        </form>
+        <button id="client-vault-reset" class="client-reset-vault" type="button">忘记密码，清空并重新创建</button>
+      </section>
+        <section id="client-workspace" class="clients-workspace">
+        <div id="clients-layout" class="clients-layout list-only">
+          <section id="client-editor" class="client-editor" hidden>
+            <div class="client-heading"><h2 id="client-form-title">新增客户</h2><p>资料仅保存在当前浏览器中。</p></div>
+            <form id="client-form" class="client-form" autocomplete="off">
+              <label class="wide">客户名称 *<input name="name" required placeholder="例如：上海某某贸易有限公司" /></label>
+              <label class="wide">税号<input name="taxId" maxlength="20" autocomplete="off" placeholder="统一社会信用代码或纳税人识别号" /></label>
+              <label>开始日期<input name="startDate" type="date" /></label>
+              <label>到期日期<input name="endDate" type="date" /></label>
+              <label>收费（元 / 期）<input name="fee" type="number" min="0" step="0.01" placeholder="例如：3000" /></label>
+              <label>联系人<input name="contact" placeholder="姓名、电话或微信" /></label>
+              <fieldset class="client-account-fieldset wide"><legend>电子税务局</legend><label>账号<input name="etaxAccount" autocomplete="off" /></label><label>密码<input name="etaxPassword" type="password" autocomplete="new-password" /></label></fieldset>
+              <fieldset class="client-account-fieldset wide"><legend>个人所得税</legend><label>账号<input name="iitAccount" autocomplete="off" /></label><label>密码<input name="iitPassword" type="password" autocomplete="new-password" /></label></fieldset>
+              <label class="wide">备注<textarea name="notes" placeholder="例如：申报周期、服务范围、交接事项等"></textarea></label>
+              <div class="client-form-actions wide"><button id="client-save" type="submit">保存客户</button><button id="client-cancel-edit" class="client-cancel" type="button" hidden>取消编辑</button></div>
+            </form>
+            <p class="client-security-note">请仅在您个人可信的电脑和浏览器中使用。清理浏览器网站数据会删除本地资料。</p>
+          </section>
+          <section class="client-list-panel">
+            <div class="client-list-heading"><div><h2>客户列表</h2><p id="client-count">0 位客户</p></div><div class="client-list-actions"><input id="client-search" type="search" placeholder="搜索客户名称、税号、联系人或备注" /><button id="client-add" type="button">新增客户</button></div></div>
+            <div id="client-list" class="client-list"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/clients.js"></script>
+  </body>
+</html>
