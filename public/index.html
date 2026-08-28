@@ -2,298 +2,46 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>税策库｜全国税法政策知识库</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#175cd3" />
+    <meta name="description" content="税策库：查询全国通用税种公式、税率、适用条件与官方依据。" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/knowledge.css" />
+    <title>税策库｜手机税务知识库</title>
   </head>
   <body>
-    <header class="topbar">
-      <a class="brand" href="#">税策库 <span>全国税法政策知识库</span></a>
-      <span class="topbar-note">常用财税工作入口</span>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="税策库首页"><span>税</span><strong>税策库</strong></a>
+      <button id="install-app" class="install-app" hidden>添加到桌面</button>
     </header>
     <main>
-      <!-- 登录和管理页面暂不在财务工作台中展示。
-      <section id="login-view" class="login-shell">
-        <div class="login-card">
-          <p class="eyebrow">内部财税团队</p>
-          <h1>从权威原文开始查询</h1>
-          <p>答案仅基于已审核发布的官方文件，且始终保留原文依据。</p>
-          <form id="login-form">
-            <label>用户名<input name="username" autocomplete="username" required /></label>
-            <label>密码<input name="password" type="password" autocomplete="current-password" required /></label>
-            <button>登录</button>
-          </form>
-          <p class="hint">演示成员：member / member-demo<br />演示管理员：admin / admin-demo</p>
-          <p id="login-error" class="error" role="alert"></p>
-        </div>
+      <section class="hero">
+        <p>已审核 · 官方依据 · 持续更新</p>
+        <h1>一搜就懂税种规则</h1>
+        <span>查公式、税率、适用条件和官方依据</span>
+        <form id="search-form" class="search-box" role="search">
+          <label for="search-input" class="sr-only">搜索税种或业务场景</label>
+          <input id="search-input" type="search" autocomplete="off" placeholder="例如：个人所得税、工资、经营所得" />
+          <button type="submit">查询</button>
+        </form>
       </section>
-      -->
-      <section id="app-view">
-        <div class="hero">
-          <p class="eyebrow">已审核 · 官方来源 · 可追溯</p>
-          <h1 id="hero-title">财务工作台</h1>
-          <p id="hero-summary">政策、实务工具与学习入口，集中在一个工作页面。</p>
-          <form id="query-form" class="query-box" hidden>
-            <input id="question" aria-label="请输入问题或关键词" placeholder="例如：哪些主体是增值税纳税人？" required />
-            <select id="tax-type" aria-label="税种筛选"><option value="">全部税种</option><option>增值税</option><option>企业所得税</option><option>个人所得税</option><option>征收管理</option></select>
-            <button>查询依据</button>
-          </form>
-        </div>
-        <nav class="tabs" aria-label="功能导航" hidden>
-          <button class="tab active" data-view="workspace">财务工作台</button>
-          <button class="tab" data-view="search">税法知识库</button>
-          <button class="tab admin-only" data-view="admin" hidden>管理工作台</button>
-        </nav>
-        <section id="workspace-view" class="workspace-view">
-          <div class="dashboard-layout">
-            <aside class="calendar-sidebar">
-              <div class="sidebar-brand">
-                <span class="brand-mark">财</span>
-                <div><strong>财务工作台</strong><small>财税日常工作入口</small></div>
-              </div>
-              <section class="tax-calendar-panel" aria-labelledby="calendar-heading">
-                <div class="calendar-title"><h2 id="calendar-heading">🗓️ 报税日历</h2><span id="calendar-year"></span></div>
-                <div class="tax-alert"><strong id="monthly-filing-title">本月报税提醒</strong><p id="monthly-filing-detail">申报与缴款期限请以电子税务局和主管税务机关通知为准。</p></div>
-                <div id="month-calendar" class="month-calendar" aria-label="本月日历"></div>
-                <a class="calendar-action" href="https://etax.chinatax.gov.cn/" target="_blank" rel="noreferrer">前往电子税务局确认期限 ↗</a>
-                <div class="annual-reminders">
-                  <h3>全年申报提醒</h3>
-                  <div id="annual-reminder-list"></div>
-                </div>
-              </section>
-              <nav class="sidebar-nav" aria-label="模块导航">
-                <a href="#daily-tools">日常工具</a>
-                <a href="#form-templates">表格模板</a>
-                <a href="#tax-calculation">税金计算</a>
-                <a href="#official-links">官方查询</a>
-                <a href="#learning-resources">学习资源</a>
-              </nav>
-            </aside>
-            <div class="dashboard-main">
-              <header class="dashboard-topbar"><strong>📊 财务工作台 2.0</strong><time id="dashboard-date"></time></header>
-              <section class="dashboard-banner">
-                <h1>财务工作台 · 电脑端</h1>
-                <p>精选官方入口、实用工具与学习资源，一个页面统筹财税工作。</p>
-                <label class="dashboard-search"><input id="tool-search" type="search" placeholder="输入关键词，快速定位工具或网站…" /><span>⌕</span></label>
-              </section>
-              <section id="daily-tools" class="dashboard-section">
-                <div class="section-heading"><h2>🧰 日常工具</h2><span>6 个工具</span></div>
-                <div class="dashboard-cards">
-                  <a class="dashboard-card" data-search-card href="https://www.gsxt.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🏢</span><div><h3>企业信息查询</h3><p>查询企业登记、经营状态、年报和异常名录。</p><em>合作前先核验主体信息</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🧾</span><div><h3>纳税服务与发票</h3><p>进入官方纳税服务，查询申报、发票与政策口径。</p><em>办税问题优先查官方服务</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://wenshu.court.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">⚖️</span><div><h3>涉税案例参考</h3><p>查询公开裁判文书，了解涉税及合同风险案例。</p><em>从真实案例中识别风险</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="/accounting-templates.html"><span class="card-icon">📒</span><div><h3>会计模板库</h3><p>记录会计准则、业务场景、借贷分录和税务口径。</p><em>建立团队常用分录模板</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="/formulas.html"><span class="card-icon">📐</span><div><h3>财务人必会的公式</h3><p>按盈利、偿债、营运、现金流、成长和本量利等分类查阅。</p><em>71 条常用财务分析与核算公式</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="/clients.html"><span class="card-icon">👥</span><div><h3>我的客户</h3><p>集中记录服务期限、收费、联系人及办税账号资料。</p><em>本地加密保存客户敏感信息</em></div><b>→</b></a>
-                </div>
-              </section>
-              <section id="form-templates" class="dashboard-section">
-                <div class="section-heading"><h2>🗂️ 工商与税务表格模板</h2><span>2 个分类</span></div>
-                <div class="form-template-entry-grid">
-                  <a class="form-template-entry" data-search-card href="/form-templates.html?category=industry"><span>🏢</span><div><h3>工商业务表格模板</h3><p>存放注册、变更、备案、年报、注销等工商业务材料。</p><em>上传、分类与下载工商表格</em></div><b>→</b></a>
-                  <a class="form-template-entry" data-search-card href="/form-templates.html?category=tax&subcategory=importExport"><span>🧾</span><div><h3>税务业务表格模板</h3><p>按进出口业务、税务合规、财务报表和其他资料分类。</p><em>上传、分类与下载税务表格</em></div><b>→</b></a>
-                </div>
-              </section>
-              <section id="tax-calculation" class="dashboard-section">
-                <div class="section-heading"><h2>🧮 税金计算</h2><span>6 类测算</span></div>
-                <div class="tax-entry-grid">
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=personal"><span>👤</span><div><h3>个人所得税</h3><p>工资薪金累计预扣、年度综合所得测算。</p></div><b>→</b></a>
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=vat"><span>🧾</span><div><h3>增值税及附加</h3><p>增值税、城建税、教育费附加测算。</p></div><b>→</b></a>
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=enterprise"><span>🏭</span><div><h3>企业所得税</h3><p>一般企业、小型微利与优惠税率测算。</p></div><b>→</b></a>
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=property"><span>🏠</span><div><h3>房产税</h3><p>从价计征、从租计征两种方式测算。</p></div><b>→</b></a>
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=business"><span>💼</span><div><h3>经营所得税</h3><p>个体工商户及其他经营所得测算。</p></div><b>→</b></a>
-                  <a class="tax-entry-card" data-search-card href="/calculator.html?tax=burden"><span>📈</span><div><h3>税负率</h3><p>测算综合、增值税和企业所得税税负率，并与行业参考值对照。</p></div><b>→</b></a>
-                </div>
-                <p class="section-note">测算结果仅供内部预算和复核参考；优惠资格、地方口径、申报周期及特殊交易请以主管税务机关和正式申报系统为准。</p>
-              </section>
-              <section id="official-links" class="dashboard-section">
-                <div class="section-heading"><h2>🏛️ 官方查询</h2><span>11 个入口</span></div>
-                <div class="dashboard-cards">
-                  <a class="dashboard-card" data-search-card href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🏛️</span><div><h3>国家税务总局</h3><p>税收政策、公告、纳税服务和官方解读。</p><em>税收政策权威入口</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://online.customs.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🛃</span><div><h3>海关政务服务</h3><p>海关监管、进出口政策和政务服务信息。</p><em>进出口业务官方查询</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.stats.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">📊</span><div><h3>国家统计局</h3><p>国家统计数据、统计公报和数据查询。</p><em>核对宏观数据与指标</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.gsxt.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🔎</span><div><h3>企业信用公示</h3><p>企业信用信息公示系统官方入口。</p><em>查询登记、年报与异常名录</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://kjs.mof.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">📘</span><div><h3>财政部会计司</h3><p>会计准则、会计管理和政策动态。</p><em>会计处理官方参考</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://e.chinaport.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🖨️</span><div><h3>电子口岸打印</h3><p>中国电子口岸相关业务与单证打印入口。</p><em>电子口岸打印服务</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.singlewindow.cn/#/parameterDetail?pqcode=CusComplex&flags=1" target="_blank" rel="noreferrer"><span class="card-icon">🔢</span><div><h3>商品编码查询</h3><p>按商品名称或编码查询 HS 商品编码信息。</p><em>海关官方税目税号查询</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.safe.gov.cn/safe/rmbhlzjj/index.html" target="_blank" rel="noreferrer"><span class="card-icon">💱</span><div><h3>人民币汇率查询</h3><p>查询中国人民银行人民币汇率中间价信息。</p><em>汇率数据官方查询</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://hd.chinatax.gov.cn/nszx2023/cktslcx2023.html" target="_blank" rel="noreferrer"><span class="card-icon">📦</span><div><h3>出口退税率查询</h3><p>查询国家税务总局出口货物退税率。</p><em>出口退税率官方查询</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="http://credit.customs.gov.cn" target="_blank" rel="noreferrer"><span class="card-icon">🛃</span><div><h3>海关企业信用公示</h3><p>查询企业十位海关编码及海关信用等级。</p><em>海关企业信用信息</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="http://zwfw.safe.gov.cn/asone/servlet/UniLoginServlet" target="_blank" rel="noreferrer"><span class="card-icon">🌐</span><div><h3>数字外管平台 ASOne</h3><p>国家外汇管理局数字外管平台服务入口。</p><em>外汇业务在线办理</em></div><b>→</b></a>
-                </div>
-              </section>
-              <section id="learning-resources" class="dashboard-section">
-                <div class="section-heading"><h2>📚 学习资源</h2><span>3 个入口</span></div>
-                <div class="dashboard-cards">
-                  <a class="dashboard-card" data-search-card href="https://kjs.mof.gov.cn/" target="_blank" rel="noreferrer"><span class="card-icon">📖</span><div><h3>会计准则与实务</h3><p>跟进会计准则、制度与权威政策资料。</p><em>持续更新专业知识</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://www.cicpa.org.cn/" target="_blank" rel="noreferrer"><span class="card-icon">🎓</span><div><h3>中国注册会计师协会</h3><p>行业动态、执业信息和考试资讯。</p><em>CPA 相关官方入口</em></div><b>→</b></a>
-                  <a class="dashboard-card" data-search-card href="https://cpaexam.cicpa.org.cn/" target="_blank" rel="noreferrer"><span class="card-icon">📝</span><div><h3>CPA 全国统一考试</h3><p>注册会计师全国统一考试服务平台。</p><em>查看考试信息与服务</em></div><b>→</b></a>
-                </div>
-              </section>
-            </div>
-          </div>
-          <div class="legacy-workbench" hidden>
-          <div class="workbench-hero">
-            <div>
-              <p class="eyebrow">一页完成常用财税工作</p>
-              <h2>财务工作台</h2>
-              <p>常用业务入口、基础测算和官方资料都集中在这里；外部链接将在新窗口打开。</p>
-            </div>
-            <a class="hero-action" href="#official-query">开始查询 <span aria-hidden="true">↓</span></a>
-          </div>
-          <nav class="module-nav" aria-label="工作台模块">
-            <a href="#tax-calendar"><span>📅</span>报税日历</a>
-            <a href="#daily-tools"><span>🧰</span>日常工具</a>
-            <a href="#tax-calculator"><span>🧮</span>税金计算</a>
-            <a href="#official-query"><span>🏛️</span>官方查询</a>
-            <a href="#learning"><span>📚</span>学习资源</a>
-          </nav>
-          <div class="module-grid">
-            <section id="tax-calendar" class="module-card">
-              <div class="module-heading"><span class="module-icon">📅</span><div><h2>报税日历</h2><p>安排每月申报、缴款与提醒。</p></div></div>
-              <div class="calendar-note"><strong>本月申报提示</strong><span>请以电子税务局及主管税务机关通知的实际期限为准。</span></div>
-              <div class="module-links">
-                <a href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer">申报期限与纳税服务 <b>↗</b></a>
-                <a href="https://etax.chinatax.gov.cn/" target="_blank" rel="noreferrer">进入电子税务局 <b>↗</b></a>
-              </div>
-            </section>
-            <section id="daily-tools" class="module-card">
-              <div class="module-heading"><span class="module-icon">🧰</span><div><h2>日常工具</h2><p>查主体、办税服务和风险案例。</p></div></div>
-              <div class="module-links">
-                <a href="https://www.gsxt.gov.cn/" target="_blank" rel="noreferrer">企业信用信息公示系统 <b>↗</b></a>
-                <a href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer">12366 纳税服务 <b>↗</b></a>
-                <a href="https://wenshu.court.gov.cn/" target="_blank" rel="noreferrer">中国裁判文书网 <b>↗</b></a>
-              </div>
-            </section>
-            <section id="tax-calculator" class="module-card calculator-card">
-              <div class="module-heading"><span class="module-icon">🧮</span><div><h2>税金计算</h2><p>用于快速预估，不替代正式申报。</p></div></div>
-              <div class="calculator-grid">
-                <form class="calculator" data-calculator="vat">
-                  <h3>增值税估算</h3>
-                  <label>不含税销售额（元）<input name="sales" type="number" min="0" step="0.01" placeholder="例如 100000" /></label>
-                  <label>适用税率<select name="rate"><option value="13">13%</option><option value="9">9%</option><option value="6">6%</option><option value="3">3%</option></select></label>
-                  <label>可抵扣进项税额（元）<input name="inputTax" type="number" min="0" step="0.01" value="0" /></label>
-                  <button>计算应纳增值税</button><output aria-live="polite"></output>
-                </form>
-                <form class="calculator" data-calculator="cit">
-                  <h3>企业所得税估算</h3>
-                  <label>应纳税所得额（元）<input name="taxableIncome" type="number" min="0" step="0.01" placeholder="例如 100000" /></label>
-                  <label>适用税率<select name="rate"><option value="25">25%</option><option value="20">20%</option><option value="15">15%</option></select></label>
-                  <button>计算应纳企业所得税</button><output aria-live="polite"></output>
-                </form>
-              </div>
-              <p class="calculator-note">仅按输入金额和税率作数学测算，未判断优惠、征收方式、扣除或抵扣条件。</p>
-            </section>
-            <section id="official-query" class="module-card official-card">
-              <div class="module-heading"><span class="module-icon">🏛️</span><div><h2>官方查询</h2><p>政策原文、法规状态与权威资料。</p></div></div>
-              <div class="module-links">
-                <a class="primary-link" href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer">国家税务总局 <b>↗</b></a>
-                <a href="https://www.customs.gov.cn/" target="_blank" rel="noreferrer">海关总署 <b>↗</b></a>
-                <a href="https://www.stats.gov.cn/" target="_blank" rel="noreferrer">国家统计局 <b>↗</b></a>
-                <a href="https://www.gsxt.gov.cn/" target="_blank" rel="noreferrer">企业信用信息公示系统 <b>↗</b></a>
-              </div>
-            </section>
-            <section id="learning" class="module-card">
-              <div class="module-heading"><span class="module-icon">📚</span><div><h2>学习资源</h2><p>会计准则、行业动态与考试信息。</p></div></div>
-              <div class="module-links">
-                <a href="https://kjs.mof.gov.cn/" target="_blank" rel="noreferrer">会计准则与政策动态 <b>↗</b></a>
-                <a href="https://www.cicpa.org.cn/" target="_blank" rel="noreferrer">中国注册会计师协会 <b>↗</b></a>
-                <a href="https://cpaexam.cicpa.org.cn/" target="_blank" rel="noreferrer">CPA 全国统一考试 <b>↗</b></a>
-              </div>
-            </section>
-          </div>
-          <!--
-          <div class="workspace-intro">
-            <p class="eyebrow">财务团队常用入口</p>
-            <h2>财务工作台</h2>
-            <p>把政策检索、实务查询和学习提升集中在一个清晰入口。所有外部链接均在新窗口打开。</p>
-          </div>
-          <section class="workspace-section">
-            <h2><span aria-hidden="true">📖</span> 政策法规与会计准则</h2>
-            <div class="tool-grid">
-              <a class="tool-card featured" href="#tax-knowledge-base" data-open-search><span class="tool-icon">🔎</span><span><strong>税法知识库</strong><small>按税种、关键词或业务问题查询；结果附官方原文与条款依据。</small><em>从这里开始查税收政策、依据哪一条法规</em></span><b>→</b></a>
-              <a class="tool-card" href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">🏛️</span><span><strong>国家税务总局</strong><small>税收政策法规、公告、纳税服务与权威解读。</small><em>查询最新税收政策和官方口径</em></span><b>→</b></a>
-              <a class="tool-card" href="https://www.mof.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">🏢</span><span><strong>财政部官网</strong><small>财政政策、会计制度、政府会计与财税信息。</small><em>会计制度、财政政策的官方入口</em></span><b>→</b></a>
-              <a class="tool-card" href="https://kjs.mof.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">📘</span><span><strong>财政部会计司</strong><small>企业会计准则、会计管理与准则实施信息。</small><em>遇到会计处理问题先查准则与官方解读</em></span><b>→</b></a>
-              <a class="tool-card" href="https://flk.npc.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">⚖️</span><span><strong>国家法律法规数据库</strong><small>法律、行政法规等中央法规的官方查询入口。</small><em>核对法律原文与有效状态</em></span><b>→</b></a>
-            </div>
-          </section>
-          <section class="workspace-section">
-            <h2><span aria-hidden="true">🧰</span> 财务工具与实务查询</h2>
-            <div class="tool-grid">
-              <a class="tool-card" href="https://www.chinatax.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">☎️</span><span><strong>12366 纳税服务</strong><small>纳税缴费、发票、申报与政策咨询入口。</small><em>实际执行拿不准时，先找官方服务口径</em></span><b>→</b></a>
-              <a class="tool-card" href="https://www.gsxt.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">🏬</span><span><strong>企业信用信息公示系统</strong><small>查询企业登记、经营状态、年报与异常名录。</small><em>合作前先核验主体是否真实、经营是否异常</em></span><b>→</b></a>
-              <a class="tool-card" href="https://wenshu.court.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">📜</span><span><strong>中国裁判文书网</strong><small>按关键词、案由和案号查询公开裁判文书。</small><em>学习真实案例，识别涉税与合同风险</em></span><b>→</b></a>
-              <a class="tool-card disabled" href="#" aria-disabled="true"><span class="tool-icon">⚡</span><span><strong>常用模板与计算工具</strong><small>后续可加入税率速查、Excel 模板和票据处理工具。</small><em>工具将按团队实际流程逐步配置</em></span><b>即将上线</b></a>
-            </div>
-          </section>
-          <section class="workspace-section">
-            <h2><span aria-hidden="true">🎓</span> 学习提升与考试信息</h2>
-            <div class="tool-grid">
-              <a class="tool-card" href="https://kjs.mof.gov.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">👓</span><span><strong>会计准则与实务学习</strong><small>查看会计政策、准则动态及权威材料。</small><em>持续跟进会计制度变化</em></span><b>→</b></a>
-              <a class="tool-card" href="https://www.cicpa.org.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">🎯</span><span><strong>中国注册会计师协会</strong><small>CPA 考试、行业动态与执业信息。</small><em>注册会计师相关信息的官方入口</em></span><b>→</b></a>
-              <a class="tool-card" href="https://www.cctaa.cn/" target="_blank" rel="noreferrer"><span class="tool-icon">📊</span><span><strong>中国注册税务师协会</strong><small>税务师行业资讯、继续教育与服务信息。</small><em>税务专业学习与行业动态</em></span><b>→</b></a>
-            </div>
-          </section>
-          -->
-          </div>
-        </section>
-        <section id="search-view" class="content-grid" hidden>
-          <div id="query-result" class="query-result empty">输入问题后，系统会优先检索现行有效的已发布文件。</div>
-          <article id="document-detail" class="panel full" hidden></article>
-          <aside class="search-filter">
-            <h2>检索筛选</h2>
-            <label>有效状态
-              <select id="status-filter"><option value="">全部法规</option><option value="repealed">仅已废止</option><option value="expired">仅期限届满</option></select>
-            </label>
-            <label>发布日期
-              <select id="published-year-filter"><option value="">全部年份</option><option value="2026">仅 2026 年新发布</option></select>
-            </label>
-            <button id="browse-documents" class="secondary">按税种浏览</button>
-            <p>历史文件可查询，但不会优先于现行有效文件。</p>
-            <h2 class="subheading">税种专题</h2>
-            <label>选择税种<select id="topic-selector"><option value="vat">增值税</option><option value="eit">企业所得税</option><option value="iit">个人所得税</option><option value="consumption">消费税</option><option value="collection">征收管理</option></select></label>
-            <button id="open-topic" class="secondary">查看专题依据</button>
-          </aside>
-          <div id="document-list" class="document-list"></div>
-        </section>
-        <section id="admin-view" hidden>
-          <div class="admin-grid">
-            <article class="panel"><h2>待审候选</h2><p class="hint">自动初审仅发布官方原文明确标注“现行有效/全文有效”、且没有到期线索的文件；其余保留人工审核。</p><div class="candidate-actions"><button id="auto-review-preview" class="secondary">预览自动初审</button><button id="auto-review-apply" disabled>执行自动发布</button></div><div id="auto-review-result" class="hint"></div><p class="hint">第二轮复核会将已修订、已废止文件归档为历史资料，并对其余文件记录期限和版本关系线索。</p><div class="candidate-actions"><button id="secondary-review-preview" class="secondary">预览第二轮复核</button><button id="secondary-review-apply" disabled>归档历史文件</button></div><div id="secondary-review-result" class="hint"></div><p class="hint">第三轮复核将归档期限届满文件，并为双方已入库的版本关系建立链接。</p><div class="candidate-actions"><button id="third-review-preview" class="secondary">预览第三轮复核</button><button id="third-review-apply" disabled>执行第三轮复核</button></div><div id="third-review-result" class="hint"></div><h2 class="subheading">已发布文件期限复核</h2><p class="hint">只处理正文明确写明“本文件执行、施行或有效至某日”，且该日期已经届满的文件。</p><div class="candidate-actions"><button id="document-review-preview" class="secondary">预览期限复核</button><button id="document-review-apply" disabled>归档已到期文件</button></div><div id="document-review-result" class="hint"></div><h2 class="subheading">已发布文件版本复核</h2><p class="hint">只在后发官方原文以完整文件标题点名，并在同一句明确写出废止、修订或修改时建立版本链和更新状态。</p><div class="candidate-actions"><button id="document-version-review-preview" class="secondary">预览版本复核</button><button id="document-version-review-apply" disabled>建立版本关系</button></div><div id="document-version-review-result" class="hint"></div><h2 class="subheading">高频税种待核验</h2><p class="hint">按税种、法规层级、发布时间和是否已有同名现行文件排序。点击官方原文核对后可直接标记状态。</p><div id="priority-review-list" class="compact-list"></div><div id="candidate-list"></div></article>
-            <article class="panel"><h2>登记官方来源</h2>
-              <form id="source-form" class="stack-form">
-                <label>来源名称<input name="name" required placeholder="例如：国家税务总局政策法规库" /></label>
-                <label>发布机关<input name="authority" required placeholder="例如：国家税务总局" /></label>
-                <label>官方链接<input name="url" type="url" required placeholder="https://" /></label>
-                <label>来源类型<input name="kind" placeholder="官方来源" /></label>
-                <button>保存来源</button>
-              </form>
-              <div id="source-list" class="compact-list"></div>
-              <h2 class="subheading">最近采集</h2>
-              <div id="collection-list" class="compact-list"></div>
-              <h2 class="subheading">全量导入任务</h2>
-              <div id="bulk-import-list" class="compact-list"></div>
-              <h2 class="subheading">官方状态核验</h2>
-              <div id="status-check-list" class="compact-list"></div>
-            </article>
-            <article class="panel full"><h2>新增待审文件</h2>
-              <form id="candidate-form" class="stack-form two-columns">
-                <label>文件标题<input name="title" required /></label><label>文号<input name="documentNumber" /></label>
-                <label>发布机关<input name="authority" required /></label><label>官方原文链接<input name="officialUrl" type="url" required /></label>
-                <label>来源<select name="sourceId" id="candidate-source" required></select></label><label>状态<select name="status"><option value="pending_verification">待核验</option><option value="current">现行有效</option><option value="revised">已修订</option><option value="repealed">已废止</option></select></label>
-                <label>发布日期<input name="publishedAt" type="date" /></label><label>施行日期<input name="effectiveAt" type="date" /></label>
-                <label class="wide">税种（逗号分隔）<input name="taxTypes" placeholder="增值税, 征收管理" /></label>
-                <label class="wide">摘要<textarea name="summary"></textarea></label>
-                <label class="wide">原文分段（每行：条款标签｜原文）<textarea name="sections" required placeholder="第一条｜原文内容"></textarea></label>
-                <button class="wide">保存为待审候选</button>
-              </form>
-            </article>
-            <article class="panel full"><h2>审计记录</h2><div id="audit-list" class="compact-list"></div></article>
-          </div>
-        </section>
+
+      <section class="content-section" aria-labelledby="tax-type-heading">
+        <div class="section-title"><h2 id="tax-type-heading">热门税种</h2><button id="clear-filter" class="text-button" hidden>查看全部</button></div>
+        <div id="tax-types" class="tax-types" aria-live="polite"></div>
+      </section>
+
+      <section class="content-section results-section" aria-labelledby="results-heading">
+        <div class="section-title"><div><h2 id="results-heading">常用知识卡片</h2><p id="result-note">以下内容适用于全国通用基础规则。</p></div></div>
+        <div id="card-list" class="card-list" aria-live="polite"></div>
       </section>
     </main>
-    <template id="document-template"><article class="document-card"><div class="card-head"><span class="status"></span><a class="title" target="_blank" rel="noreferrer"></a></div><p class="meta"></p><p class="summary"></p><div class="matches"></div></article></template>
-    <script type="module" src="/workbench.js"></script>
+    <footer>内容用于知识查询与辅助测算；正式申报请以主管税务机关和电子税务局口径为准。</footer>
+
+    <dialog id="card-dialog" class="card-dialog" aria-labelledby="detail-title">
+      <article id="card-detail"></article>
+    </dialog>
+    <script type="module" src="/knowledge.js"></script>
   </body>
 </html>
