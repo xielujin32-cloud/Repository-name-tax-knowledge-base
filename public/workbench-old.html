@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#175cd3" />
+    <meta name="description" content="税策库：查询全国通用税种公式、税率、适用条件与官方依据。" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/knowledge.css" />
+    <title>税策库｜手机税务知识库</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="税策库首页"><span>税</span><strong>税策库</strong></a>
+      <button id="install-app" class="install-app" hidden>添加到桌面</button>
+    </header>
+    <main>
+      <section class="hero">
+        <p>已审核 · 官方依据 · 持续更新</p>
+        <h1>一搜就懂税种规则</h1>
+        <span>查公式、税率、适用条件和官方依据</span>
+        <form id="search-form" class="search-box" role="search">
+          <label for="search-input" class="sr-only">搜索税种或业务场景</label>
+          <input id="search-input" type="search" autocomplete="off" placeholder="例如：个人所得税、工资、经营所得" />
+          <button type="submit">查询</button>
+        </form>
+      </section>
+
+      <section class="content-section" aria-labelledby="tax-type-heading">
+        <div class="section-title"><h2 id="tax-type-heading">热门税种</h2><button id="clear-filter" class="text-button" hidden>查看全部</button></div>
+        <div id="tax-types" class="tax-types" aria-live="polite"></div>
+      </section>
+
+      <section class="content-section results-section" aria-labelledby="results-heading">
+        <div class="section-title"><div><h2 id="results-heading">常用知识卡片</h2><p id="result-note">以下内容适用于全国通用基础规则。</p></div></div>
+        <div id="card-list" class="card-list" aria-live="polite"></div>
+      </section>
+    </main>
+    <footer>内容用于知识查询与辅助测算；正式申报请以主管税务机关和电子税务局口径为准。</footer>
+
+    <dialog id="card-dialog" class="card-dialog" aria-labelledby="detail-title">
+      <article id="card-detail"></article>
+    </dialog>
+    <script type="module" src="/knowledge.js"></script>
+  </body>
+</html>

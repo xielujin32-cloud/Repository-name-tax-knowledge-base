@@ -1,4 +1,4 @@
-const SHELL_CACHE = 'taxkb-shell-v1';
+const SHELL_CACHE = 'taxkb-shell-v2';
 const SHELL = ['/', '/knowledge.html', '/knowledge.css', '/knowledge.js', '/manifest.webmanifest', '/icon.svg'];
 self.addEventListener('install', (event) => event.waitUntil(caches.open(SHELL_CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
