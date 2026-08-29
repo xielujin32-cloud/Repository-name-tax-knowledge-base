@@ -1,6 +1,7 @@
 import { buildKnowledgeCard, publicKnowledgeCard, searchKnowledgeCards } from '../../src/knowledge-cards.js';
 import { addAudit, readKnowledgeCardState, updateKnowledgeCardState } from '../lib/knowledge-card-store.mjs';
 import { importPolicies, listPolicies, readPolicy } from '../lib/policy-store.mjs';
+import { createEvidenceAdminHandler } from '../lib/evidence-ingestion.mjs';
 import { policySeedPolicies } from '../../src/policy-seed.js';
 
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
@@ -34,8 +35,9 @@ async function requestBody(request) {
   try { return JSON.parse(text); } catch { throw new SyntaxError('请求正文必须是 JSON。'); }
 }
 
-async function adminApi(request, pathname, url) {
+async function adminApi(request, pathname, url, evidenceAdminHandler) {
   if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
+  if (pathname.startsWith('/api/admin/evidence/')) return evidenceAdminHandler(request, pathname, url);
   if (request.method === 'POST' && pathname === '/api/admin/policies/import-seed') {
     if (url.search) return json({ error: '种子导入不接受查询参数。' }, 400);
     const input = await requestBody(request);
@@ -120,11 +122,12 @@ async function adminApi(request, pathname, url) {
   return json({ error: '接口不存在。' }, 404);
 }
 
-export default async (request) => {
-  try {
-    const url = new URL(request.url);
-    const pathname = normalisePath(url);
-    if (pathname.startsWith('/api/admin/')) return await adminApi(request, pathname, url);
+export function createApiHandler({ evidenceAdminHandler = createEvidenceAdminHandler() } = {}) {
+  return async (request) => {
+    try {
+      const url = new URL(request.url);
+      const pathname = normalisePath(url);
+      if (pathname.startsWith('/api/admin/')) return await adminApi(request, pathname, url, evidenceAdminHandler);
     if (request.method === 'GET' && pathname === '/api/health') return json({ ok: true, storage: 'netlify-blobs' });
     if (request.method === 'GET' && pathname === '/api/policies') {
       const policies = await listPolicies({
@@ -148,10 +151,13 @@ export default async (request) => {
       const card = state.knowledgeCards.find((item) => item.id === pathname.split('/').pop() && item.status === 'published');
       return card ? json({ card: publicKnowledgeCard(card) }) : json({ error: '未找到已发布知识卡片。' }, 404);
     }
-    return json({ error: '接口不存在。' }, 404);
-  } catch (error) {
-    return json({ error: error.message || '请求处理失败。' }, error instanceof SyntaxError ? 400 : 422);
-  }
-};
+      return json({ error: '接口不存在。' }, 404);
+    } catch (error) {
+      return json({ error: error.message || '请求处理失败。' }, error instanceof SyntaxError ? 400 : 422);
+    }
+  };
+}
+
+export default createApiHandler();
 
 export const config = { path: '/api/*' };

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,10 +9,12 @@ import { importPolicies, listPolicies, readPolicy } from '../netlify/lib/policy-
 import { policySeedPolicies } from '../src/policy-seed.js';
 
 const directory = await mkdtemp(join(tmpdir(), 'taxkb-netlify-blobs-'));
-const blobs = new BlobsServer({ directory, port: 0, token: 'netlify-test-token', logger: () => {} });
+const blobsToken = `blobs-test-${randomUUID()}`;
+const adminToken = `admin-test-${randomUUID()}`;
+const blobs = new BlobsServer({ directory, port: 0, token: blobsToken, logger: () => {} });
 await blobs.start();
-process.env.NETLIFY_BLOBS_CONTEXT = Buffer.from(JSON.stringify({ edgeURL: blobs.address, token: 'netlify-test-token', siteID: 'taxkb-test' })).toString('base64');
-process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'netlify-admin-test-token';
+process.env.NETLIFY_BLOBS_CONTEXT = Buffer.from(JSON.stringify({ edgeURL: blobs.address, token: blobsToken, siteID: 'taxkb-test' })).toString('base64');
+process.env.NETLIFY_TAXKB_ADMIN_TOKEN = adminToken;
 const { default: handler } = await import('../netlify/functions/api.mjs');
 const policySeed = policySeedPolicies();
 
@@ -64,7 +67,7 @@ test('Policy Store 支持 dry-run 和重复 id 拒绝', async () => {
 test('Policy 种子导入接口拒绝无 Token 和错误 Token，且不写入', async () => {
   const noToken = await call('/api/admin/policies/import-seed', { method: 'POST' });
   assert.equal(noToken.response.status, 401);
-  const wrongToken = await call('/api/admin/policies/import-seed', { method: 'POST', token: 'not-the-admin-token' });
+  const wrongToken = await call('/api/admin/policies/import-seed', { method: 'POST', token: `wrong-${randomUUID()}` });
   assert.equal(wrongToken.response.status, 401);
   const configuredToken = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
   delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
