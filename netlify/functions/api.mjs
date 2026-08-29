@@ -1,6 +1,7 @@
 import { buildKnowledgeCard, publicKnowledgeCard, searchKnowledgeCards } from '../../src/knowledge-cards.js';
 import { addAudit, readKnowledgeCardState, updateKnowledgeCardState } from '../lib/knowledge-card-store.mjs';
-import { listPolicies, readPolicy } from '../lib/policy-store.mjs';
+import { importPolicies, listPolicies, readPolicy } from '../lib/policy-store.mjs';
+import { policySeedPolicies } from '../../src/policy-seed.js';
 
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
 const id = (prefix) => `${prefix}-${crypto.randomUUID()}`;
@@ -24,17 +25,27 @@ function normalisePath(url) {
 function requireAdmin(request) {
   const expected = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
   const received = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
-  if (!expected) throw new Error('管理员接口尚未配置 NETLIFY_TAXKB_ADMIN_TOKEN。');
-  if (!received || received !== expected) return false;
-  return true;
+  return Boolean(expected && received && received === expected);
 }
 
 async function requestBody(request) {
-  try { return await request.json(); } catch { throw new SyntaxError('请求正文必须是 JSON。'); }
+  const text = await request.text();
+  if (!text.trim()) return {};
+  try { return JSON.parse(text); } catch { throw new SyntaxError('请求正文必须是 JSON。'); }
 }
 
-async function adminApi(request, pathname) {
+async function adminApi(request, pathname, url) {
   if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
+  if (request.method === 'POST' && pathname === '/api/admin/policies/import-seed') {
+    if (url.search) return json({ error: '种子导入不接受查询参数。' }, 400);
+    const input = await requestBody(request);
+    if (Object.keys(input).some((key) => key !== 'apply') || (input.apply !== undefined && input.apply !== true && input.apply !== false)) {
+      return json({ error: '种子导入只接受可选布尔字段 apply。' }, 400);
+    }
+    const apply = input.apply === true;
+    const result = await importPolicies(policySeedPolicies(), { dryRun: !apply });
+    return json({ source: 'data/policy-seed.json', mode: apply ? 'apply' : 'dry-run', ...result });
+  }
   if (request.method === 'GET' && pathname === '/api/admin/knowledge-cards') {
     return json({ cards: (await readKnowledgeCardState()).knowledgeCards });
   }
@@ -113,7 +124,7 @@ export default async (request) => {
   try {
     const url = new URL(request.url);
     const pathname = normalisePath(url);
-    if (pathname.startsWith('/api/admin/')) return await adminApi(request, pathname);
+    if (pathname.startsWith('/api/admin/')) return await adminApi(request, pathname, url);
     if (request.method === 'GET' && pathname === '/api/health') return json({ ok: true, storage: 'netlify-blobs' });
     if (request.method === 'GET' && pathname === '/api/policies') {
       const policies = await listPolicies({

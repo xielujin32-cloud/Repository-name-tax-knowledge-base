@@ -4,9 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobsServer } from '@netlify/blobs/server';
-import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
 import { importPolicies, listPolicies, readPolicy } from '../netlify/lib/policy-store.mjs';
+import { policySeedPolicies } from '../src/policy-seed.js';
 
 const directory = await mkdtemp(join(tmpdir(), 'taxkb-netlify-blobs-'));
 const blobs = new BlobsServer({ directory, port: 0, token: 'netlify-test-token', logger: () => {} });
@@ -14,7 +13,7 @@ await blobs.start();
 process.env.NETLIFY_BLOBS_CONTEXT = Buffer.from(JSON.stringify({ edgeURL: blobs.address, token: 'netlify-test-token', siteID: 'taxkb-test' })).toString('base64');
 process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'netlify-admin-test-token';
 const { default: handler } = await import('../netlify/functions/api.mjs');
-const policySeed = JSON.parse(await readFile(resolve('data/policy-seed.json'), 'utf8')).policies;
+const policySeed = policySeedPolicies();
 
 async function call(path, { method = 'GET', token = '', body } = {}) {
   const response = await handler(new Request(`https://taxkb.example${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined }));
@@ -52,18 +51,53 @@ test('Netlify Function 可审核发布知识卡片并持久化到 Blobs', async 
   assert.equal(after.body.results.length, 1);
 });
 
-test('Policy Store 支持 dry-run、重复 id 拒绝和幂等导入', async () => {
+test('Policy Store 支持 dry-run 和重复 id 拒绝', async () => {
   const dryRun = await importPolicies(policySeed, { dryRun: true });
   assert.deepEqual(dryRun, { dryRun: true, total: 3, added: 3, updated: 0, skipped: 0, errors: [] });
   assert.equal((await listPolicies()).total, 0);
 
   const duplicate = await importPolicies([...policySeed, policySeed[0]], { dryRun: true });
   assert.ok(duplicate.errors.some((error) => error.includes('重复 id')));
+  assert.equal((await listPolicies()).total, 0);
+});
 
-  const imported = await importPolicies(policySeed, { dryRun: false });
-  assert.deepEqual(imported, { dryRun: false, total: 3, added: 3, updated: 0, skipped: 0, errors: [] });
-  const repeated = await importPolicies(policySeed, { dryRun: false });
-  assert.deepEqual(repeated, { dryRun: false, total: 3, added: 0, updated: 0, skipped: 3, errors: [] });
+test('Policy 种子导入接口拒绝无 Token 和错误 Token，且不写入', async () => {
+  const noToken = await call('/api/admin/policies/import-seed', { method: 'POST' });
+  assert.equal(noToken.response.status, 401);
+  const wrongToken = await call('/api/admin/policies/import-seed', { method: 'POST', token: 'not-the-admin-token' });
+  assert.equal(wrongToken.response.status, 401);
+  const configuredToken = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  try {
+    const missingConfiguredToken = await call('/api/admin/policies/import-seed', { method: 'POST', token: configuredToken });
+    assert.equal(missingConfiguredToken.response.status, 401);
+  } finally {
+    process.env.NETLIFY_TAXKB_ADMIN_TOKEN = configuredToken;
+  }
+  const querySource = await call('/api/admin/policies/import-seed?source=data/knowledge-base.json', { method: 'POST', token: configuredToken });
+  assert.equal(querySource.response.status, 400);
+  const bodySource = await call('/api/admin/policies/import-seed', { method: 'POST', token: configuredToken, body: { source: 'data/knowledge-base.json' } });
+  assert.equal(bodySource.response.status, 400);
+  assert.equal((await listPolicies()).total, 0);
+});
+
+test('Policy 种子导入接口默认 dry-run，不写入 Blobs', async () => {
+  const token = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  const dryRun = await call('/api/admin/policies/import-seed', { method: 'POST', token });
+  assert.equal(dryRun.response.status, 200);
+  assert.deepEqual(dryRun.body, { source: 'data/policy-seed.json', mode: 'dry-run', dryRun: true, total: 3, added: 3, updated: 0, skipped: 0, errors: [] });
+  assert.equal((await listPolicies()).total, 0);
+});
+
+test('Policy 种子导入接口只写入三条政策，并且可幂等重复执行', async () => {
+  const token = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  const imported = await call('/api/admin/policies/import-seed', { method: 'POST', token, body: { apply: true } });
+  assert.equal(imported.response.status, 200);
+  assert.deepEqual(imported.body, { source: 'data/policy-seed.json', mode: 'apply', dryRun: false, total: 3, added: 3, updated: 0, skipped: 0, errors: [] });
+  assert.equal((await listPolicies()).total, 3);
+
+  const repeated = await call('/api/admin/policies/import-seed', { method: 'POST', token, body: { apply: true } });
+  assert.deepEqual(repeated.body, { source: 'data/policy-seed.json', mode: 'apply', dryRun: false, total: 3, added: 0, updated: 0, skipped: 3, errors: [] });
   assert.equal((await readPolicy('doc-vat-law-2024')).title, '中华人民共和国增值税法');
 });
 
