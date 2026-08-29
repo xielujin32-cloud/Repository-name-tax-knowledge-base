@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, access, copyFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { resolve } from 'node:path';
 import { DEFAULT_KNOWLEDGE_CARDS } from './knowledge-cards.js';
+import { ensurePolicySchema } from './policy-schema.js';
 
 const root = resolve(process.env.TAXKB_DATA_DIR || resolve(process.cwd(), 'data'));
 const dataFile = resolve(root, 'knowledge-base.json');
@@ -23,6 +24,7 @@ export async function initialiseStore() {
     if (additions.length) { data.knowledgeCards.push(...additions); changed = true; }
   }
   if (!Array.isArray(data.knowledgeCardCandidates)) { data.knowledgeCardCandidates = []; changed = true; }
+  if (ensurePolicySchema(data).changed) changed = true;
   if (changed) await writeFile(dataFile, JSON.stringify(data, null, 2), 'utf8');
 }
 

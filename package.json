@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test --test-isolation=none"
+    "test": "node --test --test-isolation=none",
+    "migrate:policies": "node scripts/migrate-knowledge-base.mjs",
+    "import:policies": "node scripts/import-policies-to-netlify.mjs"
   },
   "dependencies": {
     "@netlify/blobs": "^11.0.1"

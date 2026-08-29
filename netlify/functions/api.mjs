@@ -1,5 +1,6 @@
 import { buildKnowledgeCard, publicKnowledgeCard, searchKnowledgeCards } from '../../src/knowledge-cards.js';
 import { addAudit, readKnowledgeCardState, updateKnowledgeCardState } from '../lib/knowledge-card-store.mjs';
+import { listPolicies, readPolicy } from '../lib/policy-store.mjs';
 
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
 const id = (prefix) => `${prefix}-${crypto.randomUUID()}`;
@@ -114,6 +115,18 @@ export default async (request) => {
     const pathname = normalisePath(url);
     if (pathname.startsWith('/api/admin/')) return await adminApi(request, pathname);
     if (request.method === 'GET' && pathname === '/api/health') return json({ ok: true, storage: 'netlify-blobs' });
+    if (request.method === 'GET' && pathname === '/api/policies') {
+      const policies = await listPolicies({
+        query: url.searchParams.get('query') || '', taxCategory: url.searchParams.get('taxCategory') || '',
+        status: url.searchParams.get('status') || '', region: url.searchParams.get('region') || '',
+        limit: url.searchParams.get('limit') || 30, offset: url.searchParams.get('offset') || 0
+      });
+      return json(policies);
+    }
+    if (request.method === 'GET' && pathname.startsWith('/api/policies/')) {
+      const policy = await readPolicy(decodeURIComponent(pathname.split('/').pop()));
+      return policy ? json({ policy }) : json({ error: '未找到政策。' }, 404);
+    }
     const state = await readKnowledgeCardState();
     if (request.method === 'GET' && pathname === '/api/knowledge/tax-types') return json({ taxTypes: publicTaxTypes(state.knowledgeCards) });
     if (request.method === 'GET' && pathname === '/api/knowledge/cards') {
