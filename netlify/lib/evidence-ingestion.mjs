@@ -4,6 +4,7 @@ import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js'
 import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
+export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2d-server-evidence-ingestion)';
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
 
@@ -153,6 +154,47 @@ export async function ingestPhase2BWhitelist({ repository = defaultRepositoryFac
   };
 }
 
+/**
+ * The protected admin endpoint uses this wrapper. Completion means that each
+ * of the two fixed URLs has matching candidate evidence from a completed
+ * Phase 2D run. This remains true if a later human review changes the
+ * candidate's review or legal state, and a later invocation exits before any
+ * HTTP request, collection run, snapshot, or candidate write.
+ */
+export async function ingestPhase2BWhitelistOnce({ repository = defaultRepositoryFactory(), fetchImpl = fetch } = {}) {
+  if (typeof repository.hasCompletedCandidatesForUrls !== 'function' || typeof repository.withExclusiveLock !== 'function') {
+    throw new Error('Evidence Repository 不支持一次性 Phase 2B 导入锁。');
+  }
+  const locked = await repository.withExclusiveLock(PHASE_2D_ONE_TIME_INGESTION_LOCK, async () => {
+    const complete = await repository.hasCompletedCandidatesForUrls({
+      source_id: CHINA_TAX_POLICY_SOURCE.source_id,
+      canonical_urls: PHASE_2B_ALLOWED_DETAIL_URLS
+    });
+    if (complete) {
+      return Object.freeze({
+        execution: 'already_completed',
+        source_id: CHINA_TAX_POLICY_SOURCE.source_id,
+        snapshots_created: 0,
+        candidates_created: 0,
+        candidates_skipped: PHASE_2B_ALLOWED_DETAIL_URLS.length,
+        results: []
+      });
+    }
+    return Object.freeze({ execution: 'completed', ...(await ingestPhase2BWhitelist({ repository, fetchImpl })) });
+  });
+  if (!locked.acquired) {
+    return Object.freeze({
+      execution: 'in_progress',
+      source_id: CHINA_TAX_POLICY_SOURCE.source_id,
+      snapshots_created: 0,
+      candidates_created: 0,
+      candidates_skipped: 0,
+      results: []
+    });
+  }
+  return locked.result;
+}
+
 export async function readEvidenceStatus({ repository = defaultRepositoryFactory() } = {}) {
   return { counts: await repository.counts(), candidates: (await repository.listCandidateStatuses()).map(safeCandidate) };
 }
@@ -170,7 +212,7 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       if (Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== PHASE_2D_IMPORT_CONFIRMATION) {
         return json({ error: 'Evidence 导入只接受固定 apply 与 confirmation，且不能指定 URL、文件或政策内容。' }, 400);
       }
-      const result = await ingestPhase2BWhitelist({ repository: repositoryFactory(), fetchImpl });
+      const result = await ingestPhase2BWhitelistOnce({ repository: repositoryFactory(), fetchImpl });
       return json({ mode: 'apply', allowlist_size: PHASE_2B_ALLOWED_DETAIL_URLS.length, ...result });
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));

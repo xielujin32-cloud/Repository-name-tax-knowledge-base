@@ -9,6 +9,7 @@
     "test": "node --test --test-isolation=none",
     "migrate:policies": "node scripts/migrate-knowledge-base.mjs",
     "import:policies": "node scripts/import-policies-to-netlify.mjs",
+    "import:evidence:phase2b-production": "node scripts/import-phase2b-production.mjs",
     "audit:policies": "node scripts/audit-policies.mjs"
   },
   "dependencies": {

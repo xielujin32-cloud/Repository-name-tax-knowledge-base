@@ -43,6 +43,41 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
   }
   async function traceCandidate(candidateId) { const result=await pool.query(`SELECT c.*, row_to_json(s.*) AS raw_snapshot, row_to_json(r.*) AS collection_run, row_to_json(so.*) AS source FROM candidates c JOIN raw_snapshots s ON s.snapshot_id=c.snapshot_id JOIN collection_runs r ON r.collection_run_id=s.collection_run_id JOIN sources so ON so.source_id=s.source_id WHERE c.candidate_id=$1`,[candidateId]); if(!result.rows.length) throw new Error(`candidate 不存在：${candidateId}`); return result.rows[0]; }
   async function listCandidateStatuses({ limit = 100 } = {}) { const size=Math.min(Math.max(Number(limit)||100,1),100); return (await pool.query('SELECT candidate_id,snapshot_id,last_seen_snapshot_id,source_id,official_url,verification_state,legal_status,created_at,updated_at FROM candidates ORDER BY created_at ASC LIMIT $1',[size])).rows; }
+  async function hasCompletedCandidatesForUrls({ source_id, canonical_urls = [] } = {}) {
+    const urls = [...new Set(canonical_urls.map(canonical))];
+    if (!required(source_id, 'source_id') || !urls.length) return false;
+    const result = await pool.query(
+      `SELECT COUNT(DISTINCT s.canonical_url)::int AS count
+       FROM raw_snapshots s
+       JOIN collection_runs r ON r.collection_run_id=s.collection_run_id
+       JOIN candidates c ON c.source_id=s.source_id
+                        AND c.canonical_url=s.canonical_url
+                        AND c.normalized_text_sha256=s.normalized_text_sha256
+       WHERE s.source_id=$1
+         AND s.canonical_url = ANY($2::text[])
+         AND r.mode='phase2d-production-whitelist'
+         AND r.collection_state='completed'`,
+      [source_id, urls]
+    );
+    return result.rows[0].count === urls.length;
+  }
+  async function withExclusiveLock(lockName, work) {
+    if (typeof pool.connect !== 'function') {
+      // @netlify/database-dev exposes a single local query interface. The
+      // production pg pool uses the connection-scoped branch below.
+      const lock = await pool.query('SELECT pg_try_advisory_lock(hashtext($1)) AS acquired', [required(lockName, 'lockName')]);
+      if (!lock.rows[0]?.acquired) return { acquired: false, result: null };
+      try { return { acquired: true, result: await work() }; }
+      finally { await pool.query('SELECT pg_advisory_unlock(hashtext($1))', [lockName]); }
+    }
+    const client = await pool.connect();
+    try {
+      const lock = await client.query('SELECT pg_try_advisory_lock(hashtext($1)) AS acquired', [required(lockName, 'lockName')]);
+      if (!lock.rows[0]?.acquired) return { acquired: false, result: null };
+      try { return { acquired: true, result: await work() }; }
+      finally { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [lockName]); }
+    } finally { client.release(); }
+  }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }
