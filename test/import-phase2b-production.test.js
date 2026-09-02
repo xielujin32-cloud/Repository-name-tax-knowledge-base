@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { PHASE_2B_PRODUCTION_IMPORT_URL, executePhase2BProductionImport, parseArguments } from '../scripts/import-phase2b-production.mjs';
 
 test('本机 Phase 2B 工具固定生产入口和请求正文，不接受自定义参数', async () => {
@@ -34,4 +36,13 @@ test('本机 Phase 2B 工具只显示安全摘要，拒绝输出上游错误正�
     () => executePhase2BProductionImport({ token: temporaryToken, fetchImpl: async () => { throw new Error(`network-${temporaryToken}`); } }),
     (error) => error.message === '导入网络请求未完成。' && !error.message.includes(temporaryToken)
   );
+});
+
+test('Windows PowerShell 包装器使用安全输入，并只在当前子进程环境中传递 Token', async () => {
+  const wrapper = await readFile(path.join(process.cwd(), 'scripts', 'import-phase2b-production.ps1'), 'utf8');
+  assert.match(wrapper, /Read-Host[\s\S]*-AsSecureString/);
+  assert.match(wrapper, /import-phase2b-production\.mjs'\) --from-env/);
+  assert.match(wrapper, /Remove-Item Env:NETLIFY_TAXKB_ADMIN_TOKEN/);
+  assert.match(wrapper, /ZeroFreeBSTR/);
+  assert.doesNotMatch(wrapper, /Read-Host[\s\S]*-AsPlainText/);
 });
