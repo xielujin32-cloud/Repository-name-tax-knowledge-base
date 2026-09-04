@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import { PHASE_2B_PRODUCTION_IMPORT_URL, executePhase2BProductionImport, parseArguments } from '../scripts/import-phase2b-production.mjs';
+
+const execFile = promisify(execFileCallback);
 
 test('本机 Phase 2B 工具固定生产入口和请求正文，不接受自定义参数', async () => {
   assert.deepEqual(parseArguments([]), { tokenSource: 'prompt' });
@@ -45,4 +49,23 @@ test('Windows PowerShell 包装器使用安全输入，并只在当前子进程�
   assert.match(wrapper, /Remove-Item Env:NETLIFY_TAXKB_ADMIN_TOKEN/);
   assert.match(wrapper, /ZeroFreeBSTR/);
   assert.doesNotMatch(wrapper, /Read-Host[\s\S]*-AsPlainText/);
+});
+
+test('Windows PowerShell 5.1 能实际解析生产导入包装器', async (t) => {
+  const scriptPath = path.join(process.cwd(), 'scripts', 'import-phase2b-production.ps1').replace(/'/g, "''");
+  const command = [
+    '$tokens = $null',
+    '$errors = $null',
+    `[System.Management.Automation.Language.Parser]::ParseFile('${scriptPath}', [ref]$tokens, [ref]$errors) | Out-Null`,
+    'if ($errors.Count -gt 0) { $errors | ForEach-Object { $_.Message }; exit 1 }',
+    'if ($PSVersionTable.PSVersion.Major -ne 5) { exit 2 }'
+  ].join('; ');
+  try {
+    await execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command]);
+  } catch (error) {
+    // Some restricted test sandboxes prohibit Node from spawning any child
+    // process. Normal Windows hosts still execute the real parser above.
+    if (error?.code === 'EPERM') t.skip('当前测试沙箱禁止 Node 启动 powershell.exe。');
+    else throw error;
+  }
 });
