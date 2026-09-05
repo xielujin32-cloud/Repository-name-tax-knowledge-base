@@ -3,11 +3,13 @@ import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object
 import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js';
 import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
+import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { importPolicies } from './policy-store.mjs';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
 export const PHASE_2D_REPARSE_CONFIRMATION = 'REPARSE_PHASE2B_TWO_CANDIDATES';
+export const PHASE_2D_METADATA_SUGGESTION_CONFIRMATION = 'SUGGEST_PHASE2B_TWO_CANDIDATES';
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2d-server-evidence-ingestion)';
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
 
@@ -236,6 +238,47 @@ export async function reparsePhase2BCandidates({ repository = defaultRepositoryF
   return { execution: 'reparsed', reparsed_candidates: results.length, results };
 }
 
+function metadataSuggestionSummary(suggestion) {
+  return {
+    rule_version: suggestion.rule_version,
+    input_body_sha256: suggestion.input_body_sha256,
+    generated_at: suggestion.generated_at,
+    tax_categories: suggestion.tax_categories,
+    keywords: suggestion.keywords,
+    summary: suggestion.summary
+  };
+}
+
+export async function generateEvidenceCandidateMetadataSuggestion(candidateId, { repository = defaultRepositoryFactory() } = {}) {
+  if (typeof repository.getCandidateForReview !== 'function' || typeof repository.saveMetadataSuggestion !== 'function') {
+    throw new Error('Evidence Repository 不支持 metadata_suggestion。');
+  }
+  const detail = await repository.getCandidateForReview(candidateId);
+  const body = detail.candidate.parsed_normalized_text ?? detail.raw_snapshot.normalized_text;
+  const suggestion = suggestEvidenceMetadata({
+    title: detail.candidate.parsed_fields?.title,
+    normalized_text: body
+  });
+  const saved = await repository.saveMetadataSuggestion(candidateId, suggestion);
+  return {
+    execution: saved.created ? 'generated' : 'already_current',
+    candidate: adminCandidateSummary(saved.candidate),
+    metadata_suggestion: metadataSuggestionSummary(saved.metadata_suggestion)
+  };
+}
+
+export async function generatePhase2BMetadataSuggestions({ repository = defaultRepositoryFactory() } = {}) {
+  if (typeof repository.listCandidatesForReview !== 'function') throw new Error('Evidence Repository 不支持 Candidate 列表。');
+  const candidates = (await repository.listCandidatesForReview())
+    .filter((candidate) => candidate.source_id === CHINA_TAX_POLICY_SOURCE.source_id
+      && PHASE_2B_ALLOWED_DETAIL_URLS.includes(candidate.canonical_url || candidate.official_url));
+  if (candidates.length !== PHASE_2B_ALLOWED_DETAIL_URLS.length) throw new Error('未找到两条 Phase 2B 白名单 Candidate，已停止生成建议。');
+  if (candidates.some((candidate) => candidate.verification_state !== 'pending_review')) throw new Error('Phase 2B Candidate 必须均为 pending_review 才能生成建议。');
+  const results = [];
+  for (const candidate of candidates) results.push(await generateEvidenceCandidateMetadataSuggestion(candidate.candidate_id, { repository }));
+  return { execution: 'generated', suggested_candidates: results.length, results };
+}
+
 async function fetchAllowedOfficialDetail(fetchImpl, officialUrl) {
   const response = await fetchImpl(officialUrl, {
     headers: { 'user-agent': DETAIL_USER_AGENT }, signal: AbortSignal.timeout(20_000)
@@ -380,6 +423,13 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       }
       return json(await reparsePhase2BCandidates({ repository: repositoryFactory() }));
     }
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/suggest-phase2b-metadata') {
+      const input = await requestBody(request);
+      if (Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== PHASE_2D_METADATA_SUGGESTION_CONFIRMATION) {
+        return json({ error: 'metadata_suggestion 只接受固定 apply 与 confirmation，且不会接收 URL、文件或政策内容。' }, 400);
+      }
+      return json(await generatePhase2BMetadataSuggestions({ repository: repositoryFactory() }));
+    }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));
     if (request.method === 'GET' && pathname === '/api/admin/evidence/candidates') {
       const candidates = await repositoryFactory().listCandidatesForReview();
@@ -388,6 +438,12 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);
       return json({ detail: adminReviewDetail(await repositoryFactory().getCandidateForReview(candidateId)) });
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/suggest-metadata$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      const input = await requestBody(request);
+      if (Object.keys(input).length) return json({ error: '单条 metadata_suggestion 不接受请求参数。' }, 400);
+      return json(await generateEvidenceCandidateMetadataSuggestion(candidateId, { repository: repositoryFactory() }));
     }
     if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/review$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);

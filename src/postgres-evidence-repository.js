@@ -148,6 +148,34 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('该 Candidate 正在重新解析中，请稍后重试。');
     return locked.result;
   }
+  async function saveMetadataSuggestion(candidateId, metadataSuggestion) {
+    const candidateKey = required(candidateId, 'candidate_id');
+    if (!metadataSuggestion || typeof metadataSuggestion !== 'object' || Array.isArray(metadataSuggestion)) throw new Error('metadata_suggestion 必须是对象。');
+    const ruleVersion = required(metadataSuggestion.rule_version, 'metadata_suggestion.rule_version');
+    const inputHash = required(metadataSuggestion.input_body_sha256, 'metadata_suggestion.input_body_sha256');
+    const locked = await withExclusiveLock(`taxkb:evidence-metadata-suggestion:${candidateKey}`, async () => {
+      const detail = await getCandidateForReview(candidateKey);
+      const candidate = detail.candidate;
+      if (candidate.verification_state !== 'pending_review') throw new Error('只有 pending_review Candidate 可以生成审核建议。');
+      const body = candidate.parsed_normalized_text ?? detail.raw_snapshot.normalized_text;
+      if (sha256(body) !== inputHash) throw new Error('metadata_suggestion 与当前解析正文不一致，已停止保存。');
+      const existing = jsonObject(candidate.parsed_fields).metadata_suggestion;
+      if (existing?.rule_version === ruleVersion && existing?.input_body_sha256 === inputHash) {
+        return { ...detail, metadata_suggestion: existing, created: false };
+      }
+      const timestamp = clock();
+      const fields = { ...jsonObject(candidate.parsed_fields), metadata_suggestion: metadataSuggestion };
+      await pool.query('UPDATE candidates SET parsed_fields=$2, updated_at=$3 WHERE candidate_id=$1', [candidateKey, JSON.stringify(fields), timestamp]);
+      await pool.query(
+        'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'candidate', candidateKey, 'metadata_suggestion_generated', JSON.stringify({ rule_version: ruleVersion, input_body_sha256: inputHash, tax_categories: metadataSuggestion.tax_categories?.values || [], keywords: metadataSuggestion.keywords?.values || [] }), timestamp]
+      );
+      const updated = await getCandidateForReview(candidateKey);
+      return { ...updated, metadata_suggestion: jsonObject(updated.candidate.parsed_fields).metadata_suggestion, created: true };
+    });
+    if (!locked.acquired) throw new Error('该 Candidate 正在生成审核建议，请稍后重试。');
+    return locked.result;
+  }
   async function reviewCandidate(candidateId, { action, legal_status = 'pending', reviewer_id = 'netlify-admin', note = '', confirmed_fields = {} } = {}) {
     const candidateKey = required(candidateId, 'candidate_id');
     const requestedAction = required(action, 'action');
@@ -256,5 +284,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

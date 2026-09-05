@@ -17,6 +17,12 @@ async function api(path, options = {}) {
 
 function message(id, value = '', type = '') { const node = $(id); node.textContent = value; node.className = `message ${type}`; }
 function inputValue(name, value) { $(`[name="${name}"]`).value = value || ''; }
+function preferredSuggestion(fields, field) {
+  if (field === 'summary' && String(fields[field] || '').trim()) return fields[field];
+  if (Array.isArray(fields[field]) && fields[field].length) return fields[field];
+  const suggestion = fields.metadata_suggestion || {};
+  return suggestion[field]?.values || (field === 'summary' ? suggestion.summary?.value : null);
+}
 
 function renderCandidates(candidates) {
   const root = $('#candidate-list');
@@ -49,7 +55,12 @@ async function loadDetail(candidateId) {
   inputValue('title', fields.title); inputValue('document_no', fields.document_no);
   inputValue('issuing_authority', arrayText(fields.issuing_authority)); inputValue('publish_date', fields.publish_date);
   inputValue('effective_date', fields.effective_date); inputValue('expiry_date', fields.expiry_date);
-  inputValue('tax_categories', arrayText(fields.tax_categories)); inputValue('keywords', arrayText(fields.keywords)); inputValue('summary', fields.summary);
+  inputValue('tax_categories', arrayText(preferredSuggestion(fields, 'tax_categories')));
+  inputValue('keywords', arrayText(preferredSuggestion(fields, 'keywords'))); inputValue('summary', preferredSuggestion(fields, 'summary'));
+  const suggestion = fields.metadata_suggestion;
+  message('#suggestion-message', suggestion
+    ? `系统建议 / 待人工确认：规则 ${suggestion.rule_version}；可直接修改、删除或清空后再发布。`
+    : '尚未生成系统建议；税种、关键词和摘要可由管理员手动填写。');
   $('[name="legal_status"]').value = detail.candidate.legal_status || 'pending';
   $('#normalized-text').value = detail.raw_snapshot.normalized_text || '';
   $('#raw-html').value = detail.raw_snapshot.raw_html || '';
@@ -94,6 +105,23 @@ async function reparsePhase2B() {
   finally { button.disabled = false; }
 }
 
+async function suggestPhase2BMetadata() {
+  const confirmation = prompt('此操作只会从当前已解析正文生成两条 Phase 2B 的税种、关键词和摘要建议，不会抓取、发布或改变效力状态。请输入确认短语：');
+  if (confirmation !== 'SUGGEST_PHASE2B_TWO_CANDIDATES') return message('#list-message', '未生成建议：确认短语不匹配。', 'error');
+  const button = $('#suggest-phase2b-metadata');
+  button.disabled = true;
+  try {
+    const result = await api('/api/admin/evidence/suggest-phase2b-metadata', {
+      method: 'POST',
+      body: JSON.stringify({ apply: true, confirmation })
+    });
+    message('#list-message', `审核建议已生成：${result.suggested_candidates} 条 Candidate；仍待人工确认。`, 'success');
+    await loadCandidates();
+    if (selectedCandidateId) await loadDetail(selectedCandidateId);
+  } catch (error) { message('#list-message', `生成建议失败：${error.message}`, 'error'); }
+  finally { button.disabled = false; }
+}
+
 async function submitReview(action) {
   if (!selectedCandidateId) return;
   if (!confirm(action === 'approve' ? '确认已完成 Level 3 人工核验并发布？' : `确认执行 ${action}？`)) return;
@@ -115,6 +143,7 @@ $('#connect').addEventListener('click', async () => {
 });
 $('#reload').addEventListener('click', () => loadCandidates().catch((error) => message('#list-message', error.message, 'error')));
 $('#reparse-phase2b').addEventListener('click', reparsePhase2B);
+$('#suggest-phase2b-metadata').addEventListener('click', suggestPhase2BMetadata);
 $('#review-form').addEventListener('submit', (event) => { event.preventDefault(); submitReview('approve'); });
 $('#reject').addEventListener('click', () => submitReview('reject'));
 $('#return').addEventListener('click', () => submitReview('return'));

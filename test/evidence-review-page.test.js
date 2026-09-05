@@ -10,5 +10,8 @@ test('Evidence 审核页面使用运行时密码输入，不持久化管理员 T
   assert.match(script, /let adminToken = ''/);
   assert.match(script, /\/api\/admin\/evidence\/candidates/);
   assert.match(script, /authorization: `Bearer \$\{adminToken\}`/);
+  assert.match(html, /id="suggest-phase2b-metadata"/);
+  assert.match(script, /SUGGEST_PHASE2B_TWO_CANDIDATES/);
+  assert.match(script, /系统建议 \/ 待人工确认/);
   assert.doesNotMatch(script, /localStorage|sessionStorage|NETLIFY_TAXKB_ADMIN_TOKEN/);
 });

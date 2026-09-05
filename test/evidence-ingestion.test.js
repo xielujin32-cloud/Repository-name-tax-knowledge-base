@@ -6,15 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
 import { createApiHandler } from '../netlify/functions/api.mjs';
-import { createEvidenceAdminHandler, ingestPhase2BWhitelistOnce, PHASE_2D_IMPORT_CONFIRMATION, PHASE_2D_REPARSE_CONFIRMATION } from '../netlify/lib/evidence-ingestion.mjs';
+import { createEvidenceAdminHandler, ingestPhase2BWhitelistOnce, PHASE_2D_IMPORT_CONFIRMATION, PHASE_2D_REPARSE_CONFIRMATION, PHASE_2D_METADATA_SUGGESTION_CONFIRMATION } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
 import { PHASE_2B_ALLOWED_DETAIL_URLS } from '../src/chinatax-evidence-collection.js';
 
 const [firstUrl, secondUrl] = PHASE_2B_ALLOWED_DETAIL_URLS;
 const pages = new Map([
-  [firstUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告"><meta name="PubDate" content="2026-08-28"></head><body><header>登录 本站热词 个人中心</header><div class="detials contentLeft"><h3>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h3><h5 class="actfwzh">财政部 税务总局 中国证监会公告2026年第26号</h5><div class="article"><div class="arc_cont"><p>本公告自2026年9月1日起施行。</p><p>第一条 原始证据正文一。</p></div></div></div></body></html>'],
-  [secondUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局关于明确非应税交易等增值税有关事项的公告"><meta name="PubDate" content="2026-08-27"></head><body><nav>登录 本站热词</nav><div class="detials contentLeft"><h3>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h3><h5 class="actfwzh">财政部 税务总局公告2026年第25号</h5><div class="article"><div class="arc_cont"><p>自2026年9月1日起施行。</p><p>第一条 原始证据正文二。</p></div></div></div></body></html>']
+  [firstUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告"><meta name="PubDate" content="2026-08-28"></head><body><header>登录 本站热词 个人中心</header><div class="detials contentLeft"><h3>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h3><h5 class="actfwzh">财政部 税务总局 中国证监会公告2026年第26号</h5><div class="article"><div class="arc_cont"><p>本公告自2026年9月1日起施行。</p><p>第一条 原始证据正文一：个人转让限售股所得按照财产转让所得缴纳个人所得税。</p><p>证券机构预扣预缴税款，纳税人可以办理清算申报并提供成本原值资料。</p></div></div></div></body></html>'],
+  [secondUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局关于明确非应税交易等增值税有关事项的公告"><meta name="PubDate" content="2026-08-27"></head><body><nav>登录 本站热词</nav><div class="detials contentLeft"><h3>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h3><h5 class="actfwzh">财政部 税务总局公告2026年第25号</h5><div class="article"><div class="arc_cont"><p>自2026年9月1日起施行。</p><p>第一条 原始证据正文二：非应税交易对应进项税额可以按照规定抵扣。</p><p>增值税扣税凭证中的农产品销售发票按照有关规定处理。</p></div></div></div></body></html>']
 ]);
 
 async function fakeFetch(url) {
@@ -68,6 +68,10 @@ test('Phase 2D Evidence 管理接口仅允许管理员，并在本地完成白�
     const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({ repositoryFactory, fetchImpl: countingFetch }) });
     const noToken = await call(handler, '/api/admin/evidence/status');
     assert.equal(noToken.response.status, 401);
+    const noTokenSuggestion = await call(handler, '/api/admin/evidence/suggest-phase2b-metadata', {
+      method: 'POST', body: { apply: true, confirmation: PHASE_2D_METADATA_SUGGESTION_CONFIRMATION }
+    });
+    assert.equal(noTokenSuggestion.response.status, 401);
     const wrongToken = await call(handler, '/api/admin/evidence/status', { token: `wrong-${randomUUID()}` });
     assert.equal(wrongToken.response.status, 401);
     const invalidInput = await call(handler, '/api/admin/evidence/import-phase2b', { method: 'POST', token: testAdminToken, body: { apply: true, url: firstUrl } });
@@ -253,11 +257,26 @@ test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建
     assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 2 });
 
     const candidateId = ingest.body.results[0].candidate.candidate_id;
+    const beforeSuggestion = await call(handler, `/api/admin/evidence/candidates/${candidateId}`, { token: testAdminToken });
+    assert.equal(beforeSuggestion.response.status, 200);
+    const suggestionInput = { method: 'POST', token: testAdminToken, body: { apply: true, confirmation: PHASE_2D_METADATA_SUGGESTION_CONFIRMATION } };
+    const suggested = await call(handler, '/api/admin/evidence/suggest-phase2b-metadata', suggestionInput);
+    assert.equal(suggested.response.status, 200);
+    assert.equal(suggested.body.suggested_candidates, 2);
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 4 });
+    const repeatedSuggestion = await call(handler, '/api/admin/evidence/suggest-phase2b-metadata', suggestionInput);
+    assert.equal(repeatedSuggestion.response.status, 200);
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 4 });
+
     const detail = await call(handler, `/api/admin/evidence/candidates/${candidateId}`, { token: testAdminToken });
     assert.equal(detail.response.status, 200);
     assert.match(detail.body.detail.raw_snapshot.normalized_text, /第一条 原始证据正文一/);
     assert.doesNotMatch(detail.body.detail.raw_snapshot.normalized_text, /登录|本站热词|个人中心/);
     assert.match(detail.body.detail.raw_snapshot.raw_html, /登录 本站热词 个人中心/);
+    assert.equal(detail.body.detail.raw_snapshot.raw_html, beforeSuggestion.body.detail.raw_snapshot.raw_html);
+    assert.equal(detail.body.detail.raw_snapshot.normalized_text, beforeSuggestion.body.detail.raw_snapshot.normalized_text);
+    assert.deepEqual(detail.body.detail.candidate.parsed_fields.metadata_suggestion.tax_categories.values, ['个人所得税']);
+    assert.ok(detail.body.detail.candidate.parsed_fields.metadata_suggestion.keywords.values.includes('限售股'));
     assert.doesNotMatch(JSON.stringify(detail.body.detail.candidate.parsed_fields), /normalized_text_object_key/);
 
     const approved = await call(handler, `/api/admin/evidence/candidates/${candidateId}/review`, {
@@ -279,7 +298,7 @@ test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建
 
     const second = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
     assert.equal(second.response.status, 422, '已审核 Candidate 不能通过重新解析接口重写');
-    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 1, policies: 1, policy_versions: 1, policy_relations: 0, audit_events: 3 });
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 1, policies: 1, policy_versions: 1, policy_relations: 0, audit_events: 5 });
   } finally {
     if (originalToken === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
     else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = originalToken;
