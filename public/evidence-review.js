@@ -77,6 +77,23 @@ function reviewPayload(action) {
   };
 }
 
+async function reparsePhase2B() {
+  const confirmation = prompt('此操作只会从已保存的原始 HTML 重新解析两条 Phase 2B Candidate，不会抓取网页或发布政策。请输入确认短语：');
+  if (confirmation !== 'REPARSE_PHASE2B_TWO_CANDIDATES') return message('#list-message', '未执行重新解析：确认短语不匹配。', 'error');
+  const button = $('#reparse-phase2b');
+  button.disabled = true;
+  try {
+    const result = await api('/api/admin/evidence/reparse-phase2b', {
+      method: 'POST',
+      body: JSON.stringify({ apply: true, confirmation })
+    });
+    message('#list-message', `重新解析完成：${result.reparsed_candidates} 条 Candidate；未创建新 Candidate。`, 'success');
+    await loadCandidates();
+    if (selectedCandidateId) await loadDetail(selectedCandidateId);
+  } catch (error) { message('#list-message', `重新解析失败：${error.message}`, 'error'); }
+  finally { button.disabled = false; }
+}
+
 async function submitReview(action) {
   if (!selectedCandidateId) return;
   if (!confirm(action === 'approve' ? '确认已完成 Level 3 人工核验并发布？' : `确认执行 ${action}？`)) return;
@@ -97,6 +114,7 @@ $('#connect').addEventListener('click', async () => {
   catch (error) { adminToken = ''; message('#login-message', `验证失败：${error.message}`, 'error'); }
 });
 $('#reload').addEventListener('click', () => loadCandidates().catch((error) => message('#list-message', error.message, 'error')));
+$('#reparse-phase2b').addEventListener('click', reparsePhase2B);
 $('#review-form').addEventListener('submit', (event) => { event.preventDefault(); submitReview('approve'); });
 $('#reject').addEventListener('click', () => submitReview('reject'));
 $('#return').addEventListener('click', () => submitReview('return'));

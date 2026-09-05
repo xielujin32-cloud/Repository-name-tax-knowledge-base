@@ -73,12 +73,80 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const snapshot = jsonObject(row.raw_snapshot);
     const rawHtml = await objectStore.read(snapshot.raw_object_key);
     const normalizedText = await objectStore.read(snapshot.normalized_text_object_key);
+    const parsedFields = jsonObject(row.parsed_fields);
+    const normalization = jsonObject(parsedFields.normalization);
+    const reparsedText = normalization.normalized_text_object_key
+      ? await objectStore.read(normalization.normalized_text_object_key)
+      : null;
     return {
-      candidate: { ...row, parsed_fields: jsonObject(row.parsed_fields), observed_snapshot_ids: jsonObject(row.observed_snapshot_ids, []) },
+      candidate: {
+        ...row,
+        parsed_fields: parsedFields,
+        observed_snapshot_ids: jsonObject(row.observed_snapshot_ids, []),
+        parsed_normalized_text: reparsedText === null ? null : String(reparsedText || '')
+      },
       raw_snapshot: { ...snapshot, raw_html: String(rawHtml || ''), normalized_text: String(normalizedText || '') },
       collection_run: jsonObject(row.collection_run),
       source: jsonObject(row.source)
     };
+  }
+  async function reparseCandidate(candidateId, { parsed_fields = {}, normalized_text, parser_version } = {}) {
+    const candidateKey = required(candidateId, 'candidate_id');
+    const body = required(normalized_text, 'normalized_text');
+    const parserVersion = required(parser_version, 'parser_version');
+    const bodyHash = sha256(body);
+    const locked = await withExclusiveLock(`taxkb:evidence-reparse:${candidateKey}`, async () => {
+      const detail = await getCandidateForReview(candidateKey);
+      const candidate = detail.candidate;
+      if (candidate.verification_state !== 'pending_review') throw new Error('只有 pending_review Candidate 可以重新解析。');
+      const previousNormalization = jsonObject(candidate.parsed_fields).normalization || {};
+      if (previousNormalization.normalized_text_sha256 === bodyHash && previousNormalization.parser_version === parserVersion && candidate.parsed_normalized_text === body) {
+        return { ...detail, reparsed: false };
+      }
+      const collision = await pool.query(
+        'SELECT candidate_id FROM candidates WHERE source_id=$1 AND canonical_url=$2 AND normalized_text_sha256=$3 AND candidate_id<>$4',
+        [candidate.source_id, candidate.canonical_url, bodyHash, candidateKey]
+      );
+      if (collision.rows.length) throw new Error(`重新解析结果已属于 Candidate：${collision.rows[0].candidate_id}`);
+      const objectKey = `candidate-normalizations/${candidateKey}/${bodyHash}/normalized-text`;
+      if (!(typeof objectStore.has === 'function' && await objectStore.has(objectKey))) {
+        try { await objectStore.putImmutable(objectKey, body); }
+        catch (error) {
+          // A retry may reach an already-created immutable object after an
+          // earlier request stored it but failed before the database update.
+          if (!/不可覆盖|already exists|EEXIST/i.test(String(error?.message || error))) throw error;
+        }
+      }
+      const timestamp = clock();
+      const fields = {
+        ...jsonObject(parsed_fields),
+        normalization: {
+          parser_version: parserVersion,
+          normalized_text_sha256: bodyHash,
+          normalized_text_object_key: objectKey,
+          derived_from_snapshot_id: candidate.snapshot_id,
+          reparsed_at: timestamp
+        }
+      };
+      await pool.query(
+        'UPDATE candidates SET normalized_text_sha256=$2, parsed_fields=$3, updated_at=$4 WHERE candidate_id=$1',
+        [candidateKey, bodyHash, JSON.stringify(fields), timestamp]
+      );
+      await pool.query(
+        'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'candidate', candidateKey, 'candidate_reparsed', JSON.stringify({ parser_version: parserVersion, normalized_text_sha256: bodyHash, derived_from_snapshot_id: candidate.snapshot_id }), timestamp]
+      );
+      const updated = await getCandidateForReview(candidateKey);
+      return {
+        candidate: updated.candidate,
+        raw_snapshot: updated.raw_snapshot,
+        collection_run: updated.collection_run,
+        source: updated.source,
+        reparsed: true
+      };
+    });
+    if (!locked.acquired) throw new Error('该 Candidate 正在重新解析中，请稍后重试。');
+    return locked.result;
   }
   async function reviewCandidate(candidateId, { action, legal_status = 'pending', reviewer_id = 'netlify-admin', note = '', confirmed_fields = {} } = {}) {
     const candidateKey = required(candidateId, 'candidate_id');
@@ -117,7 +185,6 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       const nextVerification = requestedAction === 'approve' ? 'verified' : requestedAction === 'reject' ? 'rejected' : 'pending_review';
       const nextLegal = requestedAction === 'return' ? candidate.legal_status : legal_status;
       await pool.query('UPDATE candidates SET verification_state=$2, legal_status=$3, updated_at=$4 WHERE candidate_id=$1', [candidateKey, nextVerification, nextLegal, timestamp]);
-      const updatedCandidate = (await pool.query('SELECT * FROM candidates WHERE candidate_id=$1', [candidateKey])).rows[0];
       let policy = null;
       let policyVersion = null;
       if (requestedAction === 'approve') {
@@ -142,7 +209,8 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
         [id('audit'), 'candidate', candidateKey, `level3_${requestedAction}`, JSON.stringify({ review_decision_id: reviewId, reviewer_id: reviewer, legal_status: nextLegal, policy_id: policy?.policy_id || null, policy_version_id: policyVersion?.policy_version_id || null }), timestamp]
       );
-      return { execution: requestedAction, ...detail, candidate: { ...updatedCandidate, parsed_fields: jsonObject(updatedCandidate.parsed_fields) }, review_decision: { ...review, confirmed_fields: fields }, policy, policy_version: policyVersion, confirmed_fields: fields };
+      const activeDetail = await getCandidateForReview(candidateKey);
+      return { execution: requestedAction, ...activeDetail, candidate: activeDetail.candidate, review_decision: { ...review, confirmed_fields: fields }, policy, policy_version: policyVersion, confirmed_fields: fields };
     });
     if (!locked.acquired) throw new Error('该 Candidate 正在审核中，请稍后重试。');
     return locked.result;
@@ -183,5 +251,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

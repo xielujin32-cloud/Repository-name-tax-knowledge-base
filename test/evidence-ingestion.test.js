@@ -6,15 +6,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
 import { createApiHandler } from '../netlify/functions/api.mjs';
-import { createEvidenceAdminHandler, ingestPhase2BWhitelistOnce, PHASE_2D_IMPORT_CONFIRMATION } from '../netlify/lib/evidence-ingestion.mjs';
+import { createEvidenceAdminHandler, ingestPhase2BWhitelistOnce, PHASE_2D_IMPORT_CONFIRMATION, PHASE_2D_REPARSE_CONFIRMATION } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
 import { PHASE_2B_ALLOWED_DETAIL_URLS } from '../src/chinatax-evidence-collection.js';
 
 const [firstUrl, secondUrl] = PHASE_2B_ALLOWED_DETAIL_URLS;
 const pages = new Map([
-  [firstUrl, '<html><body><h1>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h1><p>财政部 税务总局 中国证监会公告2026年第26号</p><p>发布时间：2026年8月28日</p><p>本公告自2026年9月1日起施行。</p><p>第一条 原始证据正文一。</p></body></html>'],
-  [secondUrl, '<html><body><h1>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h1><p>财政部 税务总局公告2026年第25号</p><p>成文日期：2026-08-27</p><p>自2026年9月1日起施行。</p><p>第一条 原始证据正文二。</p></body></html>']
+  [firstUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告"><meta name="PubDate" content="2026-08-28"></head><body><header>登录 本站热词 个人中心</header><div class="detials contentLeft"><h3>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h3><h5 class="actfwzh">财政部 税务总局 中国证监会公告2026年第26号</h5><div class="article"><div class="arc_cont"><p>本公告自2026年9月1日起施行。</p><p>第一条 原始证据正文一。</p></div></div></div></body></html>'],
+  [secondUrl, '<html><head><meta name="ArticleTitle" content="财政部 税务总局关于明确非应税交易等增值税有关事项的公告"><meta name="PubDate" content="2026-08-27"></head><body><nav>登录 本站热词</nav><div class="detials contentLeft"><h3>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h3><h5 class="actfwzh">财政部 税务总局公告2026年第25号</h5><div class="article"><div class="arc_cont"><p>自2026年9月1日起施行。</p><p>第一条 原始证据正文二。</p></div></div></div></body></html>']
 ]);
 
 async function fakeFetch(url) {
@@ -212,6 +212,76 @@ test('Phase 2D production-style advisory lock lets only one concurrent request e
   assert.equal(fetchCount, 2);
   assert.equal(snapshotCount, 2);
   assert.equal(candidateCount, 2);
+});
+
+test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建 Candidate 或 Snapshot', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-evidence-reparse-'));
+  const database = new NetlifyDB({ directory: path.join(root, 'database'), logger: () => {} });
+  const originalToken = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  const testAdminToken = `evidence-reparse-${randomUUID()}`;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = testAdminToken;
+  const projections = [];
+  try {
+    await database.start();
+    await database.reset();
+    await database.applyMigrations(path.join(process.cwd(), 'netlify', 'database', 'migrations'));
+    const repositoryFactory = () => createPostgresEvidenceRepository({
+      pool: database,
+      objectStore: createLocalEvidenceObjectStore({ rootDirectory: path.join(root, 'taxkb-evidence-raw') })
+    });
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory,
+      fetchImpl: fakeFetch,
+      publishProjection: async (policy) => { projections.push(policy); return { total: 1, added: 1, updated: 0, skipped: 0, errors: [] }; }
+    }) });
+    const ingest = await call(handler, '/api/admin/evidence/import-phase2b', { method: 'POST', token: testAdminToken, body: { apply: true, confirmation: PHASE_2D_IMPORT_CONFIRMATION } });
+    assert.equal(ingest.response.status, 200);
+    const reparseInput = { method: 'POST', token: testAdminToken, body: { apply: true, confirmation: PHASE_2D_REPARSE_CONFIRMATION } };
+    const first = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
+    assert.equal(first.response.status, 200);
+    assert.equal(first.body.execution, 'reparsed');
+    assert.equal(first.body.reparsed_candidates, 2);
+    assert.ok(first.body.results.every((item) => item.verification_state === 'pending_review' && item.legal_status === 'pending'));
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 2 });
+
+    const repeatBeforeReview = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
+    assert.equal(repeatBeforeReview.response.status, 200);
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 2 });
+
+    const candidateId = ingest.body.results[0].candidate.candidate_id;
+    const detail = await call(handler, `/api/admin/evidence/candidates/${candidateId}`, { token: testAdminToken });
+    assert.equal(detail.response.status, 200);
+    assert.match(detail.body.detail.raw_snapshot.normalized_text, /第一条 原始证据正文一/);
+    assert.doesNotMatch(detail.body.detail.raw_snapshot.normalized_text, /登录|本站热词|个人中心/);
+    assert.match(detail.body.detail.raw_snapshot.raw_html, /登录 本站热词 个人中心/);
+    assert.doesNotMatch(JSON.stringify(detail.body.detail.candidate.parsed_fields), /normalized_text_object_key/);
+
+    const approved = await call(handler, `/api/admin/evidence/candidates/${candidateId}/review`, {
+      method: 'POST', token: testAdminToken,
+      body: { action: 'approve', legal_status: 'pending', fields: {
+        title: detail.body.detail.candidate.parsed_fields.title,
+        document_no: detail.body.detail.candidate.parsed_fields.document_no,
+        issuing_authority: detail.body.detail.candidate.parsed_fields.issuing_authority,
+        publish_date: detail.body.detail.candidate.parsed_fields.publish_date,
+        effective_date: detail.body.detail.candidate.parsed_fields.effective_date,
+        expiry_date: detail.body.detail.candidate.parsed_fields.expiry_date,
+        tax_categories: [], keywords: []
+      } }
+    });
+    assert.equal(approved.response.status, 200);
+    assert.equal(projections.length, 1);
+    assert.match(projections[0].evidence.normalized_text, /第一条 原始证据正文一/);
+    assert.doesNotMatch(projections[0].evidence.normalized_text, /登录|本站热词|个人中心/);
+
+    const second = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
+    assert.equal(second.response.status, 422, '已审核 Candidate 不能通过重新解析接口重写');
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 1, policies: 1, policy_versions: 1, policy_relations: 0, audit_events: 3 });
+  } finally {
+    if (originalToken === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+    else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = originalToken;
+    await database.stop();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('Evidence Candidate 经过 Level 3 审核后生成幂等 Policy Version 与公开投影', async () => {

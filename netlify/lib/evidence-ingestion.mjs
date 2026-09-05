@@ -7,6 +7,7 @@ import { importPolicies } from './policy-store.mjs';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
+export const PHASE_2D_REPARSE_CONFIRMATION = 'REPARSE_PHASE2B_TWO_CANDIDATES';
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2d-server-evidence-ingestion)';
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
 
@@ -38,6 +39,15 @@ function safeCandidate(candidate) {
     created_at: candidate.created_at,
     updated_at: candidate.updated_at
   };
+}
+
+function safeParsedFields(fields) {
+  const value = fields && typeof fields === 'object' ? { ...fields } : {};
+  if (value.normalization && typeof value.normalization === 'object') {
+    const { normalized_text_object_key: ignored, ...normalization } = value.normalization;
+    value.normalization = normalization;
+  }
+  return value;
 }
 
 function safeTrace(trace) {
@@ -87,7 +97,7 @@ function adminCandidateSummary(candidate) {
     source_name: candidate.source_name || null,
     official_domain: candidate.official_domain || null,
     official_url: candidate.official_url,
-    parsed_fields: candidate.parsed_fields || {},
+    parsed_fields: safeParsedFields(candidate.parsed_fields),
     verification_state: candidate.verification_state,
     legal_status: candidate.legal_status,
     created_at: candidate.created_at,
@@ -102,7 +112,7 @@ function adminReviewDetail(detail) {
       source_id: detail.candidate.source_id,
       official_url: detail.candidate.official_url,
       canonical_url: detail.candidate.canonical_url,
-      parsed_fields: detail.candidate.parsed_fields || {},
+      parsed_fields: safeParsedFields(detail.candidate.parsed_fields),
       verification_state: detail.candidate.verification_state,
       legal_status: detail.candidate.legal_status,
       created_at: detail.candidate.created_at,
@@ -119,7 +129,9 @@ function adminReviewDetail(detail) {
       normalized_text_sha256: detail.raw_snapshot.normalized_text_sha256,
       parser_version: detail.raw_snapshot.parser_version,
       raw_html: detail.raw_snapshot.raw_html,
-      normalized_text: detail.raw_snapshot.normalized_text
+      // A parser correction is a Candidate-level derived artifact. The raw
+      // snapshot remains immutable and is still returned separately as proof.
+      normalized_text: detail.candidate.parsed_normalized_text ?? detail.raw_snapshot.normalized_text
     },
     collection_run: detail.collection_run,
     source: detail.source
@@ -153,7 +165,7 @@ export async function reviewEvidenceCandidate(candidateId, input, { repository =
       policy: result.policy,
       policyVersion: result.policy_version,
       confirmedFields: result.confirmed_fields,
-      normalizedText: result.raw_snapshot.normalized_text
+      normalizedText: result.candidate.parsed_normalized_text ?? result.raw_snapshot.normalized_text
     });
     publication = await publishProjection(projection);
   }
@@ -174,6 +186,54 @@ export async function reviewEvidenceCandidate(candidateId, input, { repository =
     policy_version: result.policy_version ? { policy_version_id: result.policy_version.policy_version_id, policy_id: result.policy_version.policy_id, version_number: result.policy_version.version_number, candidate_id: result.policy_version.candidate_id } : null,
     publication
   };
+}
+
+/**
+ * Rebuilds only the parse result of the two already-ingested Phase 2B
+ * Candidates from their preserved raw HTML. It does not fetch a URL, create a
+ * Raw Snapshot, or create a Candidate. The repository stores a new immutable
+ * derived-text object and an audit event while retaining the original snapshot.
+ */
+export async function reparsePhase2BCandidates({ repository = defaultRepositoryFactory() } = {}) {
+  if (typeof repository.listCandidatesForReview !== 'function' || typeof repository.getCandidateForReview !== 'function' || typeof repository.reparseCandidate !== 'function') {
+    throw new Error('Evidence Repository 不支持 Candidate 重新解析。');
+  }
+  const candidates = (await repository.listCandidatesForReview())
+    .filter((candidate) => candidate.source_id === CHINA_TAX_POLICY_SOURCE.source_id
+      && PHASE_2B_ALLOWED_DETAIL_URLS.includes(candidate.canonical_url || candidate.official_url));
+  if (candidates.length !== PHASE_2B_ALLOWED_DETAIL_URLS.length) throw new Error('未找到两条 Phase 2B 白名单 Candidate，已停止重新解析。');
+  if (candidates.some((candidate) => candidate.verification_state !== 'pending_review')) throw new Error('Phase 2B Candidate 必须均为 pending_review 才能重新解析。');
+  const results = [];
+  for (const candidate of candidates) {
+    const detail = await repository.getCandidateForReview(candidate.candidate_id);
+    const parsed = parseChinaTaxPolicyEvidence(detail.raw_snapshot.raw_html);
+    const reparsed = await repository.reparseCandidate(candidate.candidate_id, {
+      parser_version: 'chinatax-evidence-2.1.0-dom-body',
+      normalized_text: parsed.normalized_text,
+      parsed_fields: {
+        ...detail.candidate.parsed_fields,
+        title: parsed.title,
+        document_no: parsed.document_no,
+        issuing_authority: parsed.issuing_authority,
+        publish_date: parsed.publish_date,
+        effective_date: parsed.effective_date,
+        expiry_date: parsed.expiry_date,
+        official_url: detail.candidate.official_url,
+        source_id: detail.candidate.source_id,
+        snapshot_id: detail.candidate.snapshot_id
+      }
+    });
+    results.push({
+      candidate_id: reparsed.candidate.candidate_id,
+      official_url: reparsed.candidate.official_url,
+      title: reparsed.candidate.parsed_fields.title || null,
+      normalized_text_sha256: reparsed.candidate.parsed_fields.normalization?.normalized_text_sha256 || null,
+      normalized_text_length: String(reparsed.candidate.parsed_normalized_text || '').length,
+      verification_state: reparsed.candidate.verification_state,
+      legal_status: reparsed.candidate.legal_status
+    });
+  }
+  return { execution: 'reparsed', reparsed_candidates: results.length, results };
 }
 
 async function fetchAllowedOfficialDetail(fetchImpl, officialUrl) {
@@ -312,6 +372,13 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       }
       const result = await ingestPhase2BWhitelistOnce({ repository: repositoryFactory(), fetchImpl });
       return json({ mode: 'apply', allowlist_size: PHASE_2B_ALLOWED_DETAIL_URLS.length, ...result });
+    }
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/reparse-phase2b') {
+      const input = await requestBody(request);
+      if (Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== PHASE_2D_REPARSE_CONFIRMATION) {
+        return json({ error: 'Evidence 重新解析只接受固定 apply 与 confirmation，且不会接收 URL、文件或政策内容。' }, 400);
+      }
+      return json(await reparsePhase2BCandidates({ repository: repositoryFactory() }));
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));
     if (request.method === 'GET' && pathname === '/api/admin/evidence/candidates') {

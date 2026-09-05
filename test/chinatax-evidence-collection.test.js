@@ -6,8 +6,8 @@ import { policySeedPolicies } from '../src/policy-seed.js';
 
 const [firstUrl, secondUrl] = PHASE_2B_ALLOWED_DETAIL_URLS;
 const pages = new Map([
-  [firstUrl, `<html><head><title>限售股个人所得税政策公告_国家税务总局</title></head><body><h1>国家税务总局政策法规库</h1><h2>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h2><p>财政部 税务总局 中国证监会公告2026年第26号</p><p>发布时间：2026年8月28日</p><p>本公告自2026年9月1日起施行。</p><p>第一条 本公告规定个人所得税政策。</p></body></html>`],
-  [secondUrl, `<html><body><h1>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h1><p>财政部 税务总局公告2026年第25号</p><p>成文日期：2026-08-27</p><p>自2026年9月1日起施行。</p><p>第一条 本公告明确增值税事项。</p></body></html>`]
+  [firstUrl, `<html><head><meta name="ArticleTitle" content="财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告" /><meta name="PubDate" content="2026-08-28 18:45:40" /></head><body><header>国家税务总局政策法规库 简 / 繁 登录 EN 本站热词 发票 小微企业 个人所得税 个人中心</header><div class="detials contentLeft"><h3>财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告</h3><h5 class="actfwzh">财政部 税务总局 中国证监会公告2026年第26号</h5><div class="article"><div class="arc_cont"><p>本公告自2026年9月1日起施行。</p><p>第一条 本公告规定个人所得税政策。</p><p>财政部 税务总局 中国证监会</p><p>2026年8月28日</p></div></div></div><footer>关联解读 纠错或建议</footer></body></html>`],
+  [secondUrl, `<html><head><meta name="ArticleTitle" content="财政部 税务总局关于明确非应税交易等增值税有关事项的公告" /><meta name="PubDate" content="2026-08-27 18:46:49" /></head><body><nav>登录 本站热词 发票查询 社保 个人中心</nav><div class="detials contentLeft"><h3>财政部 税务总局关于明确非应税交易等增值税有关事项的公告</h3><h5 class="actfwzh">财政部 税务总局公告2026年第25号</h5><p class="arc_date">成文日期：2026-08-27</p><div class="article"><div class="arc_cont"><p>自2026年9月1日起施行。</p><p>第一条 本公告明确增值税事项。</p><p>财政部 税务总局</p><p>2026年8月27日</p></div></div></div><footer>关联文件</footer></body></html>`]
 ]);
 
 function fixedRepository() {
@@ -39,6 +39,14 @@ test('两条官方详情页只解析页面明确载明的字段，状态保持�
   assert.equal(second.expiry_date, null);
   assert.equal(second.verification_state, 'pending_review');
   assert.equal(second.legal_status, 'pending');
+});
+
+test('国家税务总局详情页只提取 .arc_cont 政策正文，排除网站模板污染', () => {
+  const parsed = parseChinaTaxPolicyEvidence(pages.get(firstUrl));
+  assert.match(parsed.normalized_text, /^本公告自2026年9月1日起施行。/);
+  assert.match(parsed.normalized_text, /第一条 本公告规定个人所得税政策。/);
+  assert.match(parsed.normalized_text, /财政部 税务总局 中国证监会\n2026年8月28日$/);
+  assert.doesNotMatch(parsed.normalized_text, /国家税务总局政策法规库|简\s*\/\s*繁|登录|本站热词|发票查询|个人中心|关联解读|纠错或建议/);
 });
 
 test('首次抓取保留两份原始 HTML、正文、hash 与 source/run/snapshot/candidate 证据链', async () => {
