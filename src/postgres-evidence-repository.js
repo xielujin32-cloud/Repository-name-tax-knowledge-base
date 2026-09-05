@@ -220,11 +220,16 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!required(source_id, 'source_id') || !urls.length) return false;
     const result = await pool.query(
       `SELECT COUNT(DISTINCT s.canonical_url)::int AS count
-       FROM raw_snapshots s
-       JOIN collection_runs r ON r.collection_run_id=s.collection_run_id
-       JOIN candidates c ON c.source_id=s.source_id
+      FROM raw_snapshots s
+      JOIN collection_runs r ON r.collection_run_id=s.collection_run_id
+      JOIN candidates c ON c.source_id=s.source_id
                         AND c.canonical_url=s.canonical_url
-                        AND c.normalized_text_sha256=s.normalized_text_sha256
+                        -- Candidate normalizations can be improved later
+                        -- without mutating a historical Raw Snapshot. The
+                        -- completed-ingestion marker must therefore follow
+                        -- the snapshot observed by the Candidate, not require
+                        -- its current derived-text hash to equal the old one.
+                        AND c.observed_snapshot_ids @> jsonb_build_array(s.snapshot_id)
        WHERE s.source_id=$1
          AND s.canonical_url = ANY($2::text[])
          AND r.mode='phase2d-production-whitelist'

@@ -247,6 +247,10 @@ test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建
     const repeatBeforeReview = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
     assert.equal(repeatBeforeReview.response.status, 200);
     assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 2 });
+    const importAfterReparse = await call(handler, '/api/admin/evidence/import-phase2b', { method: 'POST', token: testAdminToken, body: { apply: true, confirmation: PHASE_2D_IMPORT_CONFIRMATION } });
+    assert.equal(importAfterReparse.response.status, 200);
+    assert.equal(importAfterReparse.body.execution, 'already_completed');
+    assert.deepEqual(await repositoryFactory().counts(), { sources: 1, source_states: 1, collection_runs: 1, raw_snapshots: 2, candidates: 2, review_decisions: 0, policies: 0, policy_versions: 0, policy_relations: 0, audit_events: 2 });
 
     const candidateId = ingest.body.results[0].candidate.candidate_id;
     const detail = await call(handler, `/api/admin/evidence/candidates/${candidateId}`, { token: testAdminToken });
