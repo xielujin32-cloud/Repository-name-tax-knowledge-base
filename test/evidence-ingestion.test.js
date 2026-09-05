@@ -213,3 +213,61 @@ test('Phase 2D production-style advisory lock lets only one concurrent request e
   assert.equal(snapshotCount, 2);
   assert.equal(candidateCount, 2);
 });
+
+test('Evidence Candidate 经过 Level 3 审核后生成幂等 Policy Version 与公开投影', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-evidence-review-api-'));
+  const database = new NetlifyDB({ directory: path.join(root, 'database'), logger: () => {} });
+  const originalToken = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  const testAdminToken = `evidence-review-${randomUUID()}`;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = testAdminToken;
+  const projections = [];
+  try {
+    await database.start();
+    await database.reset();
+    await database.applyMigrations(path.join(process.cwd(), 'netlify', 'database', 'migrations'));
+    const repositoryFactory = () => createPostgresEvidenceRepository({
+      pool: database,
+      objectStore: createLocalEvidenceObjectStore({ rootDirectory: path.join(root, 'taxkb-evidence-raw') })
+    });
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory,
+      fetchImpl: fakeFetch,
+      publishProjection: async (policy) => { projections.push(policy); return { dryRun: false, total: 1, added: projections.length === 1 ? 1 : 0, updated: projections.length > 1 ? 1 : 0, skipped: 0, errors: [] }; }
+    }) });
+    const ingest = await call(handler, '/api/admin/evidence/import-phase2b', { method: 'POST', token: testAdminToken, body: { apply: true, confirmation: PHASE_2D_IMPORT_CONFIRMATION } });
+    const candidateId = ingest.body.results[0].candidate.candidate_id;
+
+    const noToken = await call(handler, '/api/admin/evidence/candidates');
+    assert.equal(noToken.response.status, 401);
+    const detail = await call(handler, `/api/admin/evidence/candidates/${candidateId}`, { token: testAdminToken });
+    assert.equal(detail.response.status, 200);
+    assert.match(detail.body.detail.raw_snapshot.normalized_text, /原始证据正文一/);
+    assert.match(detail.body.detail.raw_snapshot.raw_html, /<html>/);
+
+    const reviewBody = { action: 'approve', legal_status: 'effective', note: 'Level 3 已人工核验。', fields: { title: detail.body.detail.candidate.parsed_fields.title, document_no: detail.body.detail.candidate.parsed_fields.document_no, issuing_authority: detail.body.detail.candidate.parsed_fields.issuing_authority, publish_date: detail.body.detail.candidate.parsed_fields.publish_date, effective_date: detail.body.detail.candidate.parsed_fields.effective_date, expiry_date: null, tax_categories: ['个人所得税'], keywords: ['限售股'] } };
+    const first = await call(handler, `/api/admin/evidence/candidates/${candidateId}/review`, { method: 'POST', token: testAdminToken, body: reviewBody });
+    assert.equal(first.response.status, 200);
+    assert.equal(first.body.execution, 'approve');
+    assert.equal(first.body.candidate.verification_state, 'verified');
+    assert.equal(first.body.candidate.legal_status, 'effective');
+    assert.equal(first.body.policy_version.candidate_id, candidateId);
+    assert.equal(projections.length, 1);
+    assert.equal(projections[0].title, reviewBody.fields.title);
+    assert.equal(projections[0].evidence.normalized_text.includes('原始证据正文一'), true);
+
+    const repeat = await call(handler, `/api/admin/evidence/candidates/${candidateId}/review`, { method: 'POST', token: testAdminToken, body: reviewBody });
+    assert.equal(repeat.response.status, 200);
+    assert.equal(repeat.body.execution, 'already_approved');
+    assert.equal(repeat.body.policy_version.policy_version_id, first.body.policy_version.policy_version_id);
+    const counts = await repositoryFactory().counts();
+    assert.equal(counts.review_decisions, 1);
+    assert.equal(counts.policies, 1);
+    assert.equal(counts.policy_versions, 1);
+    assert.equal(counts.audit_events, 1);
+  } finally {
+    if (originalToken === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+    else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = originalToken;
+    await database.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});

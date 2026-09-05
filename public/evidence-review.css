@@ -1,0 +1,12 @@
+:root { color-scheme: light; font-family: system-ui, -apple-system, "Microsoft YaHei", sans-serif; color: #17212b; background: #f2f7f7; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+.shell { width: min(980px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 56px; }
+header { margin-bottom: 20px; }.eyebrow { color: #087f78; font-weight: 700; margin: 0 0 6px; } h1 { margin: 0; } h2 { margin: 0; font-size: 1.12rem; }
+.panel, .candidate { background: white; border: 1px solid #d8e4e3; border-radius: 12px; padding: 18px; box-shadow: 0 3px 16px #1531330d; }
+.toolbar, .actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }.toolbar { margin: 18px 0 12px; }.actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 14px; }
+label { display: grid; gap: 6px; margin: 12px 0; font-weight: 650; } input, textarea, select { width: 100%; border: 1px solid #b6cac7; border-radius: 8px; background: #fff; padding: 9px; font: inherit; font-weight: 400; } textarea { resize: vertical; } textarea[readonly] { background: #f6f9f9; }
+.dates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }.candidate-list { display: grid; gap: 10px; }.candidate h3 { margin: 0 0 8px; }.candidate p, .metadata, .message { margin: 6px 0; color: #52615f; word-break: break-word; }
+button { border: 0; border-radius: 8px; padding: 9px 13px; background: #087f78; color: white; font: inherit; cursor: pointer; } button.secondary { background: #e5efee; color: #174440; } button.danger { background: #b73535; } button:disabled { opacity: .6; cursor: wait; }
+a { color: #00756d; font-weight: 650; }.error { color: #a52323; }.success { color: #087f78; } details { margin-top: 12px; } summary { cursor: pointer; font-weight: 650; }
+@media (max-width: 640px) { .shell { width: min(100% - 20px, 980px); padding-top: 18px; }.dates { grid-template-columns: 1fr; } }

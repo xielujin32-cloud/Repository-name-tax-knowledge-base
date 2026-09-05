@@ -2,6 +2,8 @@ import { createPostgresEvidenceRepository } from '../../src/postgres-evidence-re
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js';
 import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
+import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
+import { importPolicies } from './policy-store.mjs';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
@@ -75,6 +77,102 @@ function safeTrace(trace) {
       base_url: trace.source.base_url,
       enabled: trace.source.enabled
     }
+  };
+}
+
+function adminCandidateSummary(candidate) {
+  return {
+    candidate_id: candidate.candidate_id,
+    source_id: candidate.source_id,
+    source_name: candidate.source_name || null,
+    official_domain: candidate.official_domain || null,
+    official_url: candidate.official_url,
+    parsed_fields: candidate.parsed_fields || {},
+    verification_state: candidate.verification_state,
+    legal_status: candidate.legal_status,
+    created_at: candidate.created_at,
+    updated_at: candidate.updated_at
+  };
+}
+
+function adminReviewDetail(detail) {
+  return {
+    candidate: {
+      candidate_id: detail.candidate.candidate_id,
+      source_id: detail.candidate.source_id,
+      official_url: detail.candidate.official_url,
+      canonical_url: detail.candidate.canonical_url,
+      parsed_fields: detail.candidate.parsed_fields || {},
+      verification_state: detail.candidate.verification_state,
+      legal_status: detail.candidate.legal_status,
+      created_at: detail.candidate.created_at,
+      updated_at: detail.candidate.updated_at
+    },
+    raw_snapshot: {
+      snapshot_id: detail.raw_snapshot.snapshot_id,
+      official_url: detail.raw_snapshot.official_url,
+      canonical_url: detail.raw_snapshot.canonical_url,
+      fetched_at: detail.raw_snapshot.fetched_at,
+      http_status: detail.raw_snapshot.http_status,
+      content_type: detail.raw_snapshot.content_type,
+      raw_sha256: detail.raw_snapshot.raw_sha256,
+      normalized_text_sha256: detail.raw_snapshot.normalized_text_sha256,
+      parser_version: detail.raw_snapshot.parser_version,
+      raw_html: detail.raw_snapshot.raw_html,
+      normalized_text: detail.raw_snapshot.normalized_text
+    },
+    collection_run: detail.collection_run,
+    source: detail.source
+  };
+}
+
+async function defaultPublishProjection(policy) {
+  return importPolicies([policy], { dryRun: false });
+}
+
+export async function reviewEvidenceCandidate(candidateId, input, { repository = defaultRepositoryFactory(), publishProjection = defaultPublishProjection, reviewerId = 'netlify-admin' } = {}) {
+  const action = String(input?.action || '').trim();
+  if (!['approve', 'reject', 'return'].includes(action)) throw new Error('审核动作无效。');
+  const detail = await repository.getCandidateForReview(candidateId);
+  const confirmedFields = action === 'approve'
+    ? normalizeReviewFields(detail.candidate.parsed_fields, input.fields || {})
+    : {};
+  const result = await repository.reviewCandidate(candidateId, {
+    action,
+    legal_status: input.legal_status || 'pending',
+    note: String(input.note || ''),
+    reviewer_id: reviewerId,
+    confirmed_fields: confirmedFields
+  });
+  let publication = null;
+  if (action === 'approve') {
+    const projection = buildPublicPolicyProjection({
+      candidate: result.candidate,
+      source: result.source,
+      reviewDecision: result.review_decision,
+      policy: result.policy,
+      policyVersion: result.policy_version,
+      confirmedFields: result.confirmed_fields,
+      normalizedText: result.raw_snapshot.normalized_text
+    });
+    publication = await publishProjection(projection);
+  }
+  return {
+    execution: result.execution,
+    candidate: adminCandidateSummary(result.candidate),
+    review_decision: result.review_decision ? {
+      review_decision_id: result.review_decision.review_decision_id,
+      reviewer_level: result.review_decision.reviewer_level,
+      reviewer_id: result.review_decision.reviewer_id,
+      decision: result.review_decision.decision,
+      legal_status: result.review_decision.legal_status,
+      note: result.review_decision.note,
+      decided_at: result.review_decision.decided_at,
+      confirmed_fields: result.confirmed_fields
+    } : null,
+    policy: result.policy ? { policy_id: result.policy.policy_id, canonical_title: result.policy.canonical_title, legal_status: result.policy.legal_status, verification_state: result.policy.verification_state } : null,
+    policy_version: result.policy_version ? { policy_version_id: result.policy_version.policy_version_id, policy_id: result.policy_version.policy_id, version_number: result.policy_version.version_number, candidate_id: result.policy_version.candidate_id } : null,
+    publication
   };
 }
 
@@ -203,7 +301,7 @@ export async function readEvidenceCandidateTrace(candidateId, { repository = def
   return safeTrace(await repository.traceCandidate(candidateId));
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     if (url.search) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
@@ -216,6 +314,23 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       return json({ mode: 'apply', allowlist_size: PHASE_2B_ALLOWED_DETAIL_URLS.length, ...result });
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));
+    if (request.method === 'GET' && pathname === '/api/admin/evidence/candidates') {
+      const candidates = await repositoryFactory().listCandidatesForReview();
+      return json({ candidates: candidates.map(adminCandidateSummary) });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      return json({ detail: adminReviewDetail(await repositoryFactory().getCandidateForReview(candidateId)) });
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/review$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      const input = await requestBody(request);
+      const allowed = new Set(['action', 'legal_status', 'note', 'fields']);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !allowed.has(key))) {
+        return json({ error: 'Evidence 审核只接受 action、legal_status、note 和 fields。' }, 400);
+      }
+      return json(await reviewEvidenceCandidate(candidateId, input, { repository: repositoryFactory(), publishProjection }));
+    }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/trace$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);
       return json({ trace: await readEvidenceCandidateTrace(candidateId, { repository: repositoryFactory() }) });

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>Evidence 政策审核</title>
+    <link rel="stylesheet" href="/evidence-review.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">税策库 · Level 3</p>
+        <h1>Evidence 政策审核</h1>
+        <p>仅已登录管理员可读取或发布。Token 仅保存在当前页面内存，不写入浏览器存储。</p>
+      </header>
+
+      <section id="login-panel" class="panel">
+        <h2>管理员验证</h2>
+        <label>管理员 Token<input id="admin-token" type="password" autocomplete="off" spellcheck="false" /></label>
+        <button id="connect" type="button">连接审核接口</button>
+        <p id="login-message" class="message"></p>
+      </section>
+
+      <section id="review-panel" hidden>
+        <div class="toolbar"><h2>待审核 Candidate</h2><button id="reload" type="button" class="secondary">刷新</button></div>
+        <p id="list-message" class="message"></p>
+        <div id="candidate-list" class="candidate-list"></div>
+
+        <section id="detail-panel" class="panel" hidden>
+          <div class="toolbar"><h2 id="detail-title">审核详情</h2><a id="official-link" target="_blank" rel="noreferrer">打开官方原文</a></div>
+          <p id="detail-meta" class="metadata"></p>
+          <form id="review-form">
+            <label>政策标题<input name="title" required /></label>
+            <label>文号<input name="document_no" /></label>
+            <label>发布机关（每行一个）<textarea name="issuing_authority" rows="3"></textarea></label>
+            <div class="dates">
+              <label>发布日期<input name="publish_date" type="date" /></label>
+              <label>生效日期<input name="effective_date" type="date" /></label>
+              <label>失效/废止日期<input name="expiry_date" type="date" /></label>
+            </div>
+            <label>效力状态<select name="legal_status"><option value="effective">现行有效</option><option value="partially_effective">部分有效</option><option value="repealed">已废止</option><option value="expired">已到期</option><option value="pending">待核验</option></select></label>
+            <label>税种（每行一个，可留空）<textarea name="tax_categories" rows="2"></textarea></label>
+            <label>关键词（每行一个，可留空）<textarea name="keywords" rows="2"></textarea></label>
+            <label>政策摘要（可留空）<textarea name="summary" rows="3"></textarea></label>
+            <label>审核备注<textarea name="note" rows="3"></textarea></label>
+            <label>解析后的官方正文<textarea id="normalized-text" rows="14" readonly></textarea></label>
+            <details><summary>查看原始 HTML 证据</summary><textarea id="raw-html" rows="12" readonly></textarea></details>
+            <div class="actions"><button id="approve" type="submit">Approve / Publish</button><button id="return" type="button" class="secondary">退回待修正</button><button id="reject" type="button" class="danger">Reject</button></div>
+          </form>
+          <p id="review-message" class="message"></p>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/evidence-review.js"></script>
+  </body>
+</html>
