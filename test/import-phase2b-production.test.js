@@ -65,13 +65,18 @@ test('本机 Phase 2B 工具脱敏 fetch 网络异常并保留安全诊断字段
   );
 });
 
-test('Windows PowerShell 包装器使用安全输入，并只在当前子进程环境中传递 Token', async () => {
+test('Windows PowerShell 包装器使用密码框校验 Token，并只在当前子进程环境中传递 Token', async () => {
   const wrapper = await readFile(path.join(process.cwd(), 'scripts', 'import-phase2b-production.ps1'), 'utf8');
-  assert.match(wrapper, /Read-Host[\s\S]*-AsSecureString/);
+  assert.match(wrapper, /function Read-GuiSecureString/);
+  assert.match(wrapper, /System\.Windows\.Forms\.TextBox/);
+  assert.match(wrapper, /UseSystemPasswordChar\s*=\s*\$true/);
+  assert.match(wrapper, /function Test-TokenForHttpHeader/);
+  assert.match(wrapper, /\[switch\]\$ReadOnlyConnectionTest/);
+  assert.match(wrapper, /api\/admin\/evidence\/status/);
   assert.match(wrapper, /import-phase2b-production\.mjs'\) --from-env/);
   assert.match(wrapper, /Remove-Item Env:NETLIFY_TAXKB_ADMIN_TOKEN/);
   assert.match(wrapper, /ZeroFreeBSTR/);
-  assert.doesNotMatch(wrapper, /Read-Host[\s\S]*-AsPlainText/);
+  assert.doesNotMatch(wrapper, /Read-Host/);
 });
 
 test('Windows PowerShell 5.1 能实际解析生产导入包装器', async (t) => {
