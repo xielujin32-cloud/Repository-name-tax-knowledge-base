@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { PHASE_2B_PRODUCTION_IMPORT_URL, executePhase2BProductionImport, parseArguments } from '../scripts/import-phase2b-production.mjs';
+import { PHASE_2B_PRODUCTION_IMPORT_URL, Phase2BNetworkRequestError, createSafeNetworkDiagnostic, executePhase2BProductionImport, parseArguments } from '../scripts/import-phase2b-production.mjs';
 
 const execFile = promisify(execFileCallback);
 
@@ -38,7 +38,30 @@ test('本机 Phase 2B 工具只显示安全摘要，拒绝输出上游错误正�
   );
   await assert.rejects(
     () => executePhase2BProductionImport({ token: temporaryToken, fetchImpl: async () => { throw new Error(`network-${temporaryToken}`); } }),
-    (error) => error.message === '导入网络请求未完成。' && !error.message.includes(temporaryToken)
+    (error) => error instanceof Phase2BNetworkRequestError
+      && error.message === '导入网络请求未完成。'
+      && !JSON.stringify(error.diagnostic).includes(temporaryToken)
+  );
+});
+
+test('本机 Phase 2B 工具脱敏 fetch 网络异常并保留安全诊断字段', async () => {
+  const temporaryToken = `temporary-test-${randomUUID()}`;
+  const upstreamError = new TypeError(`socket failed; Authorization: Bearer ${temporaryToken}\nbody=private`);
+  upstreamError.cause = { code: 'ECONNRESET', errno: -4077, syscall: 'read' };
+  const diagnostic = createSafeNetworkDiagnostic(upstreamError, temporaryToken);
+  assert.deepEqual(diagnostic, {
+    error: 'network_request_failed',
+    error_name: 'TypeError',
+    error_message: 'socket failed; Authorization: Bearer [REDACTED] body=[REDACTED]',
+    cause_code: 'ECONNRESET',
+    cause_errno: '-4077',
+    cause_syscall: 'read'
+  });
+  assert.doesNotMatch(JSON.stringify(diagnostic), new RegExp(temporaryToken));
+
+  await assert.rejects(
+    () => executePhase2BProductionImport({ token: temporaryToken, fetchImpl: async () => { throw upstreamError; } }),
+    (error) => error instanceof Phase2BNetworkRequestError && assert.deepEqual(error.diagnostic, diagnostic) === undefined
   );
 });
 

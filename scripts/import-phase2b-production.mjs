@@ -5,6 +5,40 @@ export const PHASE_2B_PRODUCTION_IMPORT_URL = 'https://xielujin-tax-knowledge-ba
 export const PHASE_2B_LOCAL_CONFIRMATION = 'IMPORT_PHASE2B_TWO_CANDIDATES';
 const SERVER_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 
+function safeDiagnosticValue(value, pattern) {
+  const text = String(value || '').trim();
+  return pattern.test(text) ? text : null;
+}
+
+export function createSafeNetworkDiagnostic(error, token) {
+  const tokenText = String(token || '');
+  let message = String(error?.message || '网络请求失败');
+  if (tokenText) message = message.split(tokenText).join('[REDACTED]');
+  message = message
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/ig, '$1[REDACTED]')
+    .replace(/(bearer\s+)[^\s,;]+/ig, '$1[REDACTED]')
+    .replace(/(request[ _-]?body|body)\s*[:=]\s*(?:\{.*?\}|[^\s,;]+)/ig, '$1=[REDACTED]')
+    .replace(/[\r\n\t]/g, ' ')
+    .slice(0, 240);
+  const cause = error?.cause;
+  return {
+    error: 'network_request_failed',
+    error_name: safeDiagnosticValue(error?.name, /^[A-Za-z0-9_.-]{1,120}$/) || 'Error',
+    error_message: message,
+    cause_code: safeDiagnosticValue(cause?.code, /^[A-Za-z0-9_.-]{1,120}$/),
+    cause_errno: safeDiagnosticValue(cause?.errno, /^-?[0-9]{1,20}$/),
+    cause_syscall: safeDiagnosticValue(cause?.syscall, /^[A-Za-z0-9_.-]{1,120}$/)
+  };
+}
+
+export class Phase2BNetworkRequestError extends Error {
+  constructor(diagnostic) {
+    super('导入网络请求未完成。');
+    this.name = 'Phase2BNetworkRequestError';
+    this.diagnostic = diagnostic;
+  }
+}
+
 export function parseArguments(argumentsList = process.argv.slice(2)) {
   if (argumentsList.length === 0) return { tokenSource: 'prompt' };
   if (argumentsList.length === 1 && argumentsList[0] === '--from-env') return { tokenSource: 'environment' };
@@ -85,8 +119,8 @@ export async function executePhase2BProductionImport({ token, fetchImpl = fetch,
       },
       body: JSON.stringify({ apply: true, confirmation: SERVER_CONFIRMATION })
     });
-  } catch {
-    throw new Error('导入网络请求未完成。');
+  } catch (error) {
+    throw new Phase2BNetworkRequestError(createSafeNetworkDiagnostic(error, authorizationToken));
   }
   let body = null;
   try { body = await response.json(); } catch { /* Never print raw response content. */ }
@@ -116,7 +150,11 @@ const isDirectExecution = process.argv[1] && new URL(`file:${process.argv[1].rep
 if (isDirectExecution) {
   runProductionImportCli().catch((error) => {
     // Never include a response body, request headers, or Token in terminal output.
-    process.stderr.write(`${error.message}\n`);
+    if (error instanceof Phase2BNetworkRequestError) {
+      process.stderr.write(`${JSON.stringify(error.diagnostic)}\n`);
+    } else {
+      process.stderr.write(`${error.message}\n`);
+    }
     process.exitCode = 1;
   });
 }
