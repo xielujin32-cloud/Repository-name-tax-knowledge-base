@@ -18,6 +18,8 @@ function assertSummaryTrace(body, suggestion) {
   assert.equal(suggestion.summary.value, suggestion.summary.evidence.map((item) => item.text).join(''));
   for (const item of suggestion.summary.evidence) {
     assert.equal(body.slice(item.start, item.end).replace(/\s+/g, ' ').trim(), item.text);
+    assert.ok(item.matched_keywords.every((term) => item.text.includes(term)));
+    assert.ok(item.newly_covered_keywords.every((term) => item.text.includes(term)));
   }
 }
 
@@ -33,6 +35,11 @@ test('个人所得税 Candidate 识别正式税种，不会把正文中的发票
   assert.equal(suggestion.tax_categories.values.includes('发票'), false);
   assert.equal(suggestion.keywords.values.some((value) => ['公告', '规定', '有关', '事项', '通知'].includes(value)), false);
   assertSummaryTrace(personalIncomeBody, suggestion);
+  assert.match(suggestion.summary.value, /限售股.*个人所得税/);
+  assert.match(suggestion.summary.value, /成本原值/);
+  assert.match(suggestion.summary.value, /预扣预缴/);
+  assert.match(suggestion.summary.value, /清算申报/);
+  assert.ok(suggestion.summary.evidence.length >= 3, '应覆盖核心税务处理与不同征管安排，而不是只取单一条款');
 });
 
 test('增值税 Candidate 识别增值税及高价值检索词，建议可追溯到正文', () => {
@@ -49,6 +56,8 @@ test('增值税 Candidate 识别增值税及高价值检索词，建议可追溯
     assert.equal(vatBody.includes(match.term) || match.source === 'title', true);
   }
   assertSummaryTrace(vatBody, suggestion);
+  assert.match(suggestion.summary.value, /非应税交易.*进项税额/);
+  assert.match(suggestion.summary.value, /增值税扣税凭证/);
 });
 
 test('相同正文的 metadata_suggestion 除 generated_at 外保持确定性，且不含法律状态推断', () => {

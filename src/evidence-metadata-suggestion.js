@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { classifyTaxTypes } from './collector.js';
 
-export const EVIDENCE_METADATA_RULE_VERSION = 'evidence-metadata-rules-v1';
+export const EVIDENCE_METADATA_RULE_VERSION = 'evidence-metadata-rules-v2';
 
 // These are formal policy tax categories. Operational subjects such as 发票
 // and 征收管理 are useful search topics, but are not taxes themselves.
@@ -81,29 +81,71 @@ function policySentences(body) {
   return result;
 }
 
+function summaryKeywordWeights(keywords) {
+  return keywords.map(({ term, weight }) => ({ term, weight: Number(weight) || 0 }));
+}
+
+function sentenceCoverage(sentence, keywordWeights, coveredTerms = new Set()) {
+  const matched = keywordWeights.filter(({ term }) => sentence.text.includes(term));
+  const newlyCovered = matched.filter(({ term }) => !coveredTerms.has(term));
+  return {
+    matched,
+    newlyCovered,
+    totalWeight: matched.reduce((total, item) => total + item.weight, 0),
+    newWeight: newlyCovered.reduce((total, item) => total + item.weight, 0)
+  };
+}
+
 function extractiveSummary(body, keywords) {
   const sentences = policySentences(body);
-  const ranked = sentences.map((sentence, index) => {
-    const score = keywords.reduce((total, keyword) => total + (sentence.text.includes(keyword.term) ? 10 : 0), 0)
-      + (/^(?:一、|二、|三、|第一条|第二条)/.test(sentence.text) ? 2 : 0)
-      + (index === 0 ? 3 : 0);
-    return { ...sentence, index, score };
-  }).filter((sentence) => sentence.score > 0 || sentence.index === 0)
-    .sort((left, right) => right.score - left.score || left.index - right.index);
-
+  const keywordWeights = summaryKeywordWeights(keywords);
   const selected = [];
+  const coveredTerms = new Set();
   let length = 0;
-  for (const sentence of ranked) {
-    if (selected.some((item) => item.index === sentence.index)) continue;
-    if (length && length + sentence.text.length > 150) continue;
-    selected.push(sentence);
-    length += sentence.text.length;
-    if (length >= 60 || selected.length >= 2) break;
+
+  while (selected.length < 3) {
+    const available = sentences.map((sentence, index) => ({ ...sentence, index }))
+      .filter((sentence) => !selected.some((item) => item.index === sentence.index))
+      .filter((sentence) => !length || length + sentence.text.length <= 150)
+      .map((sentence) => ({
+        ...sentence,
+        coverage: sentenceCoverage(sentence, keywordWeights, coveredTerms)
+      }));
+    if (!available.length) break;
+
+    // First select the strongest policy sentence. Subsequent selections are
+    // driven primarily by new, direct evidence so a single dense article
+    // cannot crowd out distinct arrangements such as withholding or filing.
+    available.sort((left, right) => {
+      const leftScore = selected.length ? left.coverage.newWeight : left.coverage.totalWeight;
+      const rightScore = selected.length ? right.coverage.newWeight : right.coverage.totalWeight;
+      return rightScore - leftScore
+        || right.coverage.totalWeight - left.coverage.totalWeight
+        || left.index - right.index;
+    });
+    const next = available[0];
+    if (selected.length && next.coverage.newWeight === 0 && length >= 60) break;
+
+    selected.push(next);
+    length += next.text.length;
+    for (const match of next.coverage.matched) coveredTerms.add(match.term);
+
+    const hasMaterialUncoveredEvidence = available
+      .filter((item) => item.index !== next.index)
+      .some((item) => sentenceCoverage(item, keywordWeights, coveredTerms).newWeight >= 80);
+    if (length >= 60 && !hasMaterialUncoveredEvidence) break;
   }
   const ordered = selected.sort((left, right) => left.start - right.start);
   return {
     value: ordered.map((sentence) => sentence.text).join(''),
-    evidence: ordered.map(({ text, start, end, index }) => ({ paragraph_or_sentence_index: index, start, end, text }))
+    evidence: ordered.map(({ text, start, end, index, coverage }) => ({
+      paragraph_or_sentence_index: index,
+      start,
+      end,
+      text,
+      matched_keywords: coverage.matched.map((item) => item.term),
+      newly_covered_keywords: coverage.newlyCovered.map((item) => item.term)
+    }))
   };
 }
 
