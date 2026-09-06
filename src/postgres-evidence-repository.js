@@ -1,19 +1,29 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { getDatabase } from '@netlify/database';
 import { POLICY_STATUSES } from './policy-schema.js';
+import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-risk-assessment.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value);
 const now = () => new Date().toISOString();
 const required = (value, label) => { const text = String(value || '').trim(); if (!text) throw new Error(`${label} 不能为空。`); return text; };
+const textValue = (value) => String(value || '').trim();
 const canonical = (value) => { const url = new URL(required(value, 'official_url')); url.hash = ''; return url.toString(); };
 const jsonObject = (value, fallback = {}) => {
   if (value && typeof value === 'object') return value;
   try { return JSON.parse(value || ''); } catch { return fallback; }
 };
+const riskAssessmentRow = (row) => row && ({ ...row, risk_reasons: jsonObject(row.risk_reasons, []), quality_metrics: jsonObject(row.quality_metrics, {}) });
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
+  async function transaction(work) {
+    if (typeof pool.transaction === 'function') return pool.transaction(work);
+    const client = await pool.connect();
+    try { await client.query('BEGIN'); const result = await work(client); await client.query('COMMIT'); return result; }
+    catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  }
   async function addSource(input) {
     const source = { source_id: required(input.source_id || id('source'), 'source_id'), source_name: required(input.source_name, 'source_name'), official_domain: required(input.official_domain, 'official_domain'), source_type: required(input.source_type, 'source_type'), adapter_version: required(input.adapter_version, 'adapter_version'), base_url: input.base_url ? canonical(input.base_url) : null, enabled: input.enabled !== false, created_at: clock() };
     await pool.query(`INSERT INTO sources (source_id,source_name,official_domain,source_type,adapter_version,base_url,enabled,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (source_id) DO NOTHING`, [source.source_id,source.source_name,source.official_domain,source.source_type,source.adapter_version,source.base_url,source.enabled,source.created_at]);
@@ -176,6 +186,84 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('该 Candidate 正在生成审核建议，请稍后重试。');
     return locked.result;
   }
+  async function detectCandidateRiskConflicts(detail) {
+    const candidate = detail.candidate;
+    const documentNo = textValue(candidate.parsed_fields?.document_no);
+    const document_no_conflicts = documentNo
+      ? (await pool.query(
+        `SELECT candidate_id,canonical_url,normalized_text_sha256,parsed_fields->>'title' AS title
+         FROM candidates
+         WHERE candidate_id<>$1 AND parsed_fields->>'document_no'=$2 AND normalized_text_sha256<>$3`,
+        [candidate.candidate_id, documentNo, candidate.normalized_text_sha256]
+      )).rows.map((row) => ({ candidate_id: row.candidate_id, canonical_url: row.canonical_url, title: row.title || null }))
+      : [];
+    const suspected_version_changes = (await pool.query(
+      `SELECT candidate_id,normalized_text_sha256
+       FROM candidates
+       WHERE candidate_id<>$1 AND source_id=$2 AND canonical_url=$3 AND normalized_text_sha256<>$4`,
+      [candidate.candidate_id, candidate.source_id, candidate.canonical_url, candidate.normalized_text_sha256]
+    )).rows.map((row) => ({ candidate_id: row.candidate_id, normalized_text_sha256: row.normalized_text_sha256 }));
+    return { document_no_conflicts, suspected_version_changes, relation_conflicts: [] };
+  }
+  async function saveCandidateRiskAssessment(candidateId, assessment) {
+    const candidateKey = required(candidateId, 'candidate_id');
+    if (!assessment || typeof assessment !== 'object' || Array.isArray(assessment)) throw new Error('风险评估必须是对象。');
+    const ruleVersion = required(assessment.rule_version, 'risk.rule_version');
+    const bodyHash = required(assessment.input_body_sha256, 'risk.input_body_sha256');
+    const parserVersion = required(assessment.parser_version, 'risk.parser_version');
+    const contextHash = required(assessment.input_context_sha256, 'risk.input_context_sha256');
+    if (!/^[a-f0-9]{64}$/.test(bodyHash) || !/^[a-f0-9]{64}$/.test(contextHash)) throw new Error('风险评估 hash 格式无效。');
+    if (!['low', 'medium', 'high'].includes(assessment.risk_level)) throw new Error('风险等级无效。');
+    const score = Number(assessment.risk_score);
+    if (!Number.isInteger(score) || score < 0 || score > 100) throw new Error('风险分数无效。');
+    const locked = await withExclusiveLock(`taxkb:candidate-risk:${candidateKey}`, async () => {
+      const detail = await getCandidateForReview(candidateKey);
+      const currentBody = detail.candidate.parsed_normalized_text ?? detail.raw_snapshot.normalized_text;
+      if (sha256(currentBody) !== bodyHash) throw new Error('风险评估正文 hash 与当前 Candidate 不一致，已停止保存。');
+      const existing = (await pool.query(
+        `SELECT * FROM candidate_risk_assessments
+         WHERE candidate_id=$1 AND is_current AND input_body_sha256=$2 AND parser_version=$3 AND input_context_sha256=$4 AND rule_version=$5`,
+        [candidateKey, bodyHash, parserVersion, contextHash, ruleVersion]
+      )).rows[0];
+      if (existing) return { assessment: riskAssessmentRow(existing), created: false };
+      return transaction(async (client) => {
+        const current = (await client.query(
+          'SELECT assessment_id FROM candidate_risk_assessments WHERE candidate_id=$1 AND is_current FOR UPDATE', [candidateKey]
+        )).rows[0] || null;
+        const timestamp = clock();
+        if (current) await client.query(
+          'UPDATE candidate_risk_assessments SET is_current=false,superseded_at=$2 WHERE assessment_id=$1', [current.assessment_id, timestamp]
+        );
+        const assessmentId = id('risk-assessment');
+        await client.query(
+          `INSERT INTO candidate_risk_assessments
+           (assessment_id,candidate_id,rule_version,input_body_sha256,parser_version,input_context_sha256,risk_level,risk_score,risk_reasons,quality_metrics,assessed_at,supersedes_assessment_id,is_current)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,true)`,
+          [assessmentId, candidateKey, ruleVersion, bodyHash, parserVersion, contextHash, assessment.risk_level, score,
+            JSON.stringify(assessment.risk_reasons || []), JSON.stringify(assessment.quality_metrics || {}), timestamp, current?.assessment_id || null]
+        );
+        await client.query(
+          'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+          [id('audit'), 'candidate', candidateKey, 'candidate_risk_assessed', JSON.stringify({ assessment_id: assessmentId, rule_version: ruleVersion, risk_level: assessment.risk_level, risk_score: score, input_body_sha256: bodyHash }), timestamp]
+        );
+        const inserted = (await client.query('SELECT * FROM candidate_risk_assessments WHERE assessment_id=$1', [assessmentId])).rows[0];
+        return { assessment: riskAssessmentRow(inserted), created: true };
+      });
+    });
+    if (!locked.acquired) throw new Error('该 Candidate 正在进行风险评估，请稍后重试。');
+    return locked.result;
+  }
+  async function assessCandidateRisk(candidateId, { ruleVersion = CANDIDATE_RISK_RULE_VERSION } = {}) {
+    const detail = await getCandidateForReview(candidateId);
+    const conflicts = await detectCandidateRiskConflicts(detail);
+    const assessment = evaluateCandidateRisk(detail, { ruleVersion, conflicts });
+    return saveCandidateRiskAssessment(candidateId, assessment);
+  }
+  async function listCandidateRiskAssessments(candidateId) {
+    return (await pool.query(
+      'SELECT * FROM candidate_risk_assessments WHERE candidate_id=$1 ORDER BY assessed_at DESC', [required(candidateId, 'candidate_id')]
+    )).rows.map(riskAssessmentRow);
+  }
   async function reviewCandidate(candidateId, { action, legal_status = 'pending', reviewer_id = 'netlify-admin', note = '', confirmed_fields = {} } = {}) {
     const candidateKey = required(candidateId, 'candidate_id');
     const requestedAction = required(action, 'action');
@@ -284,5 +372,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }
