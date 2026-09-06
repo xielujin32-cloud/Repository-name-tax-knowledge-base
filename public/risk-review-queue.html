@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
+    <title>Evidence 风险审核队列</title>
+    <link rel="stylesheet" href="/evidence-review.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header>
+        <p class="eyebrow">税策库 · Phase 3B</p>
+        <h1>Evidence 风险审核队列</h1>
+        <p>Low Risk 只能生成服务端冻结 manifest；Medium 进入快速人工审核；High 必须进入完整 Level 3 审核。</p>
+        <p><a href="/evidence-review.html">返回单条 Evidence Level 3 审核</a></p>
+      </header>
+      <section id="login-panel" class="panel">
+        <h2>管理员验证</h2>
+        <label>管理员 Token<input id="admin-token" type="password" autocomplete="off" spellcheck="false" /></label>
+        <button id="connect" type="button">连接风险队列</button>
+        <p id="login-message" class="message"></p>
+      </section>
+      <section id="queue-panel" hidden>
+        <section class="panel">
+          <div class="toolbar"><h2>风险筛选</h2><button id="reload" type="button" class="secondary">刷新</button></div>
+          <form id="filter-form">
+            <div class="dates">
+              <label>风险等级<select name="risk_level"><option value="">全部</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+              <label>最低分<input name="min_score" inputmode="numeric" /></label>
+              <label>最高分<input name="max_score" inputmode="numeric" /></label>
+            </div>
+            <div class="dates">
+              <label>Source ID<input name="source_id" /></label>
+              <label>Collection Run ID<input name="collection_run_id" /></label>
+              <label>税种<input name="tax_category" /></label>
+            </div>
+            <div class="dates">
+              <label>发布日期起<input name="publish_from" placeholder="YYYY-MM-DD" /></label>
+              <label>发布日期止<input name="publish_to" placeholder="YYYY-MM-DD" /></label>
+              <label>风险代码 / 缺失字段 / 冲突类型<input name="reason_code" /></label>
+            </div>
+            <button type="submit">应用筛选</button>
+          </form>
+          <div class="actions"><button id="create-manifest" type="button">生成 Low Risk dry-run manifest</button></div>
+          <p id="queue-message" class="message"></p>
+        </section>
+        <section class="panel"><h2>Candidate 队列</h2><div id="queue-list" class="candidate-list"></div></section>
+        <section id="manifest-panel" class="panel" hidden>
+          <h2>Low Risk manifest</h2><pre id="manifest-summary"></pre>
+          <button id="apply-manifest" type="button">确认并执行剩余项目</button>
+          <p id="manifest-message" class="message"></p>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="/risk-review-queue.js"></script>
+  </body>
+</html>

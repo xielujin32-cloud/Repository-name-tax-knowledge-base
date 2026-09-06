@@ -1,5 +1,6 @@
 let adminToken = '';
 let selectedCandidateId = '';
+const requestedCandidateId = new URLSearchParams(window.location.search).get('candidate') || '';
 
 const $ = (selector) => document.querySelector(selector);
 const arrayText = (value) => Array.isArray(value) ? value.join('\n') : '';
@@ -138,7 +139,12 @@ $('#connect').addEventListener('click', async () => {
   adminToken = $('#admin-token').value;
   $('#admin-token').value = '';
   if (!adminToken) return message('#login-message', '请输入管理员 Token。', 'error');
-  try { await loadCandidates(); $('#login-panel').hidden = true; $('#review-panel').hidden = false; }
+  try {
+    await loadCandidates();
+    $('#login-panel').hidden = true;
+    $('#review-panel').hidden = false;
+    if (requestedCandidateId) await loadDetail(requestedCandidateId);
+  }
   catch (error) { adminToken = ''; message('#login-message', `验证失败：${error.message}`, 'error'); }
 });
 $('#reload').addEventListener('click', () => loadCandidates().catch((error) => message('#list-message', error.message, 'error')));

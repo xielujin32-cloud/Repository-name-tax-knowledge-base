@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { getDatabase } from '@netlify/database';
 import { POLICY_STATUSES } from './policy-schema.js';
 import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-risk-assessment.js';
+import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
+import { LOW_RISK_BATCH_CONFIRMATION, chooseSampleCandidateIds, confirmedFieldsFromLowRiskCandidate, lowRiskEligibility, manifestHash, sampleSizeForBatch } from './risk-review-queue.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value);
@@ -14,6 +16,10 @@ const jsonObject = (value, fallback = {}) => {
   try { return JSON.parse(value || ''); } catch { return fallback; }
 };
 const riskAssessmentRow = (row) => row && ({ ...row, risk_reasons: jsonObject(row.risk_reasons, []), quality_metrics: jsonObject(row.quality_metrics, {}) });
+const relationProposalRow = (row) => row && ({ ...row, target_reference: jsonObject(row.target_reference), evidence: jsonObject(row.evidence, []) });
+const batchManifestRow = (row) => row && ({ ...row, filter_spec: jsonObject(row.filter_spec) });
+const batchItemRow = (row) => row && ({ ...row, confirmed_fields: jsonObject(row.confirmed_fields) });
+const projectionJobRow = (row) => row && ({ ...row });
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
@@ -203,7 +209,13 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
        WHERE candidate_id<>$1 AND source_id=$2 AND canonical_url=$3 AND normalized_text_sha256<>$4`,
       [candidate.candidate_id, candidate.source_id, candidate.canonical_url, candidate.normalized_text_sha256]
     )).rows.map((row) => ({ candidate_id: row.candidate_id, normalized_text_sha256: row.normalized_text_sha256 }));
-    return { document_no_conflicts, suspected_version_changes, relation_conflicts: [] };
+    const relation_conflicts = (await pool.query(
+      `SELECT proposal_id,relation_type,target_reference,evidence,rule_version
+       FROM candidate_relation_proposals
+       WHERE from_candidate_id=$1 AND proposal_state='proposed'`,
+      [candidate.candidate_id]
+    )).rows.map((row) => ({ proposal_id: row.proposal_id, relation_type: row.relation_type, target_reference: jsonObject(row.target_reference), evidence: jsonObject(row.evidence, []), rule_version: row.rule_version }));
+    return { document_no_conflicts, suspected_version_changes, relation_conflicts };
   }
   async function saveCandidateRiskAssessment(candidateId, assessment) {
     const candidateKey = required(candidateId, 'candidate_id');
@@ -264,7 +276,406 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       'SELECT * FROM candidate_risk_assessments WHERE candidate_id=$1 ORDER BY assessed_at DESC', [required(candidateId, 'candidate_id')]
     )).rows.map(riskAssessmentRow);
   }
-  async function reviewCandidate(candidateId, { action, legal_status = 'pending', reviewer_id = 'netlify-admin', note = '', confirmed_fields = {} } = {}) {
+  async function listCandidateRelationProposals(candidateId) {
+    return (await pool.query(
+      'SELECT * FROM candidate_relation_proposals WHERE from_candidate_id=$1 ORDER BY created_at DESC', [required(candidateId, 'candidate_id')]
+    )).rows.map(relationProposalRow);
+  }
+  async function generateCandidateRelationProposals(candidateId, { ruleVersion = CANDIDATE_RELATION_RULE_VERSION } = {}) {
+    const candidateKey = required(candidateId, 'candidate_id');
+    const locked = await withExclusiveLock(`taxkb:candidate-relation-proposal:${candidateKey}`, async () => {
+      const detail = await getCandidateForReview(candidateKey);
+      const body = detail.candidate.parsed_normalized_text ?? detail.raw_snapshot.normalized_text;
+      const proposals = proposeCandidateRelations({ normalized_text: body, rule_version: ruleVersion });
+      const created = [];
+      for (const proposal of proposals) {
+        const documentNo = textValue(proposal.target_reference?.document_no);
+        const target = documentNo ? (await pool.query(
+          `SELECT candidate_id FROM candidates WHERE candidate_id<>$1 AND parsed_fields->>'document_no'=$2 ORDER BY created_at DESC LIMIT 1`,
+          [candidateKey, documentNo]
+        )).rows[0] : null;
+        const proposalId = id('relation-proposal');
+        const result = await pool.query(
+          `INSERT INTO candidate_relation_proposals
+           (proposal_id,from_candidate_id,to_candidate_id,relation_type,rule_version,input_body_sha256,target_reference,evidence,confidence,proposal_state,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'proposed',$10)
+           ON CONFLICT DO NOTHING RETURNING *`,
+          [proposalId, candidateKey, target?.candidate_id || null, proposal.relation_type, proposal.rule_version, proposal.input_body_sha256,
+            JSON.stringify(proposal.target_reference), JSON.stringify(proposal.evidence), proposal.confidence, clock()]
+        );
+        if (result.rows[0]) created.push(relationProposalRow(result.rows[0]));
+      }
+      if (created.length) await pool.query(
+        'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'candidate', candidateKey, 'candidate_relation_proposed', JSON.stringify({ rule_version: ruleVersion, proposal_ids: created.map((item) => item.proposal_id), input_body_sha256: sha256(body) }), clock()]
+      );
+      return { created, proposals: await listCandidateRelationProposals(candidateKey) };
+    });
+    if (!locked.acquired) throw new Error('该 Candidate 正在生成关系线索，请稍后重试。');
+    return locked.result;
+  }
+  async function reviewCandidateRelationProposal(proposalId, { action, reviewer_id = 'netlify-admin', note = '' } = {}) {
+    const key = required(proposalId, 'proposal_id');
+    const decision = required(action, 'action');
+    if (!['confirm', 'reject'].includes(decision)) throw new Error('关系线索审核动作无效。');
+    return transaction(async (client) => {
+      const proposal = (await client.query('SELECT * FROM candidate_relation_proposals WHERE proposal_id=$1 FOR UPDATE', [key])).rows[0];
+      if (!proposal) throw new Error('关系线索不存在。');
+      if (proposal.proposal_state !== 'proposed') return { execution: `already_${proposal.proposal_state}`, proposal: relationProposalRow(proposal), policy_relation: null };
+      let policyRelation = null;
+      if (decision === 'confirm') {
+        if (!proposal.to_candidate_id) throw new Error('关系线索尚未匹配到另一条 Candidate，不能确认。');
+        const fromVersion = (await client.query('SELECT * FROM policy_versions WHERE candidate_id=$1', [proposal.from_candidate_id])).rows[0];
+        const toVersion = (await client.query('SELECT * FROM policy_versions WHERE candidate_id=$1', [proposal.to_candidate_id])).rows[0];
+        if (!fromVersion || !toVersion) throw new Error('两端 Candidate 均必须已有 Policy Version，才能确认政策关系。');
+        const existing = (await client.query(
+          'SELECT * FROM policy_relations WHERE from_policy_version_id=$1 AND to_policy_version_id=$2 AND relation_type=$3',
+          [fromVersion.policy_version_id, toVersion.policy_version_id, proposal.relation_type]
+        )).rows[0];
+        if (existing) policyRelation = existing;
+        else {
+          const relationId = id('policy-relation');
+          await client.query(
+            `INSERT INTO policy_relations (policy_relation_id,from_policy_version_id,to_policy_version_id,relation_type,relation_state,evidence_snapshot_id,created_at)
+             VALUES ($1,$2,$3,$4,'confirmed',$5,$6)`,
+            [relationId, fromVersion.policy_version_id, toVersion.policy_version_id, proposal.relation_type,
+              (await client.query('SELECT snapshot_id FROM candidates WHERE candidate_id=$1', [proposal.from_candidate_id])).rows[0].snapshot_id, clock()]
+          );
+          policyRelation = (await client.query('SELECT * FROM policy_relations WHERE policy_relation_id=$1', [relationId])).rows[0];
+        }
+      }
+      const timestamp = clock();
+      const reviewId = id('relation-review');
+      await client.query(
+        'INSERT INTO candidate_relation_proposal_reviews (relation_review_id,proposal_id,reviewer_id,decision,note,decided_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [reviewId, key, required(reviewer_id, 'reviewer_id'), decision, String(note || ''), timestamp]
+      );
+      await client.query('UPDATE candidate_relation_proposals SET proposal_state=$2,resolved_at=$3 WHERE proposal_id=$1', [key, decision === 'confirm' ? 'confirmed' : 'rejected', timestamp]);
+      await client.query(
+        'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'candidate_relation_proposal', key, `relation_${decision}`, JSON.stringify({ reviewer_id, policy_relation_id: policyRelation?.policy_relation_id || null }), timestamp]
+      );
+      const updated = (await client.query('SELECT * FROM candidate_relation_proposals WHERE proposal_id=$1', [key])).rows[0];
+      return { execution: decision, proposal: relationProposalRow(updated), policy_relation: policyRelation };
+    });
+  }
+  async function currentRiskAssessment(candidateId) {
+    const row = (await pool.query(
+      'SELECT * FROM candidate_risk_assessments WHERE candidate_id=$1 AND is_current', [required(candidateId, 'candidate_id')]
+    )).rows[0];
+    return riskAssessmentRow(row || null);
+  }
+  async function activeRelationProposalCount(candidateId) {
+    return (await pool.query(
+      "SELECT COUNT(*)::int AS count FROM candidate_relation_proposals WHERE from_candidate_id=$1 AND proposal_state='proposed'",
+      [required(candidateId, 'candidate_id')]
+    )).rows[0].count;
+  }
+  async function listRiskQueue(filters = {}) {
+    const requested = filters && typeof filters === 'object' && !Array.isArray(filters) ? filters : {};
+    const size = Math.min(Math.max(Number(requested.limit) || 100, 1), 500);
+    const offset = Math.max(Number(requested.offset) || 0, 0);
+    const rows = (await pool.query(
+      `SELECT c.candidate_id,c.snapshot_id,c.source_id,c.collection_run_id,c.official_url,c.canonical_url,c.normalized_text_sha256,c.parsed_fields,c.verification_state,c.legal_status,c.created_at,c.updated_at,
+              so.source_name,so.official_domain,so.enabled,r.mode AS collection_mode,r.collection_state,r.started_at,
+              a.assessment_id,a.rule_version AS assessment_rule_version,a.input_body_sha256,a.parser_version,a.input_context_sha256,a.risk_level,a.risk_score,a.risk_reasons,a.quality_metrics,a.assessed_at
+       FROM candidates c
+       JOIN candidate_risk_assessments a ON a.candidate_id=c.candidate_id AND a.is_current
+       JOIN sources so ON so.source_id=c.source_id
+       JOIN collection_runs r ON r.collection_run_id=c.collection_run_id
+       ORDER BY CASE a.risk_level WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, a.risk_score DESC, c.created_at ASC`
+    )).rows;
+    const candidateIds = rows.map((row) => row.candidate_id);
+    const relationRows = candidateIds.length ? (await pool.query(
+      "SELECT from_candidate_id,COUNT(*)::int AS count FROM candidate_relation_proposals WHERE from_candidate_id=ANY($1::text[]) AND proposal_state='proposed' GROUP BY from_candidate_id",
+      [candidateIds]
+    )).rows : [];
+    const relationCount = new Map(relationRows.map((row) => [row.from_candidate_id, row.count]));
+    const normalized = rows.map((row) => ({
+      candidate: {
+        candidate_id: row.candidate_id, snapshot_id: row.snapshot_id, source_id: row.source_id, collection_run_id: row.collection_run_id,
+        official_url: row.official_url, canonical_url: row.canonical_url, normalized_text_sha256: row.normalized_text_sha256,
+        parsed_fields: jsonObject(row.parsed_fields), verification_state: row.verification_state, legal_status: row.legal_status,
+        created_at: row.created_at, updated_at: row.updated_at
+      },
+      assessment: riskAssessmentRow({ assessment_id: row.assessment_id, candidate_id: row.candidate_id, rule_version: row.assessment_rule_version,
+        input_body_sha256: row.input_body_sha256, parser_version: row.parser_version, input_context_sha256: row.input_context_sha256,
+        risk_level: row.risk_level, risk_score: row.risk_score, risk_reasons: row.risk_reasons, quality_metrics: row.quality_metrics,
+        assessed_at: row.assessed_at, is_current: true }),
+      source: { source_id: row.source_id, source_name: row.source_name, official_domain: row.official_domain, enabled: row.enabled },
+      collection_run: { collection_run_id: row.collection_run_id, mode: row.collection_mode, collection_state: row.collection_state, started_at: row.started_at },
+      active_relation_proposal_count: relationCount.get(row.candidate_id) || 0
+    }));
+    const wantedLevels = requested.risk_level ? new Set(String(requested.risk_level).split(',').map((item) => item.trim()).filter(Boolean)) : null;
+    const wantedReasons = requested.reason_code ? new Set(String(requested.reason_code).split(',').map((item) => item.trim()).filter(Boolean)) : null;
+    const wantedTax = textValue(requested.tax_category);
+    const filtered = normalized.filter((item) => {
+      const fields = item.candidate.parsed_fields;
+      const reasons = item.assessment.risk_reasons.map((reason) => reason.code);
+      const tax = fields.metadata_suggestion?.tax_categories?.values || fields.tax_categories || [];
+      const date = String(fields.publish_date || '');
+      if (wantedLevels && !wantedLevels.has(item.assessment.risk_level)) return false;
+      if (requested.min_score !== undefined && Number(item.assessment.risk_score) < Number(requested.min_score)) return false;
+      if (requested.max_score !== undefined && Number(item.assessment.risk_score) > Number(requested.max_score)) return false;
+      if (requested.source_id && item.candidate.source_id !== requested.source_id) return false;
+      if (requested.collection_run_id && item.candidate.collection_run_id !== requested.collection_run_id) return false;
+      if (wantedTax && !tax.includes(wantedTax)) return false;
+      if (requested.publish_from && (!date || date < String(requested.publish_from))) return false;
+      if (requested.publish_to && (!date || date > String(requested.publish_to))) return false;
+      if (wantedReasons && ![...wantedReasons].some((code) => reasons.includes(code))) return false;
+      if (requested.missing_field && !reasons.includes(String(requested.missing_field))) return false;
+      if (requested.conflict_type && !reasons.includes(String(requested.conflict_type))) return false;
+      return true;
+    });
+    return { total: filtered.length, results: filtered.slice(offset, offset + size) };
+  }
+  async function createLowRiskReviewManifest({ filters = {}, created_by = 'netlify-admin', risk_rule_version = CANDIDATE_RISK_RULE_VERSION } = {}) {
+    if (!filters || typeof filters !== 'object' || Array.isArray(filters)) throw new Error('manifest 筛选条件必须是对象。');
+    if (['candidate_id', 'candidate_ids', 'ids'].some((key) => key in filters)) throw new Error('manifest 不接受浏览器提交 Candidate ID。');
+    if (risk_rule_version !== CANDIDATE_RISK_RULE_VERSION) throw new Error('只能使用当前风险规则版本创建 Low Risk manifest。');
+    const queue = await listRiskQueue({ ...filters, risk_level: 'low', limit: 500, offset: 0 });
+    const candidates = [];
+    for (const item of queue.results) {
+      const detail = await getCandidateForReview(item.candidate.candidate_id);
+      const assessment = await currentRiskAssessment(item.candidate.candidate_id);
+      const proposalCount = await activeRelationProposalCount(item.candidate.candidate_id);
+      const eligibility = lowRiskEligibility(detail, assessment, { expectedRuleVersion: risk_rule_version, activeProposalCount: proposalCount });
+      if (!eligibility.eligible) continue;
+      candidates.push({
+        candidate_id: item.candidate.candidate_id, assessment_id: assessment.assessment_id, snapshot_id: detail.candidate.snapshot_id,
+        source_id: detail.candidate.source_id, collection_run_id: detail.candidate.collection_run_id,
+        input_body_sha256: detail.candidate.normalized_text_sha256, parser_version: eligibility.parser_version,
+        risk_rule_version: assessment.rule_version, risk_level: assessment.risk_level, risk_score: assessment.risk_score,
+        metadata_rule_version: eligibility.metadata_rule_version, metadata_input_body_sha256: eligibility.metadata_input_body_sha256,
+        relation_proposal_count: proposalCount, confirmed_fields: confirmedFieldsFromLowRiskCandidate(detail.candidate.parsed_fields)
+      });
+    }
+    if (!candidates.length) throw new Error('没有满足 Low Risk 批量确认硬条件的 Candidate。');
+    const reserved = (await pool.query(
+      `SELECT candidate_id FROM review_batch_items WHERE candidate_id=ANY($1::text[])
+       AND item_state IN ('selected','sample_required','sample_approved','processing','failed')`,
+      [candidates.map((item) => item.candidate_id)]
+    )).rows.map((row) => row.candidate_id);
+    const selected = candidates.filter((item) => !reserved.includes(item.candidate_id));
+    if (!selected.length) throw new Error('所有符合条件的 Candidate 均已被其他活动 manifest 保留。');
+    const manifestId = id('review-manifest');
+    const samplingSeed = sha256(manifestId);
+    const sampleIds = new Set(chooseSampleCandidateIds(selected.map((item) => item.candidate_id), samplingSeed));
+    const timestamp = clock();
+    const fingerprint = manifestHash({ filter_spec: filters, risk_rule_version, sampling_seed: samplingSeed, items: selected });
+    await transaction(async (client) => {
+      await client.query(
+        `INSERT INTO review_batch_manifests
+         (manifest_id,created_by,filter_spec,risk_rule_version,batch_size,sample_size,sampling_seed,confirmation_phrase,manifest_hash,manifest_state,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'sample_review',$10,$10)`,
+        [manifestId, required(created_by, 'created_by'), JSON.stringify(filters), risk_rule_version, selected.length, sampleSizeForBatch(selected.length), samplingSeed, LOW_RISK_BATCH_CONFIRMATION, fingerprint, timestamp]
+      );
+      for (const item of selected) await client.query(
+        `INSERT INTO review_batch_items
+         (manifest_item_id,manifest_id,candidate_id,assessment_id,snapshot_id,source_id,collection_run_id,input_body_sha256,parser_version,risk_rule_version,risk_level,risk_score,metadata_rule_version,metadata_input_body_sha256,relation_proposal_count,confirmed_fields,is_sample,item_state,created_at,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'low',$11,$12,$13,0,$14,$15,$16,$17,$17)`,
+        [id('review-manifest-item'), manifestId, item.candidate_id, item.assessment_id, item.snapshot_id, item.source_id, item.collection_run_id,
+          item.input_body_sha256, item.parser_version, item.risk_rule_version, item.risk_score, item.metadata_rule_version,
+          item.metadata_input_body_sha256, JSON.stringify(item.confirmed_fields), sampleIds.has(item.candidate_id), sampleIds.has(item.candidate_id) ? 'sample_required' : 'selected', timestamp]
+      );
+      await client.query(
+        'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'review_batch_manifest', manifestId, 'low_risk_manifest_created', JSON.stringify({ batch_size: selected.length, sample_size: sampleIds.size, risk_rule_version, manifest_hash: fingerprint }), timestamp]
+      );
+    });
+    return getReviewBatchManifest(manifestId);
+  }
+  async function getReviewBatchManifest(manifestId) {
+    const manifest = (await pool.query('SELECT * FROM review_batch_manifests WHERE manifest_id=$1', [required(manifestId, 'manifest_id')])).rows[0];
+    if (!manifest) throw new Error('review manifest 不存在。');
+    const items = (await pool.query(
+      `SELECT i.*,c.parsed_fields,c.verification_state,c.legal_status,c.official_url
+       FROM review_batch_items i JOIN candidates c ON c.candidate_id=i.candidate_id
+       WHERE i.manifest_id=$1 ORDER BY i.is_sample DESC,i.created_at ASC`,
+      [manifest.manifest_id]
+    )).rows.map((row) => ({ ...batchItemRow(row), candidate: { candidate_id: row.candidate_id, official_url: row.official_url, parsed_fields: jsonObject(row.parsed_fields), verification_state: row.verification_state, legal_status: row.legal_status } }));
+    return { manifest: batchManifestRow(manifest), items };
+  }
+  async function blockReviewBatchManifest(manifestId, reason) {
+    const key = required(manifestId, 'manifest_id');
+    const timestamp = clock();
+    await transaction(async (client) => {
+      await client.query("UPDATE review_batch_manifests SET manifest_state='blocked',blocked_reason=$2,updated_at=$3 WHERE manifest_id=$1", [key, String(reason || 'manifest validation failed'), timestamp]);
+      await client.query("UPDATE review_batch_items SET item_state='blocked',updated_at=$2,last_error=$3 WHERE manifest_id=$1 AND item_state IN ('selected','sample_required','sample_approved','processing','failed')", [key, timestamp, String(reason || 'manifest validation failed')]);
+    });
+    return getReviewBatchManifest(key);
+  }
+  async function manifestItemProblems(item, { requirePending = true } = {}) {
+    const detail = await getCandidateForReview(item.candidate_id);
+    const assessment = await currentRiskAssessment(item.candidate_id);
+    const proposalCount = await activeRelationProposalCount(item.candidate_id);
+    const fields = detail.candidate.parsed_fields || {};
+    const normalization = fields.normalization || {};
+    const suggestion = fields.metadata_suggestion || {};
+    const problems = [];
+    if (detail.candidate.snapshot_id !== item.snapshot_id || detail.candidate.source_id !== item.source_id || detail.candidate.collection_run_id !== item.collection_run_id) problems.push('EVIDENCE_CHAIN_CHANGED');
+    if (detail.candidate.normalized_text_sha256 !== item.input_body_sha256) problems.push('CANDIDATE_BODY_CHANGED');
+    if ((normalization.parser_version || detail.raw_snapshot.parser_version || '') !== item.parser_version) problems.push('PARSER_VERSION_CHANGED');
+    if (!assessment || !assessment.is_current || assessment.assessment_id !== item.assessment_id) problems.push('ASSESSMENT_SUPERSEDED');
+    else {
+      if (assessment.rule_version !== item.risk_rule_version) problems.push('RISK_RULE_VERSION_CHANGED');
+      if (assessment.risk_level !== 'low' || Number(assessment.risk_score) >= 15) problems.push('RISK_LEVEL_CHANGED');
+      if (assessment.input_body_sha256 !== item.input_body_sha256) problems.push('RISK_BODY_HASH_CHANGED');
+    }
+    if (suggestion.rule_version !== item.metadata_rule_version || suggestion.input_body_sha256 !== item.metadata_input_body_sha256) problems.push('METADATA_SUGGESTION_CHANGED');
+    if (proposalCount !== 0) problems.push('RELATION_PROPOSAL_PENDING');
+    if (Number(detail.raw_snapshot.http_status) !== 200 || detail.source.enabled !== true || detail.collection_run.source_id !== detail.source.source_id) problems.push('EVIDENCE_VALIDATION_FAILED');
+    if (requirePending && (detail.candidate.verification_state !== 'pending_review' || detail.candidate.legal_status !== 'pending')) problems.push('CANDIDATE_ALREADY_REVIEWED');
+    const otherReservation = (await pool.query(
+      `SELECT manifest_id FROM review_batch_items WHERE candidate_id=$1 AND manifest_id<>$2
+       AND item_state IN ('selected','sample_required','sample_approved','processing','failed') LIMIT 1`,
+      [item.candidate_id, item.manifest_id]
+    )).rows[0];
+    if (otherReservation) problems.push('CANDIDATE_RESERVED_BY_OTHER_MANIFEST');
+    return { problems, detail, assessment, proposal_count: proposalCount };
+  }
+  async function refreshReviewBatchSamples(manifestId) {
+    const key = required(manifestId, 'manifest_id');
+    const manifest = (await pool.query('SELECT * FROM review_batch_manifests WHERE manifest_id=$1', [key])).rows[0];
+    if (!manifest) throw new Error('review manifest 不存在。');
+    if (['blocked', 'cancelled', 'completed', 'processing'].includes(manifest.manifest_state)) return getReviewBatchManifest(key);
+    const samples = (await pool.query("SELECT * FROM review_batch_items WHERE manifest_id=$1 AND is_sample=true ORDER BY created_at", [key])).rows.map(batchItemRow);
+    let allApproved = true;
+    for (const item of samples) {
+      // A frozen manifest must fail closed even before the human sample
+      // review has completed. Otherwise a changed body/parser/assessment
+      // could remain in a seemingly valid sample-review state.
+      const validation = await manifestItemProblems(item, { requirePending: false });
+      if (validation.problems.length) return blockReviewBatchManifest(key, `抽样 Candidate ${item.candidate_id} 发生变化：${validation.problems.join(',')}`);
+      if (item.item_state === 'sample_approved') continue;
+      const latest = (await pool.query(
+        'SELECT * FROM review_decisions WHERE candidate_id=$1 AND reviewer_level=3 ORDER BY decided_at DESC LIMIT 1', [item.candidate_id]
+      )).rows[0];
+      if (latest?.decision === 'reject' || latest?.decision === 'return') return blockReviewBatchManifest(key, `抽样 Candidate ${item.candidate_id} 未通过 Level 3 审核。`);
+      if (latest?.decision !== 'approve') { allApproved = false; continue; }
+      const version = (await pool.query('SELECT * FROM policy_versions WHERE candidate_id=$1', [item.candidate_id])).rows[0];
+      if (!version) return blockReviewBatchManifest(key, `抽样 Candidate ${item.candidate_id} 缺少 Policy Version。`);
+      await pool.query(
+        "UPDATE review_batch_items SET item_state='sample_approved',review_decision_id=$2,policy_id=$3,policy_version_id=$4,updated_at=$5 WHERE manifest_item_id=$1",
+        [item.manifest_item_id, latest.review_decision_id, version.policy_id, version.policy_version_id, clock()]
+      );
+    }
+    if (allApproved) await pool.query("UPDATE review_batch_manifests SET manifest_state='ready',updated_at=$2 WHERE manifest_id=$1", [key, clock()]);
+    return getReviewBatchManifest(key);
+  }
+  async function beginReviewBatchApply(manifestId) {
+    const key = required(manifestId, 'manifest_id');
+    const locked = await withExclusiveLock(`taxkb:review-batch:${key}`, async () => {
+      let result = await refreshReviewBatchSamples(key);
+      if (result.manifest.manifest_state === 'blocked') return { execution: 'blocked', ...result };
+      if (result.manifest.manifest_state === 'sample_review') return { execution: 'sample_review_required', ...result };
+      if (result.manifest.manifest_state === 'completed') return { execution: 'already_completed', ...result };
+      if (result.manifest.manifest_state === 'processing') return { execution: 'in_progress', ...result };
+      if (!['ready', 'failed'].includes(result.manifest.manifest_state)) throw new Error('manifest 当前状态不能执行。');
+      // Revalidate every frozen item before any non-sample Candidate can be
+      // approved. A mismatch blocks the entire manifest before it can create
+      // even a partial set of Policy / Policy Version records.
+      for (const item of result.items) {
+        // A failed item that already has a Policy Version is a projection-only
+        // retry. Its Candidate is expected to be verified, but every frozen
+        // evidence/hash/risk constraint must still match.
+        const projectionOnlyRetry = item.item_state === 'failed' && Boolean(item.policy_version_id);
+        const validation = await manifestItemProblems(item, { requirePending: item.is_sample ? false : !projectionOnlyRetry });
+        if (validation.problems.length) {
+          const blocked = await blockReviewBatchManifest(key, `manifest Candidate ${item.candidate_id} 发生变化：${validation.problems.join(',')}`);
+          return { execution: 'blocked', ...blocked };
+        }
+      }
+      await pool.query("UPDATE review_batch_manifests SET manifest_state='processing',updated_at=$2 WHERE manifest_id=$1", [key, clock()]);
+      result = await getReviewBatchManifest(key);
+      return { execution: 'ready_to_apply', ...result };
+    });
+    if (!locked.acquired) return { execution: 'in_progress', ...(await getReviewBatchManifest(key)) };
+    return locked.result;
+  }
+  async function markReviewBatchItem(manifestItemId, { item_state, review_decision_id = null, policy_id = null, policy_version_id = null, last_error = null } = {}) {
+    const allowed = new Set(['selected', 'sample_required', 'sample_approved', 'processing', 'published', 'failed', 'blocked']);
+    if (!allowed.has(item_state)) throw new Error('manifest item 状态无效。');
+    await pool.query(
+      `UPDATE review_batch_items SET item_state=$2,review_decision_id=COALESCE($3,review_decision_id),policy_id=COALESCE($4,policy_id),policy_version_id=COALESCE($5,policy_version_id),last_error=$6,updated_at=$7 WHERE manifest_item_id=$1`,
+      [required(manifestItemId, 'manifest_item_id'), item_state, review_decision_id, policy_id, policy_version_id, last_error ? String(last_error).slice(0, 500) : null, clock()]
+    );
+  }
+  async function completeReviewBatchManifest(manifestId) {
+    const key = required(manifestId, 'manifest_id');
+    const pending = (await pool.query("SELECT COUNT(*)::int AS count FROM review_batch_items WHERE manifest_id=$1 AND item_state NOT IN ('sample_approved','published')", [key])).rows[0].count;
+    if (pending) throw new Error('manifest 仍有未完成项目。');
+    await pool.query("UPDATE review_batch_manifests SET manifest_state='completed',completed_at=$2,updated_at=$2 WHERE manifest_id=$1", [key, clock()]);
+    return getReviewBatchManifest(key);
+  }
+  async function failReviewBatchManifest(manifestId, reason) {
+    const key = required(manifestId, 'manifest_id');
+    await pool.query("UPDATE review_batch_manifests SET manifest_state='failed',blocked_reason=$2,updated_at=$3 WHERE manifest_id=$1", [key, String(reason || 'projection failed').slice(0, 500), clock()]);
+    return getReviewBatchManifest(key);
+  }
+  async function ensureProjectionJob({ policy_id, policy_version_id, candidate_id, review_decision_id, projection_hash, manifest_id = null } = {}) {
+    const timestamp = clock();
+    const jobId = id('projection-job');
+    await pool.query(
+      `INSERT INTO policy_projection_jobs
+       (projection_job_id,policy_id,policy_version_id,candidate_id,review_decision_id,manifest_id,projection_hash,job_state,created_at,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8,$8)
+       ON CONFLICT (policy_version_id) DO NOTHING`,
+      [jobId, required(policy_id, 'policy_id'), required(policy_version_id, 'policy_version_id'), required(candidate_id, 'candidate_id'), required(review_decision_id, 'review_decision_id'), manifest_id, required(projection_hash, 'projection_hash'), timestamp]
+    );
+    return projectionJobRow((await pool.query('SELECT * FROM policy_projection_jobs WHERE policy_version_id=$1', [policy_version_id])).rows[0]);
+  }
+  async function getProjectionJobDetail(projectionJobId) {
+    const job = (await pool.query('SELECT * FROM policy_projection_jobs WHERE projection_job_id=$1', [required(projectionJobId, 'projection_job_id')])).rows[0];
+    if (!job) throw new Error('projection job 不存在。');
+    const [policy, policyVersion, review] = await Promise.all([
+      pool.query('SELECT * FROM policies WHERE policy_id=$1', [job.policy_id]),
+      pool.query('SELECT * FROM policy_versions WHERE policy_version_id=$1', [job.policy_version_id]),
+      pool.query('SELECT * FROM review_decisions WHERE review_decision_id=$1', [job.review_decision_id])
+    ]);
+    return { job: projectionJobRow(job), policy: policy.rows[0], policy_version: policyVersion.rows[0], review_decision: { ...review.rows[0], confirmed_fields: jsonObject(review.rows[0]?.confirmed_fields) }, detail: await getCandidateForReview(job.candidate_id) };
+  }
+  async function getProjectionJobForPolicyVersion(policyVersionId) {
+    return projectionJobRow((await pool.query('SELECT * FROM policy_projection_jobs WHERE policy_version_id=$1', [required(policyVersionId, 'policy_version_id')])).rows[0] || null);
+  }
+  async function markProjectionJob(projectionJobId, state, { error = null } = {}) {
+    if (!['processing', 'published', 'failed'].includes(state)) throw new Error('projection job 状态无效。');
+    const timestamp = clock();
+    await pool.query(
+      `UPDATE policy_projection_jobs SET job_state=$2,attempts=CASE WHEN $2='processing' THEN attempts+1 ELSE attempts END,last_error=$3,updated_at=$4,published_at=CASE WHEN $2='published' THEN $4 ELSE published_at END WHERE projection_job_id=$1`,
+      [required(projectionJobId, 'projection_job_id'), state, error ? String(error).slice(0, 500) : null, timestamp]
+    );
+    return projectionJobRow((await pool.query('SELECT * FROM policy_projection_jobs WHERE projection_job_id=$1', [projectionJobId])).rows[0]);
+  }
+  async function getReviewBatchItem(manifestItemId) {
+    const row = (await pool.query('SELECT * FROM review_batch_items WHERE manifest_item_id=$1', [required(manifestItemId, 'manifest_item_id')])).rows[0];
+    if (!row) throw new Error('manifest item 不存在。');
+    return batchItemRow(row);
+  }
+  async function approveLowRiskReviewBatchItem(manifestItemId) {
+    const item = await getReviewBatchItem(manifestItemId);
+    const manifest = (await pool.query('SELECT * FROM review_batch_manifests WHERE manifest_id=$1', [item.manifest_id])).rows[0];
+    if (!manifest || manifest.manifest_state !== 'processing') throw new Error('manifest 当前不在执行状态。');
+    if (item.is_sample) throw new Error('抽样 Candidate 必须通过现有单条 Level 3 审核，不能由 batch 发布。');
+    if (item.policy_version_id) return { execution: 'already_reviewed', item, review_decision: null, policy: null, policy_version: { policy_version_id: item.policy_version_id, policy_id: item.policy_id } };
+    const result = await reviewCandidate(item.candidate_id, {
+      action: 'approve', legal_status: 'pending', reviewer_id: `netlify-admin:batch:${item.manifest_id}`,
+      note: `Low Risk batch manifest ${item.manifest_id}`, confirmed_fields: item.confirmed_fields,
+      precondition: async () => {
+        const currentItem = await getReviewBatchItem(item.manifest_item_id);
+        if (!['selected', 'failed'].includes(currentItem.item_state)) throw new Error('manifest item 已被其他流程处理。');
+        const validation = await manifestItemProblems(currentItem, { requirePending: true });
+        if (validation.problems.length) throw new Error(`manifest item 重新校验失败：${validation.problems.join(',')}`);
+        await markReviewBatchItem(currentItem.manifest_item_id, { item_state: 'processing' });
+      }
+    });
+    await markReviewBatchItem(item.manifest_item_id, {
+      item_state: 'processing', review_decision_id: result.review_decision?.review_decision_id || null,
+      policy_id: result.policy?.policy_id || null, policy_version_id: result.policy_version?.policy_version_id || null
+    });
+    return { execution: result.execution, item: await getReviewBatchItem(item.manifest_item_id), review_decision: result.review_decision, policy: result.policy, policy_version: result.policy_version, detail: result };
+  }
+  async function reviewCandidate(candidateId, { action, legal_status = 'pending', reviewer_id = 'netlify-admin', note = '', confirmed_fields = {}, precondition = null } = {}) {
     const candidateKey = required(candidateId, 'candidate_id');
     const requestedAction = required(action, 'action');
     if (!['approve', 'reject', 'return'].includes(requestedAction)) throw new Error('审核动作无效。');
@@ -275,6 +686,10 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       const candidate = detail.candidate;
       const reviews = (await pool.query('SELECT * FROM review_decisions WHERE candidate_id=$1 ORDER BY decided_at DESC', [candidateKey])).rows
         .map((row) => ({ ...row, confirmed_fields: jsonObject(row.confirmed_fields), evidence_snapshot_ids: jsonObject(row.evidence_snapshot_ids, []) }));
+      if (precondition) {
+        if (typeof precondition !== 'function') throw new Error('审核前置校验必须是函数。');
+        await precondition({ candidate, detail, reviews });
+      }
       const existingApproval = reviews.find((item) => item.reviewer_level === 3 && item.decision === 'approve');
       if (requestedAction === 'approve' && existingApproval) {
         const version = (await pool.query('SELECT * FROM policy_versions WHERE candidate_id=$1', [candidateKey])).rows[0];
@@ -372,5 +787,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

@@ -1,17 +1,22 @@
 import { createPostgresEvidenceRepository } from '../../src/postgres-evidence-repository.js';
+import { createHash } from 'node:crypto';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js';
 import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
+import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
 import { importPolicies } from './policy-store.mjs';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
 export const PHASE_2D_REPARSE_CONFIRMATION = 'REPARSE_PHASE2B_TWO_CANDIDATES';
 export const PHASE_2D_METADATA_SUGGESTION_CONFIRMATION = 'SUGGEST_PHASE2B_TWO_CANDIDATES';
+export const LOW_RISK_BATCH_CONFIRMATION_PHRASE = LOW_RISK_BATCH_CONFIRMATION;
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2d-server-evidence-ingestion)';
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
+const sha256 = (value) => createHash('sha256').update(String(value || '')).digest('hex');
+const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value);
 
 function requireAdmin(request) {
   const expected = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
@@ -144,6 +149,118 @@ async function defaultPublishProjection(policy) {
   return importPolicies([policy], { dryRun: false });
 }
 
+function safeProjectionJob(job) {
+  return job && {
+    projection_job_id: job.projection_job_id,
+    policy_id: job.policy_id,
+    policy_version_id: job.policy_version_id,
+    candidate_id: job.candidate_id,
+    manifest_id: job.manifest_id || null,
+    job_state: job.job_state,
+    attempts: job.attempts,
+    last_error: job.last_error || null,
+    created_at: job.created_at,
+    published_at: job.published_at || null
+  };
+}
+
+function projectionFromJobDetail(value) {
+  return buildPublicPolicyProjection({
+    candidate: value.detail.candidate,
+    source: value.detail.source,
+    reviewDecision: value.review_decision,
+    policy: value.policy,
+    policyVersion: value.policy_version,
+    confirmedFields: value.review_decision.confirmed_fields,
+    normalizedText: value.detail.candidate.parsed_normalized_text ?? value.detail.raw_snapshot.normalized_text,
+    now: new Date(value.job.created_at)
+  });
+}
+
+/** A failed public Blob projection can be retried without re-reviewing data. */
+export async function processPolicyProjectionJob(projectionJobId, { repository = defaultRepositoryFactory(), publishProjection = defaultPublishProjection } = {}) {
+  const initial = await repository.getProjectionJobDetail(projectionJobId);
+  if (initial.job.job_state === 'published') return { execution: 'already_published', job: safeProjectionJob(initial.job), publication: null };
+  await repository.markProjectionJob(projectionJobId, 'processing');
+  try {
+    const current = await repository.getProjectionJobDetail(projectionJobId);
+    const projection = projectionFromJobDetail(current);
+    if (sha256(stable(projection)) !== current.job.projection_hash) throw new Error('projection job 内容 hash 不一致，已停止写入公开投影。');
+    const publication = await publishProjection(projection);
+    const job = await repository.markProjectionJob(projectionJobId, 'published');
+    return { execution: 'published', job: safeProjectionJob(job), publication };
+  } catch (error) {
+    const job = await repository.markProjectionJob(projectionJobId, 'failed', { error: error?.message || 'projection failed' });
+    return { execution: 'failed', job: safeProjectionJob(job), publication: null };
+  }
+}
+
+async function queueProjectionForReview(result, { repository, publishProjection, manifestId = null } = {}) {
+  if (!result.policy || !result.policy_version || !result.review_decision) return null;
+  const projection = buildPublicPolicyProjection({
+    candidate: result.candidate,
+    source: result.source,
+    reviewDecision: result.review_decision,
+    policy: result.policy,
+    policyVersion: result.policy_version,
+    confirmedFields: result.confirmed_fields,
+    normalizedText: result.candidate.parsed_normalized_text ?? result.raw_snapshot.normalized_text
+  });
+  const job = await repository.ensureProjectionJob({
+    policy_id: result.policy.policy_id,
+    policy_version_id: result.policy_version.policy_version_id,
+    candidate_id: result.candidate.candidate_id,
+    review_decision_id: result.review_decision.review_decision_id,
+    manifest_id: manifestId,
+    projection_hash: sha256(stable(projection))
+  });
+  return processPolicyProjectionJob(job.projection_job_id, { repository, publishProjection });
+}
+
+function safeRiskQueue(value) {
+  return {
+    total: value.total,
+    results: value.results.map((item) => ({
+      candidate: adminCandidateSummary(item.candidate),
+      assessment: {
+        assessment_id: item.assessment.assessment_id,
+        rule_version: item.assessment.rule_version,
+        input_body_sha256: item.assessment.input_body_sha256,
+        parser_version: item.assessment.parser_version,
+        risk_level: item.assessment.risk_level,
+        risk_score: item.assessment.risk_score,
+        risk_reasons: item.assessment.risk_reasons,
+        quality_metrics: item.assessment.quality_metrics,
+        assessed_at: item.assessment.assessed_at
+      },
+      source: item.source,
+      collection_run: item.collection_run,
+      active_relation_proposal_count: item.active_relation_proposal_count
+    }))
+  };
+}
+
+function safeManifest(value) {
+  return {
+    manifest: value.manifest,
+    items: value.items.map((item) => ({
+      manifest_item_id: item.manifest_item_id,
+      candidate: adminCandidateSummary({ ...item.candidate, source_id: item.source_id, created_at: item.created_at, updated_at: item.updated_at }),
+      assessment_id: item.assessment_id,
+      input_body_sha256: item.input_body_sha256,
+      parser_version: item.parser_version,
+      risk_rule_version: item.risk_rule_version,
+      risk_level: item.risk_level,
+      risk_score: item.risk_score,
+      metadata_rule_version: item.metadata_rule_version,
+      metadata_input_body_sha256: item.metadata_input_body_sha256,
+      is_sample: item.is_sample,
+      item_state: item.item_state,
+      last_error: item.last_error || null
+    }))
+  };
+}
+
 export async function reviewEvidenceCandidate(candidateId, input, { repository = defaultRepositoryFactory(), publishProjection = defaultPublishProjection, reviewerId = 'netlify-admin' } = {}) {
   const action = String(input?.action || '').trim();
   if (!['approve', 'reject', 'return'].includes(action)) throw new Error('审核动作无效。');
@@ -158,19 +275,9 @@ export async function reviewEvidenceCandidate(candidateId, input, { repository =
     reviewer_id: reviewerId,
     confirmed_fields: confirmedFields
   });
-  let publication = null;
-  if (action === 'approve') {
-    const projection = buildPublicPolicyProjection({
-      candidate: result.candidate,
-      source: result.source,
-      reviewDecision: result.review_decision,
-      policy: result.policy,
-      policyVersion: result.policy_version,
-      confirmedFields: result.confirmed_fields,
-      normalizedText: result.candidate.parsed_normalized_text ?? result.raw_snapshot.normalized_text
-    });
-    publication = await publishProjection(projection);
-  }
+  const publication = action === 'approve'
+    ? await queueProjectionForReview(result, { repository, publishProjection })
+    : null;
   return {
     execution: result.execution,
     candidate: adminCandidateSummary(result.candidate),
@@ -404,10 +511,51 @@ export async function readEvidenceCandidateTrace(candidateId, { repository = def
   return safeTrace(await repository.traceCandidate(candidateId));
 }
 
+function riskQueueFilters(url) {
+  const allowed = new Set(['risk_level', 'min_score', 'max_score', 'source_id', 'collection_run_id', 'tax_category', 'publish_from', 'publish_to', 'missing_field', 'conflict_type', 'reason_code', 'limit', 'offset']);
+  for (const key of url.searchParams.keys()) if (!allowed.has(key)) throw new Error(`风险队列不接受筛选参数：${key}`);
+  return Object.fromEntries([...url.searchParams.entries()]);
+}
+
+export async function applyLowRiskReviewManifest(manifestId, { repository = defaultRepositoryFactory(), publishProjection = defaultPublishProjection } = {}) {
+  const prepared = await repository.beginReviewBatchApply(manifestId);
+  if (prepared.execution !== 'ready_to_apply') return { execution: prepared.execution, manifest: safeManifest(prepared) };
+  for (const item of prepared.items) {
+    if (item.is_sample || item.item_state === 'published' || item.item_state === 'sample_approved') continue;
+    try {
+      if (item.item_state === 'failed' && item.policy_version_id) {
+        const job = await repository.getProjectionJobForPolicyVersion(item.policy_version_id);
+        if (!job) throw new Error('已审核项目缺少 projection job。');
+        const retried = await processPolicyProjectionJob(job.projection_job_id, { repository, publishProjection });
+        if (retried.execution !== 'published' && retried.execution !== 'already_published') {
+          await repository.failReviewBatchManifest(manifestId, `projection job ${job.projection_job_id} 失败。`);
+          return { execution: 'failed', manifest: safeManifest(await repository.getReviewBatchManifest(manifestId)), failed_item_id: item.manifest_item_id };
+        }
+        await repository.markReviewBatchItem(item.manifest_item_id, { item_state: 'published' });
+        continue;
+      }
+      const approved = await repository.approveLowRiskReviewBatchItem(item.manifest_item_id);
+      const projection = await queueProjectionForReview(approved.detail, { repository, publishProjection, manifestId });
+      if (!projection || !['published', 'already_published'].includes(projection.execution)) {
+        await repository.markReviewBatchItem(item.manifest_item_id, { item_state: 'failed', last_error: projection?.job?.last_error || 'projection failed' });
+        await repository.failReviewBatchManifest(manifestId, `projection job ${projection?.job?.projection_job_id || 'unknown'} 失败。`);
+        return { execution: 'failed', manifest: safeManifest(await repository.getReviewBatchManifest(manifestId)), failed_item_id: item.manifest_item_id, projection };
+      }
+      await repository.markReviewBatchItem(item.manifest_item_id, { item_state: 'published' });
+    } catch (error) {
+      await repository.blockReviewBatchManifest(manifestId, error?.message || 'manifest item validation failed');
+      return { execution: 'blocked', manifest: safeManifest(await repository.getReviewBatchManifest(manifestId)), failed_item_id: item.manifest_item_id };
+    }
+  }
+  return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
+}
+
 export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
-    if (url.search) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
+    const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
+    if (url.search && !isRiskQueueRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
+    if (isRiskQueueRead) return json(safeRiskQueue(await repositoryFactory().listRiskQueue(riskQueueFilters(url))));
     if (request.method === 'POST' && pathname === '/api/admin/evidence/import-phase2b') {
       const input = await requestBody(request);
       if (Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== PHASE_2D_IMPORT_CONFIRMATION) {
@@ -431,6 +579,22 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       return json(await generatePhase2BMetadataSuggestions({ repository: repositoryFactory() }));
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/risk-queue/manifests') {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => key !== 'filters')) return json({ error: 'Low Risk manifest 只接受服务端筛选条件，不接受 Candidate ID 或政策内容。' }, 400);
+      return json({ mode: 'dry_run_manifest', ...safeManifest(await repositoryFactory().createLowRiskReviewManifest({ filters: input.filters || {} })) });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/risk-queue\/manifests\/[^/]+$/.test(pathname)) {
+      return json(safeManifest(await repositoryFactory().getReviewBatchManifest(decodeURIComponent(pathname.split('/').pop()))));
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/risk-queue\/manifests\/[^/]+\/apply$/.test(pathname)) {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== LOW_RISK_BATCH_CONFIRMATION_PHRASE) {
+        return json({ error: 'Low Risk 批量确认只接受固定 apply 与确认短语，且不接受 Candidate ID、正文或 legal_status。' }, 400);
+      }
+      const manifestId = decodeURIComponent(pathname.split('/')[6]);
+      return json(await applyLowRiskReviewManifest(manifestId, { repository: repositoryFactory(), publishProjection }));
+    }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/candidates') {
       const candidates = await repositoryFactory().listCandidatesForReview();
       return json({ candidates: candidates.map(adminCandidateSummary) });
@@ -438,6 +602,27 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);
       return json({ detail: adminReviewDetail(await repositoryFactory().getCandidateForReview(candidateId)) });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/risk-assessments$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      return json({ assessments: await repositoryFactory().listCandidateRiskAssessments(candidateId) });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/relation-proposals$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      return json({ proposals: await repositoryFactory().listCandidateRelationProposals(candidateId) });
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/relation-proposals$/.test(pathname)) {
+      const candidateId = decodeURIComponent(pathname.split('/')[5]);
+      const input = await requestBody(request);
+      if (Object.keys(input).length) return json({ error: '关系线索生成不接受请求参数。' }, 400);
+      return json(await repositoryFactory().generateCandidateRelationProposals(candidateId));
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/relation-proposals\/[^/]+\/review$/.test(pathname)) {
+      const proposalId = decodeURIComponent(pathname.split('/')[5]);
+      const input = await requestBody(request);
+      const allowed = new Set(['action', 'note']);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !allowed.has(key))) return json({ error: '关系线索审核只接受 action 与 note。' }, 400);
+      return json(await repositoryFactory().reviewCandidateRelationProposal(proposalId, { action: input.action, note: input.note || '' }));
     }
     if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/suggest-metadata$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);
