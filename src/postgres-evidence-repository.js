@@ -787,6 +787,25 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const expectedHash = phase3c1ManifestFingerprint({ items: preview.items, selection_criteria: preview.selection_criteria });
     if (preview.manifest_hash !== expectedHash) throw new Error('Phase 3C-1 preview manifest hash 不一致。');
   }
+  function phase3c1UpstreamAttemptAudit(preview) {
+    return (preview?.items || []).map((item) => ({
+      ordinal: item.ordinal,
+      upstream_attempts: (item.upstream_attempts || []).map((attempt) => ({
+        attempt_number: attempt.attempt_number,
+        retry_eligible: Boolean(attempt.retry_eligible),
+        wait_before_next_ms: Number(attempt.wait_before_next_ms) || 0,
+        http_status: attempt.http_status ?? null,
+        content_type: attempt.content_type ?? null,
+        final_url: attempt.final_url ?? null,
+        html_length: attempt.html_length ?? null,
+        html_sha256: attempt.html_sha256 ?? null,
+        page_title: attempt.page_title ?? null,
+        selector_counts: attempt.selector_counts ?? null,
+        parser_result: attempt.parser_result ?? null,
+        parser_error_code: attempt.parser_error_code ?? null
+      }))
+    }));
+  }
   async function getControlledImportManifest(controlledManifestId) {
     const manifest = (await pool.query('SELECT * FROM controlled_import_manifests WHERE controlled_manifest_id=$1', [required(controlledManifestId, 'controlled_manifest_id')])).rows[0];
     if (!manifest) throw new Error('controlled import manifest 不存在。');
@@ -809,7 +828,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
           `INSERT INTO controlled_import_manifest_items (controlled_manifest_item_id,controlled_manifest_id,ordinal,official_url,canonical_url,title,document_no,document_no_provenance,issuing_authority,publish_date,effective_date,body_hash,parser_version,risk_assessment,metadata_suggestion,relation_proposals,item_fingerprint,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
           [id('controlled-import-manifest-item'), manifestId, item.ordinal, canonical(item.official_url), canonical(item.canonical_url || item.official_url), required(item.title, 'title'), required(item.document_no, 'document_no'), JSON.stringify(item.document_no_provenance), JSON.stringify(item.issuing_authority || []), required(item.publish_date, 'publish_date'), item.effective_date || null, required(item.body_hash, 'body_hash'), required(item.parser_version, 'parser_version'), JSON.stringify(item.risk_assessment), JSON.stringify(item.metadata_suggestion), JSON.stringify(item.relation_proposals), required(item.item_fingerprint, 'item_fingerprint'), timestamp]
         );
-        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length }), timestamp]);
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length, upstream_attempts: phase3c1UpstreamAttemptAudit(preview) }), timestamp]);
       });
       return { created: true, ...(await getControlledImportManifest(manifestId)) };
     });
@@ -914,7 +933,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         );
         await client.query(
           'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
-          [id('audit'), 'controlled_import_preflight', preflightId, `phase3c2_preflight_${state}`, JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preview_hash: currentPreviewHash, expires_at: expiresAt, validation }), timestamp]
+          [id('audit'), 'controlled_import_preflight', preflightId, `phase3c2_preflight_${state}`, JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preview_hash: currentPreviewHash, expires_at: expiresAt, validation, upstream_attempts: phase3c1UpstreamAttemptAudit(current_preview) }), timestamp]
         );
       });
       const row = (await pool.query('SELECT * FROM controlled_import_preflights WHERE preflight_id=$1', [preflightId])).rows[0];
@@ -988,7 +1007,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
           [applyId, manifestId, manifestHashValue, preflightId, required(operator_id, 'operator_id'), timestamp]
         );
         await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
-          [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_started', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id }), timestamp]
+          [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_started', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, upstream_attempts: phase3c1UpstreamAttemptAudit(current_preview) }), timestamp]
         );
       });
       const snapshots = frozen.items.map((item) => ({ item, material: materials.find((value) => Number(value.ordinal) === Number(item.ordinal)), snapshot_id: id('snapshot'), candidate_id: id('candidate') }));
@@ -1045,7 +1064,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
           await client.query("UPDATE controlled_import_manifests SET manifest_state='consumed',consumed_at=$2,updated_at=$2 WHERE controlled_manifest_id=$1", [manifestId, timestamp]);
           await client.query("UPDATE controlled_import_apply_attempts SET apply_state='completed',result=$2,completed_at=$3 WHERE controlled_apply_id=$1", [applyId, JSON.stringify(result), timestamp]);
           await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
-            [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_completed', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, ...result }), timestamp]);
+            [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_completed', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, upstream_attempts: phase3c1UpstreamAttemptAudit(current_preview), ...result }), timestamp]);
         });
       } catch (error) {
         // A failed Apply never reuses the same authorization checkpoint. This

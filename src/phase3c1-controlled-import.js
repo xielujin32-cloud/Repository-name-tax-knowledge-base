@@ -12,6 +12,9 @@ export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MAN
 const PHASE3C1_PREVIEW_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)';
 const PHASE3C1_FETCH_TIMEOUT_MS = 20_000;
 const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
+const PHASE3C1_TRANSIENT_MAX_ATTEMPTS = 2;
+const PHASE3C1_TRANSIENT_RETRY_DELAY_MS = 5_000;
+const PHASE3C1_RATE_LIMIT_MAX_DELAY_MS = 15_000;
 export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
   selection_version: 'phase3c1-fixed-preview-v1',
   source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
@@ -196,7 +199,7 @@ function diagnosticItem({ ordinal, requested_url, response, raw_html }, { includ
  * text never become part of this object.
  */
 export class Phase3C1PreviewFailure extends Error {
-  constructor({ ordinal, stage, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, code = 'PREVIEW_ITEM_FAILED' } = {}) {
+  constructor({ ordinal, stage, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, code = 'PREVIEW_ITEM_FAILED', upstream_attempts = [] } = {}) {
     super(`Phase 3C-1 Preview stopped at ordinal ${ordinal}.`);
     this.name = 'Phase3C1PreviewFailure';
     const hasHtml = typeof raw_html === 'string';
@@ -215,13 +218,100 @@ export class Phase3C1PreviewFailure extends Error {
       html_sha256: hasHtml ? sha256(raw_html) : null,
       page_title: hasHtml ? safeTitle(raw_html) : null,
       selectors: hasHtml ? diagnosticSelectors(raw_html) : null,
-      parser_error_code: parser_error_code || (hasHtml ? diagnosticParse(raw_html).error_code : null)
+      parser_error_code: parser_error_code || (hasHtml ? diagnosticParse(raw_html).error_code : null),
+      upstream_attempts: Object.freeze([...(upstream_attempts || [])])
     });
   }
 }
 
 function phase3c1PreviewFailure(input) {
   return new Phase3C1PreviewFailure(input);
+}
+
+const waitFor = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function retryAfterDelay(headers) {
+  const seconds = String(headers?.get?.('retry-after') || '').trim();
+  if (!/^\d+$/.test(seconds)) return PHASE3C1_TRANSIENT_RETRY_DELAY_MS;
+  return Math.max(PHASE3C1_TRANSIENT_RETRY_DELAY_MS, Math.min(Number(seconds) * 1000, PHASE3C1_RATE_LIMIT_MAX_DELAY_MS));
+}
+
+function transientNetworkFailure(error) {
+  const code = String(error?.code || error?.cause?.code || '').toUpperCase();
+  const name = String(error?.name || '').toLowerCase();
+  return name === 'aborterror' || ['ETIMEDOUT', 'ECONNRESET', 'ECONNABORTED', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(code);
+}
+
+function allSupportedContainersMissing(selectors) {
+  return Object.values(selectors || {}).every((value) => Number(value?.count) === 0);
+}
+
+function safeRetryAttempt({ attempt_number, response = null, raw_html = null, requested_url = null, fetch_error = null, diagnostic = null, retry_eligible = false, wait_before_next_ms = 0 } = {}) {
+  const value = diagnostic || (typeof raw_html === 'string' && response ? diagnosticItem({ ordinal: null, requested_url, response, raw_html }) : null);
+  return Object.freeze({
+    attempt_number,
+    retry_eligible,
+    wait_before_next_ms,
+    http_status: value?.http_status ?? null,
+    content_type: value?.content_type ?? null,
+    final_url: value?.final_url ?? requested_url,
+    html_length: value?.html_character_length ?? null,
+    html_sha256: value?.html_sha256 ?? null,
+    page_title: value?.page_title ?? null,
+    selector_counts: value?.selectors ?? null,
+    parser_result: value?.parse?.result ?? 'FAIL',
+    parser_error_code: value?.parse?.error_code ?? (fetch_error ? 'UPSTREAM_FETCH_FAILED' : null)
+  });
+}
+
+function retryDecision({ response = null, diagnostic = null, error = null } = {}) {
+  if (error) return { retry_eligible: transientNetworkFailure(error), delay_ms: PHASE3C1_TRANSIENT_RETRY_DELAY_MS, code: 'UPSTREAM_FETCH_FAILED' };
+  const status = Number(response?.status);
+  if (status === 429) return { retry_eligible: true, delay_ms: retryAfterDelay(response.headers), code: 'UPSTREAM_HTTP_429' };
+  if ([502, 503, 504].includes(status)) return { retry_eligible: true, delay_ms: PHASE3C1_TRANSIENT_RETRY_DELAY_MS, code: `UPSTREAM_HTTP_${status}` };
+  const incomplete200 = status === 200
+    && Number(diagnostic?.html_character_length) < 2_000
+    && !diagnostic?.page_title
+    && allSupportedContainersMissing(diagnostic?.selectors)
+    && diagnostic?.parse?.error_code === 'POLICY_BODY_CONTAINER_MISSING';
+  return { retry_eligible: incomplete200, delay_ms: PHASE3C1_TRANSIENT_RETRY_DELAY_MS, code: incomplete200 ? 'INCOMPLETE_HTML_200' : null };
+}
+
+/**
+ * Shared by the formal Preview, manifest material collection, and Apply
+ * material collection. Diagnostics deliberately continue to call the raw
+ * one-shot fetch helper so they expose upstream behavior without recovery.
+ */
+export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl = fetch, waitImpl = waitFor, ordinal = null, processed_count = 0 } = {}) {
+  const requestedUrl = canonical(officialUrl);
+  const upstreamAttempts = [];
+  for (let attempt = 1; attempt <= PHASE3C1_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
+    let fetched;
+    try {
+      fetched = await fetchPhase3C1OfficialDetail(requestedUrl, { fetchImpl });
+    } catch (error) {
+      const decision = retryDecision({ error });
+      const canRetry = decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS;
+      upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: requestedUrl, fetch_error: error, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
+      if (canRetry) { await waitImpl(decision.delay_ms); continue; }
+      throw phase3c1PreviewFailure({ ordinal, stage: 'fetch', processed_count, requested_url: requestedUrl, code: decision.code || 'UPSTREAM_FETCH_FAILED', upstream_attempts: upstreamAttempts });
+    }
+    const diagnostic = diagnosticItem({ ordinal, ...fetched });
+    const decision = retryDecision({ response: fetched.response, diagnostic });
+    const success = fetched.response.ok && diagnostic.parse.result === 'PASS';
+    const canRetry = !success && decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS;
+    upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, diagnostic, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
+    if (success) {
+      let parsed;
+      try { parsed = parseChinaTaxPolicyEvidence(fetched.raw_html); }
+      catch { throw phase3c1PreviewFailure({ ordinal, stage: 'parse', processed_count, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, parser_error_code: 'PARSER_ERROR', code: 'PARSER_ERROR', upstream_attempts: upstreamAttempts }); }
+      return Object.freeze({ ...fetched, parsed, upstream_attempts: Object.freeze(upstreamAttempts) });
+    }
+    if (canRetry) { await waitImpl(decision.delay_ms); continue; }
+    const stage = !fetched.response.ok ? 'http' : diagnostic.parse.error_code === 'POLICY_BODY_CONTAINER_MISSING' ? 'body-container' : 'parse';
+    throw phase3c1PreviewFailure({ ordinal, stage, processed_count, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, parser_error_code: diagnostic.parse.error_code, code: decision.code || diagnostic.parse.error_code || 'UPSTREAM_HTTP_NOT_OK', upstream_attempts: upstreamAttempts });
+  }
+  throw new Error('Phase 3C transient retry attempt limit invariant failed.');
 }
 
 /**
@@ -459,34 +549,19 @@ function eligibilityProblems(item) {
  * Evidence records or Blob objects. The caller can persist only its output
  * through the dedicated controlled-import repository method.
  */
-export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString() } = {}) {
+export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor } = {}) {
   const items = [];
   const materials = [];
   for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
     const ordinal = offset + 1;
     const officialUrl = canonical(configuredUrl);
-    let fetched;
-    try {
-      fetched = await fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl });
-    } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'fetch', processed_count: items.length, requested_url: officialUrl, code: 'UPSTREAM_FETCH_FAILED' });
-    }
-    const { response, raw_html: rawHtml } = fetched;
-    if (!response.ok) {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'http', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'UPSTREAM_HTTP_NOT_OK' });
-    }
-    let parsed;
-    try {
-      parsed = parseChinaTaxPolicyEvidence(rawHtml);
-    } catch {
-      const parser = diagnosticParse(rawHtml);
-      throw phase3c1PreviewFailure({ ordinal, stage: parser.error_code === 'POLICY_BODY_CONTAINER_MISSING' ? 'body-container' : 'parse', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, parser_error_code: parser.error_code, code: parser.error_code || 'PARSER_ERROR' });
-    }
+    const fetched = await fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl, waitImpl, ordinal, processed_count: items.length });
+    const { response, raw_html: rawHtml, parsed, upstream_attempts: upstreamAttempts } = fetched;
     let metadata;
     try {
       metadata = suggestEvidenceMetadata({ title: parsed.title, normalized_text: parsed.normalized_text, generated_at: now });
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'metadata', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'METADATA_SUGGESTION_FAILED' });
+      throw phase3c1PreviewFailure({ ordinal, stage: 'metadata', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'METADATA_SUGGESTION_FAILED', upstream_attempts: upstreamAttempts });
     }
     const fields = {
       title: parsed.title,
@@ -504,13 +579,13 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
     try {
       risk = evaluateCandidateRisk(syntheticRiskDetail({ ordinal, officialUrl, rawHtml, parsed, fields }));
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'risk', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RISK_ASSESSMENT_FAILED' });
+      throw phase3c1PreviewFailure({ ordinal, stage: 'risk', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RISK_ASSESSMENT_FAILED', upstream_attempts: upstreamAttempts });
     }
     let proposals;
     try {
       proposals = proposeCandidateRelations({ normalized_text: parsed.normalized_text });
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'relation', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RELATION_PROPOSAL_FAILED' });
+      throw phase3c1PreviewFailure({ ordinal, stage: 'relation', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RELATION_PROPOSAL_FAILED', upstream_attempts: upstreamAttempts });
     }
     const item = {
       ordinal,
@@ -530,6 +605,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       effective_date: parsed.effective_date,
       body_hash: sha256(parsed.normalized_text),
       body_length: parsed.normalized_text.length,
+      upstream_attempts: upstreamAttempts,
       parser_version: PHASE3C1_IMPORT_PARSER_VERSION,
       risk_assessment: { ...risk, assessment_hash: sha256(stable(risk)) },
       metadata_suggestion: {
@@ -553,7 +629,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       const stage = issues.includes('RISK_NOT_LOW_ZERO') ? 'risk'
         : issues.includes('RELATION_PROPOSAL_PRESENT') ? 'relation'
           : 'eligibility';
-      throw phase3c1PreviewFailure({ ordinal, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0] });
+      throw phase3c1PreviewFailure({ ordinal, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0], upstream_attempts: upstreamAttempts });
     }
     items.push(Object.freeze(item));
     materials.push(Object.freeze({
@@ -561,6 +637,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       official_url: officialUrl,
       http_status: response.status,
       response_headers_subset: headersSubset(response.headers),
+      upstream_attempts: upstreamAttempts,
       raw_html: rawHtml,
       normalized_text: parsed.normalized_text
     }));

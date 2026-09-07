@@ -279,6 +279,7 @@ function safePhase3C1Preview(preview) {
       effective_date: item.effective_date,
       body_hash: item.body_hash,
       body_length: item.body_length,
+      upstream_attempts: item.upstream_attempts || [],
       parser_version: item.parser_version,
       risk_assessment: item.risk_assessment,
       metadata_suggestion: item.metadata_suggestion,

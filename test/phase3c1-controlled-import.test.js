@@ -9,7 +9,7 @@ import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
 import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -125,6 +125,109 @@ test('Phase 3C-1 Preview fail-closed 返回安全的失败 ordinal 和阶段，�
     const serialized = JSON.stringify(result.body);
     assert.equal(serialized.includes(secret), false);
     assert.equal(serialized.includes(process.env.NETLIFY_TAXKB_ADMIN_TOKEN), false);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
+test('Phase 3C transient retry only recovers a strictly incomplete 200 page and audits both attempts', async () => {
+  const calls = [];
+  const waits = [];
+  const incomplete = '<html><body>temporary shell</body></html>';
+  const retryFetch = async (url) => {
+    calls.push(String(url));
+    if (calls.length === 1) return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } });
+    const ordinal = PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1;
+    return new Response(html(ordinal), { status: 200, headers: { 'content-type': 'text/html' } });
+  };
+  const preview = await preparePhase3C1ImportPreview({ fetchImpl: retryFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: async (milliseconds) => { waits.push(milliseconds); } });
+  assert.equal(calls.length, 11); assert.equal(calls[0], PHASE3C1_FIXED_IMPORT_URLS[0]); assert.equal(calls[1], PHASE3C1_FIXED_IMPORT_URLS[0]);
+  assert.deepEqual(waits, [5000]);
+  assert.equal(preview.items[0].upstream_attempts.length, 2);
+  assert.deepEqual(preview.items[0].upstream_attempts.map((item) => [item.attempt_number, item.retry_eligible, item.wait_before_next_ms, item.parser_error_code]), [[1, true, 5000, 'POLICY_BODY_CONTAINER_MISSING'], [2, false, 0, null]]);
+  assert.match(preview.items[0].body_hash, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(preview).includes(incomplete), false);
+});
+
+test('Phase 3C transient retry fails closed after two incomplete pages and never fetches a later fixed URL', async () => {
+  const calls = [];
+  const waits = [];
+  const incomplete = '<html><body>temporary shell</body></html>';
+  await assert.rejects(
+    () => preparePhase3C1ImportPreview({ fetchImpl: async (url) => { calls.push(String(url)); return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } }); }, waitImpl: async (milliseconds) => { waits.push(milliseconds); } }),
+    (error) => error instanceof Phase3C1PreviewFailure
+      && error.safe_diagnostic.failed_ordinal === 1
+      && error.safe_diagnostic.upstream_attempts.length === 2
+      && error.safe_diagnostic.upstream_attempts.every((item) => item.parser_error_code === 'POLICY_BODY_CONTAINER_MISSING')
+  );
+  assert.deepEqual(calls, [PHASE3C1_FIXED_IMPORT_URLS[0], PHASE3C1_FIXED_IMPORT_URLS[0]]);
+  assert.deepEqual(waits, [5000]);
+});
+
+test('Phase 3C retry classifier caps transient HTTP and network failures, but never retries non-transient or complete-page parse failures', async () => {
+  const retryable = [429, 502, 503, 504];
+  for (const status of retryable) {
+    const calls = []; const waits = [];
+    const result = await fetchParsePhase3C1OfficialDetailWithRetry(PHASE3C1_FIXED_IMPORT_URLS[0], {
+      fetchImpl: async () => { calls.push('request'); return calls.length === 1 ? new Response('temporary', { status, headers: { 'retry-after': status === 429 ? '1' : '' } }) : new Response(html(1), { status: 200, headers: { 'content-type': 'text/html' } }); },
+      waitImpl: async (milliseconds) => { waits.push(milliseconds); }
+    });
+    assert.equal(result.upstream_attempts.length, 2); assert.deepEqual(waits, [5000]); assert.equal(calls.length, 2);
+  }
+  for (const code of ['ETIMEDOUT', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT']) {
+    const calls = []; const waits = [];
+    const result = await fetchParsePhase3C1OfficialDetailWithRetry(PHASE3C1_FIXED_IMPORT_URLS[0], {
+      fetchImpl: async () => { calls.push('request'); if (calls.length === 1) throw Object.assign(new Error('transient'), { code }); return new Response(html(1), { status: 200, headers: { 'content-type': 'text/html' } }); },
+      waitImpl: async (milliseconds) => { waits.push(milliseconds); }
+    });
+    assert.equal(result.upstream_attempts.length, 2); assert.deepEqual(waits, [5000]);
+  }
+  const noRetryCases = [
+    new Response('not found', { status: 404 }),
+    new Response(`<html><head><title>complete but unsupported</title></head><body>${'x'.repeat(2500)}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } }),
+    new Response('<html><head><title>short title</title></head><body>x</body></html>', { status: 200, headers: { 'content-type': 'text/html' } })
+  ];
+  for (const response of noRetryCases) {
+    let calls = 0;
+    await assert.rejects(() => fetchParsePhase3C1OfficialDetailWithRetry(PHASE3C1_FIXED_IMPORT_URLS[0], { fetchImpl: async () => { calls += 1; return response.clone(); }, waitImpl: async () => { throw new Error('must not wait'); } }));
+    assert.equal(calls, 1);
+  }
+});
+
+test('Phase 3C retry does not weaken frozen body-hash comparison', async () => {
+  const frozen = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+  const calls = [];
+  const changed = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const ordinal = PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1;
+      calls.push(ordinal);
+      if (ordinal === 1 && calls.filter((value) => value === 1).length === 1) return new Response('<html><body>temporary shell</body></html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      return new Response(ordinal === 1 ? html(1).replace('纳税人应当按照规定办理申报', '纳税人应当另行办理申报') : html(ordinal), { status: 200, headers: { 'content-type': 'text/html' } });
+    },
+    waitImpl: async () => {}
+  });
+  assert.equal(changed.items[0].upstream_attempts.length, 2);
+  assert.notEqual(changed.items[0].body_hash, frozen.items[0].body_hash);
+  assert.ok(comparePhase3C1FrozenManifest(frozen.items, changed.items).some((item) => item.code === 'BODY_HASH_CHANGED'));
+});
+
+test('Phase 3C Preview stays read-only and never retries a downstream risk/eligibility failure', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-read-only-retry-token';
+  let repositoryFactoryCalls = 0;
+  const calls = [];
+  const missingDocumentNo = html(1).replace(/<h5 class="actfwzh">[\s\S]*?<\/h5>/, '');
+  try {
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('Preview must not open a repository'); },
+      fetchImpl: async (url) => { calls.push(String(url)); return new Response(missingDocumentNo, { status: 200, headers: { 'content-type': 'text/html' } }); }
+    }) });
+    const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(result.response.status, 422);
+    assert.equal(result.body.failure.failure_stage, 'risk');
+    assert.equal(result.body.failure.upstream_attempts.length, 1);
+    assert.equal(repositoryFactoryCalls, 0);
+    assert.deepEqual(calls, [PHASE3C1_FIXED_IMPORT_URLS[0]]);
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
   }
