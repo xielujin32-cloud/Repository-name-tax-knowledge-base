@@ -134,6 +134,60 @@ function diagnosticParse(rawHtml) {
   }
 }
 
+const SAFE_UPSTREAM_RESPONSE_HEADERS = Object.freeze([
+  'server', 'via', 'cache-control', 'age', 'content-length', 'content-encoding',
+  'x-cache', 'x-cache-hits', 'x-served-by', 'cf-cache-status', 'x-webcache-source'
+]);
+
+function safeUpstreamResponseHeaders(headers) {
+  const values = {};
+  for (const name of SAFE_UPSTREAM_RESPONSE_HEADERS) {
+    const value = headers?.get?.(name);
+    if (value) values[name] = String(value).slice(0, 500);
+  }
+  return values;
+}
+
+function shortResponseStructure(rawHtml) {
+  const value = String(rawHtml || '');
+  const short = value.length < 2_000;
+  if (!short) return { analyzed: false };
+  const text = value.replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ').replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return {
+    analyzed: true,
+    complete_html_document: /<html\b/i.test(value) && /<\/html\s*>/i.test(value),
+    script: /<script\b/i.test(value),
+    meta_refresh: /<meta\b[^>]*\bhttp-equiv\s*=\s*(["'])?refresh\1/i.test(value),
+    location_script: /(?:window|document)\.location\b|\blocation\.(?:href|assign|replace)\b/i.test(value),
+    iframe: /<iframe\b/i.test(value),
+    form: /<form\b/i.test(value),
+    js_challenge: /(?:challenge|captcha|recaptcha|hcaptcha|turnstile|_cf_chl|bot\s*(?:check|detection))/i.test(value),
+    empty_shell: text.length <= 80
+  };
+}
+
+function diagnosticItem({ ordinal, requested_url, response, raw_html }, { include_response_headers = false, include_short_structure = false } = {}) {
+  const value = {
+    ordinal,
+    official_url: requested_url,
+    http_status: response.status,
+    response_ok: response.ok,
+    content_type: response.headers?.get?.('content-type') || null,
+    final_url: response.url || requested_url,
+    redirect: { occurred: Boolean(response.redirected), count: response.redirected ? null : 0 },
+    html_character_length: raw_html.length,
+    html_utf8_byte_length: new TextEncoder().encode(raw_html).byteLength,
+    html_sha256: sha256(raw_html),
+    page_title: safeTitle(raw_html),
+    selectors: diagnosticSelectors(raw_html),
+    waf_signals: wafSignals(raw_html),
+    parse: diagnosticParse(raw_html)
+  };
+  if (include_response_headers) value.response_headers = safeUpstreamResponseHeaders(response.headers);
+  if (include_short_structure) value.short_response_structure = shortResponseStructure(raw_html);
+  return Object.freeze(value);
+}
+
 /**
  * Admin-only callers receive response diagnostics, never raw HTML or policy
  * prose. It deliberately does not throw on one failed item so a Production
@@ -145,22 +199,7 @@ export async function diagnosePhase3C1ImportPreview({ fetchImpl = fetch } = {}) 
     const ordinal = offset + 1;
     try {
       const { requested_url, response, raw_html } = await fetchPhase3C1OfficialDetail(configuredUrl, { fetchImpl });
-      items.push(Object.freeze({
-        ordinal,
-        official_url: requested_url,
-        http_status: response.status,
-        response_ok: response.ok,
-        content_type: response.headers?.get?.('content-type') || null,
-        final_url: response.url || requested_url,
-        redirect: { occurred: Boolean(response.redirected), count: response.redirected ? null : 0 },
-        html_character_length: raw_html.length,
-        html_utf8_byte_length: new TextEncoder().encode(raw_html).byteLength,
-        html_sha256: sha256(raw_html),
-        page_title: safeTitle(raw_html),
-        selectors: diagnosticSelectors(raw_html),
-        waf_signals: wafSignals(raw_html),
-        parse: diagnosticParse(raw_html)
-      }));
+      items.push(diagnosticItem({ ordinal, requested_url, response, raw_html }));
     } catch (error) {
       items.push(Object.freeze({
         ordinal,
@@ -174,6 +213,37 @@ export async function diagnosePhase3C1ImportPreview({ fetchImpl = fetch } = {}) 
     mode: 'read_only_diagnostic',
     fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
     items: Object.freeze(items)
+  });
+}
+
+/**
+ * Fixed, read-only stability probe for the only Production-blocking source
+ * entry. There is intentionally no ordinal/URL/attempt input in this API.
+ */
+export async function diagnosePhase3C1OrdinalTenUpstreamStability({ fetchImpl = fetch } = {}) {
+  const ordinal = PHASE3C1_FIXED_IMPORT_URLS.length;
+  const configuredUrl = PHASE3C1_FIXED_IMPORT_URLS[ordinal - 1];
+  const attempts = [];
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const fetched = await fetchPhase3C1OfficialDetail(configuredUrl, { fetchImpl });
+      attempts.push(Object.freeze({ attempt, ...diagnosticItem({ ordinal, ...fetched }, { include_response_headers: true, include_short_structure: true }) }));
+    } catch (error) {
+      attempts.push(Object.freeze({
+        attempt,
+        ordinal,
+        official_url: canonical(configuredUrl),
+        fetch_error: { code: 'UPSTREAM_FETCH_FAILED', name: String(error?.name || 'Error') },
+        parse: { result: 'FAIL', error_code: 'UPSTREAM_FETCH_FAILED' }
+      }));
+    }
+  }
+  return Object.freeze({
+    mode: 'read_only_ordinal_ten_stability_diagnostic',
+    fixed_ordinal: ordinal,
+    maximum_attempts: 3,
+    fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
+    attempts: Object.freeze(attempts)
   });
 }
 

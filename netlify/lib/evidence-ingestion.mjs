@@ -7,7 +7,7 @@ import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/ev
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
 import { importPolicies, listPolicies, readPolicy } from './policy-store.mjs';
-import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, collectPhase3C1ApplyMaterial, diagnosePhase3C1ImportPreview, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
+import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, collectPhase3C1ApplyMaterial, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
@@ -668,6 +668,9 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics') {
       return json(await diagnosePhase3C1ImportPreview({ fetchImpl }));
+    }
+    if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics/ordinal-10-stability') {
+      return json(await diagnosePhase3C1OrdinalTenUpstreamStability({ fetchImpl }));
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/phase3c1/import-manifests') {
       const input = await requestBody(request);
