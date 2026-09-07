@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
-import { PHASE3C1_FIXED_IMPORT_URLS, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, diagnosePhase3C1ShortCadence, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
 const policyHtml = (index) => `<!doctype html><html><head><title>国家税务总局政策法规库</title><meta name="PubDate" content="2020-01-${String(index).padStart(2, '0')}"></head><body><div class="detials contentLeft"><h3>国家税务总局关于第${index}项个人所得税征管事项的公告</h3><h5 class="actfwzh">国税发〔2020〕${index}号</h5><div class="article"><div class="arc_cont"><p>${body(index)}</p></div></div></div></body></html>`;
@@ -124,4 +124,72 @@ test('Phase 3C ordinal 10 stability diagnostic is fixed, capped at three request
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
   }
+});
+
+test('Phase 3C short cadence diagnostic is admin-only, fixed at 8 then 9 then 10, and uses two fixed waits', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-cadence-token';
+  const expectedUrls = PHASE3C1_FIXED_IMPORT_URLS.slice(7, 10);
+  const calls = [];
+  const waits = [];
+  let repositoryFactoryCalls = 0;
+  const secret = 'TOP_SECRET_POLICY_CONTENT';
+  const cadenceFetch = async (url, options) => {
+    calls.push(String(url));
+    assert.equal(options.headers['user-agent'], 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)');
+    return new Response(`${policyHtml(PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1)}${secret}`, {
+      status: 200,
+      headers: { 'content-type': 'text/html', age: '7', 'x-cache': 'HIT', 'set-cookie': 'session=TOP_SECRET_COOKIE' }
+    });
+  };
+  const diagnosticFactory = ({ fetchImpl }) => diagnosePhase3C1ShortCadence({ fetchImpl, waitImpl: async (milliseconds) => { waits.push(milliseconds); } });
+  try {
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('cadence diagnostic must not create a repository'); },
+      fetchImpl: cadenceFetch,
+      phase3c1ShortCadenceDiagnosticFactory: diagnosticFactory
+    }) });
+    const endpoint = '/api/admin/evidence/phase3c1/import-preview-diagnostics/cadence-short';
+    assert.equal((await request(handler, endpoint)).response.status, 401);
+    const injected = await request(handler, `${endpoint}?ordinal=1&url=https://attacker.invalid/&delay=1`, { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(injected.response.status, 400);
+    assert.equal(calls.length, 0);
+    assert.equal((await request(handler, endpoint, { method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN })).response.status, 404);
+    assert.equal(calls.length, 0);
+    const result = await request(handler, endpoint, { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(result.response.status, 200);
+    assert.equal(repositoryFactoryCalls, 0);
+    assert.equal(result.body.result, 'PASS');
+    assert.deepEqual(calls, expectedUrls);
+    assert.deepEqual(waits, [2000, 2000]);
+    assert.equal(result.body.maximum_requests, 3);
+    assert.deepEqual(result.body.items.map((item) => [item.request_sequence, item.ordinal]), [[1, 8], [2, 9], [3, 10]]);
+    assert.ok(result.body.items.every((item) => item.parse.result === 'PASS' && item.selectors['.arc_cont'].count === 1));
+    assert.equal(result.body.items[0].response_headers.age, '7');
+    const serialized = JSON.stringify(result.body);
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes('TOP_SECRET_COOKIE'), false);
+    assert.equal(serialized.includes(process.env.NETLIFY_TAXKB_ADMIN_TOKEN), false);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
+test('Phase 3C short cadence stops immediately after an abnormal fixed item', async () => {
+  const calls = [];
+  const waits = [];
+  const value = await diagnosePhase3C1ShortCadence({
+    fetchImpl: async (url) => {
+      const ordinal = PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1;
+      calls.push(ordinal);
+      return new Response(ordinal === 9 ? '<html><title>short</title><body>empty</body></html>' : policyHtml(ordinal), { status: 200, headers: { 'content-type': 'text/html' } });
+    },
+    waitImpl: async (milliseconds) => { waits.push(milliseconds); }
+  });
+  assert.equal(value.result, 'BLOCKED');
+  assert.deepEqual(calls, [8, 9]);
+  assert.deepEqual(waits, [2000]);
+  assert.equal(value.items.length, 2);
+  assert.equal(value.items[1].ordinal, 9);
+  assert.equal(value.items[1].parse.error_code, 'POLICY_BODY_CONTAINER_MISSING');
 });

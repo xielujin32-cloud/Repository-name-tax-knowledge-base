@@ -11,6 +11,7 @@ export const PHASE3C1_IMPORT_MANIFEST_CONFIRMATION = 'FREEZE_PHASE3C1_FIRST_TEN'
 export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MANIFEST';
 const PHASE3C1_PREVIEW_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)';
 const PHASE3C1_FETCH_TIMEOUT_MS = 20_000;
+const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
 export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
   selection_version: 'phase3c1-fixed-preview-v1',
   source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
@@ -279,6 +280,56 @@ export async function diagnosePhase3C1OrdinalTenUpstreamStability({ fetchImpl = 
     maximum_attempts: 3,
     fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
     attempts: Object.freeze(attempts)
+  });
+}
+
+function cadenceFetchFailure({ request_sequence, ordinal, official_url, error }) {
+  return Object.freeze({
+    request_sequence,
+    ordinal,
+    official_url,
+    fetch_error: { code: 'UPSTREAM_FETCH_FAILED', name: String(error?.name || 'Error') },
+    parse: { result: 'FAIL', error_code: 'UPSTREAM_FETCH_FAILED' }
+  });
+}
+
+/**
+ * A fixed, low-volume cadence probe. It intentionally has no caller-supplied
+ * ordinal, URL, or delay. Any bad HTTP response or parse stops the sequence
+ * before another official-site request is made.
+ */
+export async function diagnosePhase3C1ShortCadence({ fetchImpl = fetch, waitImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)) } = {}) {
+  const ordinals = Object.freeze([8, 9, 10]);
+  const items = [];
+  let blocked = false;
+  for (const [offset, ordinal] of ordinals.entries()) {
+    if (offset > 0) await waitImpl(PHASE3C1_SHORT_CADENCE_DELAY_MS);
+    const configuredUrl = PHASE3C1_FIXED_IMPORT_URLS[ordinal - 1];
+    try {
+      const fetched = await fetchPhase3C1OfficialDetail(configuredUrl, { fetchImpl });
+      const item = Object.freeze({
+        request_sequence: offset + 1,
+        ...diagnosticItem({ ordinal, ...fetched }, { include_response_headers: true })
+      });
+      items.push(item);
+      if (!item.response_ok || item.parse.result !== 'PASS') {
+        blocked = true;
+        break;
+      }
+    } catch (error) {
+      items.push(cadenceFetchFailure({ request_sequence: offset + 1, ordinal, official_url: canonical(configuredUrl), error }));
+      blocked = true;
+      break;
+    }
+  }
+  return Object.freeze({
+    mode: 'read_only_short_cadence_diagnostic',
+    fixed_ordinals: ordinals,
+    fixed_delay_ms: PHASE3C1_SHORT_CADENCE_DELAY_MS,
+    maximum_requests: ordinals.length,
+    result: blocked ? 'BLOCKED' : 'PASS',
+    fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
+    items: Object.freeze(items)
   });
 }
 
