@@ -8,6 +8,7 @@ import { suggestEvidenceMetadata } from './evidence-metadata-suggestion.js';
 export const PHASE3C1_IMPORT_MANIFEST_KEY = 'phase3c1-first-ten-v1';
 export const PHASE3C1_IMPORT_PARSER_VERSION = 'chinatax-evidence-2.1.0-dom-body';
 export const PHASE3C1_IMPORT_MANIFEST_CONFIRMATION = 'FREEZE_PHASE3C1_FIRST_TEN';
+export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MANIFEST';
 export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
   selection_version: 'phase3c1-fixed-preview-v1',
   source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
@@ -42,6 +43,13 @@ const stable = (value) => Array.isArray(value)
     ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`
     : JSON.stringify(value);
 const canonical = (value) => normalizeChinaTaxPolicyUrl(value) || (() => { const url = new URL(value); url.hash = ''; return url.toString(); })();
+// generated_at is audit metadata, not a change to the deterministic rule
+// output. Including it would incorrectly block a later preflight for exactly
+// the same official content.
+function metadataSuggestionFingerprint(metadata) {
+  const { generated_at: ignored, ...content } = metadata || {};
+  return sha256(stable(content));
+}
 
 function frozenItemShape(item) {
   return {
@@ -129,8 +137,9 @@ function eligibilityProblems(item) {
  * Evidence records or Blob objects. The caller can persist only its output
  * through the dedicated controlled-import repository method.
  */
-export async function preparePhase3C1ImportPreview({ fetchImpl = fetch, now = new Date().toISOString() } = {}) {
+export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString() } = {}) {
   const items = [];
+  const materials = [];
   for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
     const ordinal = offset + 1;
     const officialUrl = canonical(configuredUrl);
@@ -179,7 +188,7 @@ export async function preparePhase3C1ImportPreview({ fetchImpl = fetch, now = ne
       metadata_suggestion: {
         rule_version: metadata.rule_version,
         input_body_sha256: metadata.input_body_sha256,
-        suggestion_hash: sha256(stable(metadata)),
+        suggestion_hash: metadataSuggestionFingerprint(metadata),
         tax_categories: metadata.tax_categories,
         keywords: metadata.keywords,
         summary: metadata.summary
@@ -195,15 +204,31 @@ export async function preparePhase3C1ImportPreview({ fetchImpl = fetch, now = ne
     const issues = eligibilityProblems(item);
     if (issues.length) throw new Error(`Phase 3C-1 固定条目 ${ordinal} 不再满足冻结条件：${issues.join(',')}`);
     items.push(Object.freeze(item));
+    materials.push(Object.freeze({
+      ordinal,
+      official_url: officialUrl,
+      http_status: response.status,
+      response_headers_subset: headersSubset(response.headers),
+      raw_html: rawHtml,
+      normalized_text: parsed.normalized_text
+    }));
   }
   if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('Phase 3C-1 固定清单数量异常。');
-  return Object.freeze({
+  const preview = Object.freeze({
     manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY,
     selection_criteria: PHASE3C1_IMPORT_SELECTION_CRITERIA,
     created_at: now,
     items: Object.freeze(items),
+    materials: Object.freeze(materials),
     manifest_hash: phase3c1ManifestFingerprint({ items })
   });
+  const { materials: safeMaterials, ...publicPreview } = preview;
+  return Object.freeze({ preview: Object.freeze(publicPreview), materials: safeMaterials });
+}
+
+/** Public/admin preview deliberately omits raw HTML and normalized text. */
+export async function preparePhase3C1ImportPreview(options = {}) {
+  return (await collectPhase3C1ApplyMaterial(options)).preview;
 }
 
 /** Returns immutable-field mismatches without mutating an existing manifest. */

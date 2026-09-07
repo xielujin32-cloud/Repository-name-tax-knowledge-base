@@ -5,12 +5,20 @@ import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-
 import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
 import { LOW_RISK_BATCH_CONFIRMATION, chooseSampleCandidateIds, confirmedFieldsFromLowRiskCandidate, lowRiskEligibility, manifestHash, sampleSizeForBatch } from './risk-review-queue.js';
 import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint } from './phase3c1-controlled-import.js';
+import { CHINA_TAX_POLICY_SOURCE } from './chinatax-evidence-adapter.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value);
 const now = () => new Date().toISOString();
 const required = (value, label) => { const text = String(value || '').trim(); if (!text) throw new Error(`${label} 不能为空。`); return text; };
 const textValue = (value) => String(value || '').trim();
+const dateValue = (value) => {
+  if (value === null || value === undefined || value === '') return '';
+  const direct = String(value).match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+  if (direct) return direct;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString().slice(0, 10) : String(value);
+};
 const canonical = (value) => { const url = new URL(required(value, 'official_url')); url.hash = ''; return url.toString(); };
 const jsonObject = (value, fallback = {}) => {
   if (value && typeof value === 'object') return value;
@@ -30,6 +38,8 @@ const controlledImportManifestItemRow = (row) => row && ({
   metadata_suggestion: jsonObject(row.metadata_suggestion),
   relation_proposals: jsonObject(row.relation_proposals)
 });
+const controlledImportPreflightRow = (row) => row && ({ ...row, validation: jsonObject(row.validation) });
+const controlledImportApplyRow = (row) => row && ({ ...row, result: jsonObject(row.result) });
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
@@ -820,8 +830,8 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       if (item.document_no !== fresh.document_no) changes.push({ ordinal: item.ordinal, code: 'DOCUMENT_NO_CHANGED' });
       if (stable(item.document_no_provenance) !== stable(fresh.document_no_provenance)) changes.push({ ordinal: item.ordinal, code: 'DOCUMENT_NO_PROVENANCE_CHANGED' });
       if (stable(item.issuing_authority) !== stable(fresh.issuing_authority)) changes.push({ ordinal: item.ordinal, code: 'ISSUING_AUTHORITY_CHANGED' });
-      if (String(item.publish_date) !== String(fresh.publish_date)) changes.push({ ordinal: item.ordinal, code: 'PUBLISH_DATE_CHANGED' });
-      if (String(item.effective_date || '') !== String(fresh.effective_date || '')) changes.push({ ordinal: item.ordinal, code: 'EFFECTIVE_DATE_CHANGED' });
+      if (dateValue(item.publish_date) !== dateValue(fresh.publish_date)) changes.push({ ordinal: item.ordinal, code: 'PUBLISH_DATE_CHANGED' });
+      if (dateValue(item.effective_date) !== dateValue(fresh.effective_date)) changes.push({ ordinal: item.ordinal, code: 'EFFECTIVE_DATE_CHANGED' });
       if (item.body_hash !== fresh.body_hash) changes.push({ ordinal: item.ordinal, code: 'BODY_HASH_CHANGED' });
       if (item.parser_version !== fresh.parser_version) changes.push({ ordinal: item.ordinal, code: 'PARSER_VERSION_CHANGED' });
       if (item.risk_assessment?.assessment_hash !== fresh.risk_assessment?.assessment_hash) changes.push({ ordinal: item.ordinal, code: 'RISK_ASSESSMENT_CHANGED' });
@@ -853,6 +863,206 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const duplicateConflicts = duplicates.filter((item) => item.raw_snapshots.length || item.candidates.length || item.reviewed_candidates.length || item.policies.length || item.policy_versions.length);
     if (duplicateConflicts.length) changes.push({ code: 'DUPLICATE_EVIDENCE_EXISTS', ordinals: duplicateConflicts.map((item) => item.ordinal) });
     return { manifest: frozen.manifest, items: frozen.items, validation: { state: changes.length ? 'blocked' : 'ready', changes }, evidence_duplicates: duplicates, evidence_duplicate_free: duplicateConflicts.length === 0 };
+  }
+  function previewHash(preview) {
+    return sha256(stable({ manifest_key: preview?.manifest_key, manifest_hash: preview?.manifest_hash, items: preview?.items || [] }));
+  }
+  function phase3c2Expired(value) {
+    const date = new Date(value || 0);
+    return !Number.isFinite(date.getTime()) || date.getTime() <= Date.now();
+  }
+  function validatePhase3C2Material(preview, materials) {
+    validatePhase3C1Preview(preview);
+    if (!Array.isArray(materials) || materials.length !== preview.items.length) throw new Error('Apply 必须使用服务器刚读取的完整 10 条正文。');
+    const byOrdinal = new Map(materials.map((item) => [Number(item.ordinal), item]));
+    for (const item of preview.items) {
+      const material = byOrdinal.get(Number(item.ordinal));
+      if (!material || canonical(material.official_url) !== canonical(item.official_url)) throw new Error(`Apply 正文与 frozen manifest URL 不一致（${item.ordinal}）。`);
+      if (Number(material.http_status) !== 200) throw new Error(`Apply 官方响应状态异常（${item.ordinal}）。`);
+      if (sha256(String(material.normalized_text || '')) !== item.body_hash) throw new Error(`Apply 正文 hash 与 frozen manifest 不一致（${item.ordinal}）。`);
+      if (!String(material.raw_html || '')) throw new Error(`Apply 原始 HTML 为空（${item.ordinal}）。`);
+    }
+  }
+  async function createPhase3C2ControlledPreflight({ controlled_manifest_id, manifest_hash, current_preview, checked_by = 'netlify-admin', ttl_ms = 15 * 60 * 1000 } = {}) {
+    const manifestId = required(controlled_manifest_id, 'controlled_manifest_id');
+    const manifestHashValue = required(manifest_hash, 'manifest_hash');
+    validatePhase3C1Preview(current_preview);
+    const locked = await withExclusiveLock(`taxkb:controlled-import-preflight:${manifestId}`, async () => {
+      const frozen = await getControlledImportManifest(manifestId);
+      if (frozen.manifest.manifest_state !== 'frozen') throw new Error('controlled import manifest 不再是 frozen，拒绝 preflight。');
+      if (frozen.manifest.manifest_hash !== manifestHashValue) throw new Error('manifest hash 不匹配，拒绝 preflight。');
+      const evidence = await preflightControlledImportManifest(manifestId, { current_preview });
+      const timestamp = clock();
+      const currentPreviewHash = previewHash(current_preview);
+      const existing = (await pool.query(
+        `SELECT * FROM controlled_import_preflights
+         WHERE controlled_manifest_id=$1 AND manifest_hash=$2 AND preview_hash=$3
+           AND preflight_state='ready' AND expires_at>$4 ORDER BY checked_at DESC LIMIT 1`,
+        [manifestId, manifestHashValue, currentPreviewHash, timestamp]
+      )).rows[0];
+      if (existing) return { created: false, preflight: controlledImportPreflightRow(existing), evidence };
+      const state = evidence.validation.state === 'ready' && evidence.evidence_duplicate_free ? 'ready' : 'blocked';
+      const preflightId = id('controlled-import-preflight');
+      const expiresAt = new Date(Date.parse(timestamp) + Math.max(1, Number(ttl_ms) || 1)).toISOString();
+      const validation = { ...evidence.validation, evidence_duplicate_free: evidence.evidence_duplicate_free };
+      await transaction(async (client) => {
+        await client.query(
+          `INSERT INTO controlled_import_preflights
+           (preflight_id,controlled_manifest_id,manifest_hash,preview_hash,validation,preflight_state,checked_by,checked_at,expires_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [preflightId, manifestId, manifestHashValue, currentPreviewHash, JSON.stringify(validation), state, required(checked_by, 'checked_by'), timestamp, expiresAt]
+        );
+        await client.query(
+          'INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+          [id('audit'), 'controlled_import_preflight', preflightId, `phase3c2_preflight_${state}`, JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preview_hash: currentPreviewHash, expires_at: expiresAt, validation }), timestamp]
+        );
+      });
+      const row = (await pool.query('SELECT * FROM controlled_import_preflights WHERE preflight_id=$1', [preflightId])).rows[0];
+      return { created: true, preflight: controlledImportPreflightRow(row), evidence };
+    });
+    if (!locked.acquired) throw new Error('controlled import preflight 正在执行，请稍后重试。');
+    return locked.result;
+  }
+  async function getPhase3C2ControlledPreflight(preflightId) {
+    const row = (await pool.query('SELECT * FROM controlled_import_preflights WHERE preflight_id=$1', [required(preflightId, 'preflight_id')])).rows[0];
+    if (!row) throw new Error('controlled import preflight 不存在。');
+    return controlledImportPreflightRow(row);
+  }
+  async function recordPhase3C2ApplyTerminal({ controlled_manifest_id, manifest_hash, preflight_id, operator_id, apply_state, failure_reason = null, result = {} } = {}) {
+    const timestamp = clock();
+    const existing = (await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_manifest_id=$1 AND preflight_id=$2', [controlled_manifest_id, preflight_id])).rows[0];
+    if (existing) return controlledImportApplyRow(existing);
+    const applyId = id('controlled-import-apply');
+    await transaction(async (client) => {
+      await client.query(
+        `INSERT INTO controlled_import_apply_attempts
+         (controlled_apply_id,controlled_manifest_id,manifest_hash,preflight_id,operator_id,apply_state,result,failure_reason,started_at,completed_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)`,
+        [applyId, controlled_manifest_id, manifest_hash, preflight_id, required(operator_id, 'operator_id'), apply_state, JSON.stringify(result), failure_reason, timestamp]
+      );
+      await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+        [id('audit'), 'controlled_import_apply', applyId, `phase3c2_apply_${apply_state}`, JSON.stringify({ controlled_manifest_id, manifest_hash, preflight_id, operator_id, failure_reason, result }), timestamp]
+      );
+    });
+    return controlledImportApplyRow((await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_apply_id=$1', [applyId])).rows[0]);
+  }
+  async function applyPhase3C2ControlledImport({ controlled_manifest_id, manifest_hash, preflight_id, current_preview, materials, operator_id = 'netlify-admin' } = {}) {
+    const manifestId = required(controlled_manifest_id, 'controlled_manifest_id');
+    const manifestHashValue = required(manifest_hash, 'manifest_hash');
+    const preflightId = required(preflight_id, 'preflight_id');
+    validatePhase3C2Material(current_preview, materials);
+    const locked = await withExclusiveLock(`taxkb:controlled-import-apply:${manifestId}`, async () => {
+      const frozen = await getControlledImportManifest(manifestId);
+      if (frozen.manifest.manifest_hash !== manifestHashValue) throw new Error('manifest hash 不匹配，拒绝 Apply。');
+      const completed = (await pool.query("SELECT * FROM controlled_import_apply_attempts WHERE controlled_manifest_id=$1 AND apply_state='completed' ORDER BY completed_at DESC LIMIT 1", [manifestId])).rows[0];
+      if (completed) return { execution: 'already_completed', apply: controlledImportApplyRow(completed) };
+      const existing = (await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_manifest_id=$1 AND preflight_id=$2', [manifestId, preflightId])).rows[0];
+      if (existing) return { execution: `already_${existing.apply_state}`, apply: controlledImportApplyRow(existing) };
+      const preflight = await getPhase3C2ControlledPreflight(preflightId);
+      if (preflight.controlled_manifest_id !== manifestId || preflight.manifest_hash !== manifestHashValue) throw new Error('preflight 不属于该 frozen manifest，拒绝 Apply。');
+      if (preflight.preflight_state !== 'ready') {
+        const rejected = await recordPhase3C2ApplyTerminal({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, apply_state: 'rejected', failure_reason: `PREFLIGHT_${String(preflight.preflight_state).toUpperCase()}` });
+        return { execution: 'rejected', apply: rejected };
+      }
+      if (phase3c2Expired(preflight.expires_at)) {
+        await pool.query("UPDATE controlled_import_preflights SET preflight_state='expired' WHERE preflight_id=$1", [preflightId]);
+        const rejected = await recordPhase3C2ApplyTerminal({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, apply_state: 'rejected', failure_reason: 'PREFLIGHT_EXPIRED' });
+        return { execution: 'rejected', apply: rejected };
+      }
+      if (frozen.manifest.manifest_state !== 'frozen' || current_preview.manifest_hash !== manifestHashValue || previewHash(current_preview) !== preflight.preview_hash) {
+        const rejected = await recordPhase3C2ApplyTerminal({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, apply_state: 'rejected', failure_reason: 'FROZEN_STATE_CHANGED' });
+        return { execution: 'rejected', apply: rejected };
+      }
+      const finalPreflight = await preflightControlledImportManifest(manifestId, { current_preview });
+      if (finalPreflight.validation.state !== 'ready' || !finalPreflight.evidence_duplicate_free) {
+        const rejected = await recordPhase3C2ApplyTerminal({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, apply_state: 'rejected', failure_reason: 'PREFLIGHT_REVALIDATION_BLOCKED', result: { validation: finalPreflight.validation } });
+        return { execution: 'rejected', apply: rejected };
+      }
+      const applyId = id('controlled-import-apply');
+      const timestamp = clock();
+      await transaction(async (client) => {
+        await client.query(
+          `INSERT INTO controlled_import_apply_attempts
+           (controlled_apply_id,controlled_manifest_id,manifest_hash,preflight_id,operator_id,apply_state,result,started_at)
+           VALUES ($1,$2,$3,$4,$5,'running','{}'::jsonb,$6)`,
+          [applyId, manifestId, manifestHashValue, preflightId, required(operator_id, 'operator_id'), timestamp]
+        );
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+          [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_started', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id }), timestamp]
+        );
+      });
+      const snapshots = frozen.items.map((item) => ({ item, material: materials.find((value) => Number(value.ordinal) === Number(item.ordinal)), snapshot_id: id('snapshot'), candidate_id: id('candidate') }));
+      const unreferencedObjectKeys = [];
+      try {
+        for (const value of snapshots) {
+          const rawKey = `raw-snapshots/${value.snapshot_id}/raw`;
+          const textKey = `raw-snapshots/${value.snapshot_id}/normalized-text`;
+          await objectStore.putImmutable(rawKey, String(value.material.raw_html));
+          unreferencedObjectKeys.push(rawKey);
+          await objectStore.putImmutable(textKey, String(value.material.normalized_text));
+          unreferencedObjectKeys.push(textKey);
+        }
+        await transaction(async (client) => {
+          const manifest = (await client.query('SELECT * FROM controlled_import_manifests WHERE controlled_manifest_id=$1 FOR UPDATE', [manifestId])).rows[0];
+          const freshPreflight = (await client.query('SELECT * FROM controlled_import_preflights WHERE preflight_id=$1 FOR UPDATE', [preflightId])).rows[0];
+          if (!manifest || manifest.manifest_state !== 'frozen' || manifest.manifest_hash !== manifestHashValue) throw new Error('frozen manifest 状态已变化。');
+          if (!freshPreflight || freshPreflight.preflight_state !== 'ready' || freshPreflight.manifest_hash !== manifestHashValue || phase3c2Expired(freshPreflight.expires_at)) throw new Error('preflight 已失效或不再 ready。');
+          for (const value of snapshots) {
+            const item = value.item;
+            const duplicate = await client.query(
+              `SELECT 1 FROM raw_snapshots WHERE canonical_url=$1 OR official_url=$1 OR normalized_text_sha256=$2
+               UNION ALL SELECT 1 FROM candidates WHERE canonical_url=$1 OR official_url=$1 OR normalized_text_sha256=$2
+                 OR (parsed_fields->>'document_no'=$3 AND parsed_fields->>'document_no_confidence'='high' AND parsed_fields->>'document_no_source' IN ('structured_field','title_nearby','body_lead'))
+               UNION ALL SELECT 1 FROM policy_versions WHERE canonical_url=$1 OR official_url=$1 OR document_no=$3 LIMIT 1`,
+              [item.official_url, item.body_hash, item.document_no]
+            );
+            if (duplicate.rows.length) throw new Error(`Apply 发现重复 Evidence（${item.ordinal}）。`);
+          }
+          await client.query(`INSERT INTO sources (source_id,source_name,official_domain,source_type,adapter_version,base_url,enabled,created_at,updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,true,$7,$7) ON CONFLICT (source_id) DO NOTHING`,
+            [CHINA_TAX_POLICY_SOURCE.source_id, CHINA_TAX_POLICY_SOURCE.source_name, CHINA_TAX_POLICY_SOURCE.official_domain, CHINA_TAX_POLICY_SOURCE.source_type, CHINA_TAX_POLICY_SOURCE.adapter_version, CHINA_TAX_POLICY_SOURCE.collection_url, timestamp]);
+          await client.query('INSERT INTO source_states (source_id,updated_at) VALUES ($1,$2) ON CONFLICT (source_id) DO NOTHING', [CHINA_TAX_POLICY_SOURCE.source_id, timestamp]);
+          const runId = id('collection-run');
+          await client.query(`INSERT INTO collection_runs (collection_run_id,source_id,mode,collection_state,started_at,completed_at,discovered_count)
+            VALUES ($1,$2,'phase3c2-controlled-manifest','completed',$3,$3,$4)`, [runId, CHINA_TAX_POLICY_SOURCE.source_id, timestamp, snapshots.length]);
+          for (const value of snapshots) {
+            const { item, material, snapshot_id, candidate_id } = value;
+            const rawKey = `raw-snapshots/${snapshot_id}/raw`; const textKey = `raw-snapshots/${snapshot_id}/normalized-text`;
+            const parsedFields = { title: item.title, document_no: item.document_no, document_no_source: item.document_no_provenance.source, document_no_confidence: item.document_no_provenance.confidence, document_no_evidence: item.document_no_provenance.evidence, issuing_authority: item.issuing_authority, publish_date: item.publish_date, effective_date: item.effective_date || null, expiry_date: null, metadata_suggestion: item.metadata_suggestion };
+            await client.query(`INSERT INTO raw_snapshots (snapshot_id,source_id,collection_run_id,official_url,canonical_url,fetched_at,http_status,response_headers_subset,content_type,raw_object_key,normalized_text_object_key,raw_sha256,normalized_text_sha256,parser_version,parse_result_hash,previous_snapshot_id,content_changed)
+              VALUES ($1,$2,$3,$4,$4,$5,$6,$7,'text/html',$8,$9,$10,$11,$12,$13,NULL,true)`,
+              [snapshot_id, CHINA_TAX_POLICY_SOURCE.source_id, runId, item.official_url, timestamp, Number(material.http_status), JSON.stringify(material.response_headers_subset || {}), rawKey, textKey, sha256(material.raw_html), item.body_hash, item.parser_version, sha256(stable(parsedFields))]);
+            await client.query(`INSERT INTO candidates (candidate_id,snapshot_id,source_id,collection_run_id,official_url,canonical_url,normalized_text_sha256,parsed_fields,verification_state,legal_status,observed_snapshot_ids,last_seen_snapshot_id,created_at,updated_at)
+              VALUES ($1,$2,$3,$4,$5,$5,$6,$7,'pending_review','pending',$8,$2,$9,$9)`,
+              [candidate_id, snapshot_id, CHINA_TAX_POLICY_SOURCE.source_id, runId, item.official_url, item.body_hash, JSON.stringify(parsedFields), JSON.stringify([snapshot_id]), timestamp]);
+            const risk = item.risk_assessment;
+            await client.query(`INSERT INTO candidate_risk_assessments (assessment_id,candidate_id,rule_version,input_body_sha256,parser_version,input_context_sha256,risk_level,risk_score,risk_reasons,quality_metrics,assessed_at,is_current)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true)`,
+              [id('assessment'), candidate_id, risk.rule_version, risk.input_body_sha256, risk.parser_version, risk.input_context_sha256, risk.risk_level, Number(risk.risk_score), JSON.stringify(risk.risk_reasons || []), JSON.stringify(risk.quality_metrics || {}), timestamp]);
+          }
+          const result = { source_id: CHINA_TAX_POLICY_SOURCE.source_id, collection_run_id: runId, snapshot_ids: snapshots.map((value) => value.snapshot_id), candidate_ids: snapshots.map((value) => value.candidate_id), review_decision_ids: [], policy_ids: [], policy_version_ids: [], projection_job_ids: [] };
+          await client.query("UPDATE controlled_import_preflights SET preflight_state='consumed',consumed_by_apply_id=$2 WHERE preflight_id=$1", [preflightId, applyId]);
+          await client.query("UPDATE controlled_import_manifests SET manifest_state='consumed',consumed_at=$2,updated_at=$2 WHERE controlled_manifest_id=$1", [manifestId, timestamp]);
+          await client.query("UPDATE controlled_import_apply_attempts SET apply_state='completed',result=$2,completed_at=$3 WHERE controlled_apply_id=$1", [applyId, JSON.stringify(result), timestamp]);
+          await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)',
+            [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_completed', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, ...result }), timestamp]);
+        });
+      } catch (error) {
+        // A failed Apply never reuses the same authorization checkpoint. This
+        // forces a fresh server-side preflight before any retry, while the
+        // failed attempt remains permanently auditable.
+        await pool.query("UPDATE controlled_import_preflights SET preflight_state='expired' WHERE preflight_id=$1 AND preflight_state='ready'", [preflightId]);
+        if (typeof objectStore.deleteUnreferenced === 'function') {
+          await Promise.allSettled(unreferencedObjectKeys.map((key) => objectStore.deleteUnreferenced(key)));
+        }
+        await pool.query("UPDATE controlled_import_apply_attempts SET apply_state='failed',failure_reason=$2,completed_at=$3 WHERE controlled_apply_id=$1 AND apply_state='running'", [applyId, String(error?.message || 'controlled apply failed'), clock()]);
+        await pool.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_apply', applyId, 'phase3c2_apply_failed', JSON.stringify({ controlled_manifest_id: manifestId, manifest_hash: manifestHashValue, preflight_id: preflightId, operator_id, reason: String(error?.message || 'controlled apply failed') }), clock()]);
+        throw error;
+      }
+      return { execution: 'completed', apply: controlledImportApplyRow((await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_apply_id=$1', [applyId])).rows[0]) };
+    });
+    if (!locked.acquired) throw new Error('controlled import Apply 正在执行，请稍后重试。');
+    return locked.result;
   }
   async function hasCompletedCandidatesForUrls({ source_id, canonical_urls = [] } = {}) {
     const urls = [...new Set(canonical_urls.map(canonical))];
@@ -895,5 +1105,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

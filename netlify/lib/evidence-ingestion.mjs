@@ -7,7 +7,7 @@ import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/ev
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
 import { importPolicies, listPolicies, readPolicy } from './policy-store.mjs';
-import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
+import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, collectPhase3C1ApplyMaterial, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
@@ -318,6 +318,33 @@ function safePhase3C1Preflight(value, publicProjection) {
   };
 }
 
+function safePhase3C2Preflight(value) {
+  return {
+    created: value.created,
+    preflight: value.preflight,
+    validation: value.evidence.validation,
+    evidence_duplicate_free: value.evidence.evidence_duplicate_free
+  };
+}
+
+function safePhase3C2Apply(value) {
+  return {
+    execution: value.execution,
+    apply: value.apply && {
+      controlled_apply_id: value.apply.controlled_apply_id,
+      controlled_manifest_id: value.apply.controlled_manifest_id,
+      manifest_hash: value.apply.manifest_hash,
+      preflight_id: value.apply.preflight_id,
+      operator_id: value.apply.operator_id,
+      apply_state: value.apply.apply_state,
+      result: value.apply.result,
+      failure_reason: value.apply.failure_reason || null,
+      started_at: value.apply.started_at,
+      completed_at: value.apply.completed_at || null
+    }
+  };
+}
+
 export async function reviewEvidenceCandidate(candidateId, input, { repository = defaultRepositoryFactory(), publishProjection = defaultPublishProjection, reviewerId = 'netlify-admin' } = {}) {
   const action = String(input?.action || '').trim();
   if (!['approve', 'reject', 'return'].includes(action)) throw new Error('审核动作无效。');
@@ -607,7 +634,7 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
@@ -659,6 +686,24 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       const value = await repositoryFactory().preflightControlledImportManifest(manifestId, { current_preview: preview });
       const projection = await publicProjectionPreflight(value.items, { listPublicPolicies, readPublicPolicy });
       return json(safePhase3C1Preflight(value, projection));
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/preflights$/.test(pathname)) {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 2 || input.check !== true || !/^[a-f0-9]{64}$/.test(String(input.manifest_hash || ''))) {
+        return json({ error: 'Phase 3C-2 preflight 只接受固定 check 与 frozen manifest hash，不接受 URL、正文、Candidate、Policy 字段或 legal_status。' }, 400);
+      }
+      const manifestId = decodeURIComponent(pathname.split('/')[6]);
+      const value = await repositoryFactory().createPhase3C2ControlledPreflight({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash, current_preview: await phase3c1PreviewFactory({ fetchImpl }) });
+      return json(safePhase3C2Preflight(value));
+    }
+    if (request.method === 'POST' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/apply$/.test(pathname)) {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 4 || input.apply !== true || input.confirmation !== PHASE3C2_CONTROLLED_APPLY_CONFIRMATION || !/^[a-f0-9]{64}$/.test(String(input.manifest_hash || '')) || !String(input.preflight_id || '').trim()) {
+        return json({ error: 'Phase 3C-2 Apply 只接受 frozen manifest hash、服务器 preflight ID、固定 apply 与确认短语，不接受 URL、正文、Candidate、Policy 字段或 legal_status。' }, 400);
+      }
+      const manifestId = decodeURIComponent(pathname.split('/')[6]);
+      const collected = await phase3c1ApplyMaterialFactory({ fetchImpl });
+      return json(safePhase3C2Apply(await repositoryFactory().applyPhase3C2ControlledImport({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash, preflight_id: input.preflight_id, current_preview: collected.preview, materials: collected.materials })));
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/risk-queue/manifests') {
       const input = await requestBody(request);
