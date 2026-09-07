@@ -1,0 +1,159 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { NetlifyDB } from '@netlify/database-dev';
+import { createApiHandler } from '../netlify/functions/api.mjs';
+import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
+import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
+import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
+import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
+
+const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
+const html = (index) => `<!doctype html><html><head><meta name="PubDate" content="2020-01-${String(index).padStart(2, '0')}"></head><body><div class="detials contentLeft"><h3>国家税务总局关于第${index}项个人所得税征管事项的公告</h3><h5 class="actfwzh">国税发〔2020〕${index}号</h5><div class="article"><div class="arc_cont"><p>${body(index)}</p></div></div></div></body></html>`;
+const clone = (value) => JSON.parse(JSON.stringify(value));
+
+async function fixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-phase3c1-'));
+  const database = new NetlifyDB({ directory: path.join(root, 'database'), logger: () => {} });
+  await database.start(); await database.reset();
+  await database.applyMigrations(path.join(process.cwd(), 'netlify', 'database', 'migrations'));
+  const repository = createPostgresEvidenceRepository({
+    pool: database,
+    objectStore: createLocalEvidenceObjectStore({ rootDirectory: path.join(root, 'objects') }),
+    id: (prefix) => `${prefix}-${randomUUID()}`
+  });
+  const source = await repository.addSource({ source_id: 'source-phase3c1', source_name: '国家税务总局政策法规库', official_domain: 'fgk.chinatax.gov.cn', source_type: 'official-policy-regulations', adapter_version: 'test', base_url: 'https://fgk.chinatax.gov.cn/zcfgk/' });
+  const run = await repository.createCollectionRun({ source_id: source.source_id, mode: 'phase3c1-test' });
+  return { root, database, repository, source, run };
+}
+
+async function close(value) { await value.database.stop(); await rm(value.root, { recursive: true, force: true }); }
+function fakeFetch(url) {
+  const index = PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1;
+  if (!index) return Promise.resolve(new Response('not found', { status: 404 }));
+  return Promise.resolve(new Response(html(index), { status: 200, headers: { 'content-type': 'text/html' } }));
+}
+async function request(handler, pathname, { method = 'GET', token = '', body: input } = {}) {
+  const response = await handler(new Request(`https://taxkb.example${pathname}`, {
+    method,
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(input ? { 'content-type': 'application/json' } : {}) },
+    body: input ? JSON.stringify(input) : undefined
+  }));
+  return { response, body: await response.json() };
+}
+
+test('Phase 3C-1 服务端固定 preview 冻结 10 条，浏览器不能指定内容', async () => {
+  const value = await fixture();
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-test-token';
+  try {
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    assert.equal(preview.items.length, 10);
+    assert.deepEqual(preview.items.map((item) => item.official_url), PHASE3C1_FIXED_IMPORT_URLS);
+    assert.ok(preview.items.every((item) => item.risk_assessment.risk_level === 'low' && item.risk_assessment.risk_score === 0));
+    assert.ok(preview.items.every((item) => item.document_no_provenance.source === 'structured_field' && item.document_no_provenance.confidence === 'high'));
+    assert.ok(preview.items.every((item) => item.relation_proposals.proposed_count === 0));
+
+    const concurrent = await Promise.allSettled([
+      value.repository.createPhase3C1FrozenImportManifest({ preview, created_by: 'test-admin-a' }),
+      value.repository.createPhase3C1FrozenImportManifest({ preview, created_by: 'test-admin-b' })
+    ]);
+    const fulfilled = concurrent.filter((item) => item.status === 'fulfilled').map((item) => item.value);
+    assert.equal(fulfilled.length, 1, 'concurrent freeze must admit at most one creator');
+    const frozen = fulfilled[0];
+    assert.equal(frozen.created, true); assert.equal(frozen.items.length, 10);
+    assert.equal((await value.repository.counts()).candidates, 0);
+    assert.equal((await value.repository.counts()).policies, 0);
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM controlled_import_manifests')).rows[0].count, 1);
+    const repeated = await value.repository.createPhase3C1FrozenImportManifest({ preview, created_by: 'test-admin' });
+    assert.equal(repeated.created, false);
+    await assert.rejects(() => value.database.query('UPDATE controlled_import_manifests SET manifest_hash=$1 WHERE controlled_manifest_id=$2', ['a'.repeat(64), frozen.manifest.controlled_manifest_id]), /frozen fields are immutable/);
+    await assert.rejects(() => value.database.query('UPDATE controlled_import_manifest_items SET title=$1 WHERE controlled_manifest_id=$2', ['rewritten', frozen.manifest.controlled_manifest_id]), /immutable audit records/);
+    await assert.rejects(() => value.database.query('DELETE FROM controlled_import_manifests WHERE controlled_manifest_id=$1', [frozen.manifest.controlled_manifest_id]), /retained audit records/);
+
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({ repositoryFactory: () => value.repository, fetchImpl: fakeFetch, phase3c1PreviewFactory: async () => preview }) });
+    assert.equal((await request(handler, '/api/admin/evidence/phase3c1/import-preview')).response.status, 401);
+    assert.equal((await request(handler, `/api/admin/evidence/phase3c1/import-manifests/${frozen.manifest.controlled_manifest_id}/preflight`)).response.status, 401);
+    const visiblePreview = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(visiblePreview.response.status, 200); assert.equal(visiblePreview.body.preview.items.length, 10);
+    const injected = await request(handler, '/api/admin/evidence/phase3c1/import-manifests', { method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN, body: { freeze: true, confirmation: PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, urls: ['https://attacker.invalid/'] } });
+    assert.equal(injected.response.status, 400);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+    await close(value);
+  }
+});
+
+test('Phase 3C-1 预检只读识别 URL、可信文号、正文 hash、Candidate、Review、Policy 和公开投影', async () => {
+  const value = await fixture();
+  try {
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview });
+    const first = preview.items[0];
+    const snapshot = await value.repository.recordRawSnapshot({ source_id: value.source.source_id, collection_run_id: value.run.collection_run_id, official_url: first.official_url, canonical_url: first.official_url, http_status: 200, content_type: 'text/html', raw_content: '<article>stored</article>', normalized_text: 'not the preview body', parser_version: first.parser_version, parse_result: { title: first.title } });
+    const created = await value.repository.createCandidate({ snapshot_id: snapshot.snapshot_id, parsed_fields: { title: first.title, document_no: first.document_no, document_no_source: 'structured_field', document_no_confidence: 'high', issuing_authority: first.issuing_authority, publish_date: first.publish_date }, verification_state: 'pending_review', legal_status: 'pending' });
+    const fields = { title: first.title, document_no: first.document_no, issuing_authority: first.issuing_authority, publish_date: first.publish_date, effective_date: null, expiry_date: null, tax_categories: ['个人所得税'], keywords: ['个人所得税'], summary: '测试摘要。' };
+    await value.repository.reviewCandidate(created.candidate.candidate_id, { action: 'approve', legal_status: 'pending', reviewer_id: 'test-reviewer', confirmed_fields: fields });
+    const sameBody = parseChinaTaxPolicyEvidence(html(1)).normalized_text;
+    const bodySnapshot = await value.repository.recordRawSnapshot({ source_id: value.source.source_id, collection_run_id: value.run.collection_run_id, official_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/same-body/content.html', canonical_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/same-body/content.html', http_status: 200, content_type: 'text/html', raw_content: '<article>same body</article>', normalized_text: sameBody, parser_version: first.parser_version, parse_result: { title: '相似标题但不同证据' } });
+    await value.repository.createCandidate({ snapshot_id: bodySnapshot.snapshot_id, parsed_fields: { title: '相似标题但不同证据', document_no: '国税发〔2021〕99号', document_no_source: 'structured_field', document_no_confidence: 'high', issuing_authority: first.issuing_authority, publish_date: first.publish_date }, verification_state: 'pending_review', legal_status: 'pending' });
+    const sameDocumentSnapshot = await value.repository.recordRawSnapshot({ source_id: value.source.source_id, collection_run_id: value.run.collection_run_id, official_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/same-document/content.html', canonical_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/same-document/content.html', http_status: 200, content_type: 'text/html', raw_content: '<article>same document</article>', normalized_text: '不同正文但同一可信文号。'.repeat(40), parser_version: first.parser_version, parse_result: { title: '同文号文件' } });
+    await value.repository.createCandidate({ snapshot_id: sameDocumentSnapshot.snapshot_id, parsed_fields: { title: '同文号文件', document_no: first.document_no, document_no_source: 'structured_field', document_no_confidence: 'high', issuing_authority: first.issuing_authority, publish_date: first.publish_date }, verification_state: 'pending_review', legal_status: 'pending' });
+    const similarSnapshot = await value.repository.recordRawSnapshot({ source_id: value.source.source_id, collection_run_id: value.run.collection_run_id, official_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/similar-title/content.html', canonical_url: 'https://fgk.chinatax.gov.cn/zcfgk/test/similar-title/content.html', http_status: 200, content_type: 'text/html', raw_content: '<article>different</article>', normalized_text: '完全不同的正文内容。'.repeat(40), parser_version: first.parser_version, parse_result: { title: `${first.title}（其他文件）` } });
+    const similarCandidate = await value.repository.createCandidate({ snapshot_id: similarSnapshot.snapshot_id, parsed_fields: { title: `${first.title}（其他文件）`, document_no: '国税发〔2021〕100号', document_no_source: 'structured_field', document_no_confidence: 'high', issuing_authority: first.issuing_authority, publish_date: first.publish_date }, verification_state: 'pending_review', legal_status: 'pending' });
+    const before = await value.repository.counts();
+    const evidence = await value.repository.preflightControlledImportManifest(frozen.manifest.controlled_manifest_id, { current_preview: preview });
+    assert.equal(evidence.validation.state, 'blocked');
+    assert.equal(evidence.evidence_duplicate_free, false);
+    assert.equal(evidence.evidence_duplicates[0].raw_snapshots[0].match_basis, 'official_url');
+    assert.equal(evidence.evidence_duplicates[0].candidates[0].match_basis, 'official_url');
+    assert.equal(evidence.evidence_duplicates[0].reviewed_candidates.length, 1);
+    assert.deepEqual(evidence.evidence_duplicates[0].policies[0].match_basis, ['official_url']);
+    assert.equal(evidence.evidence_duplicates[0].policy_versions[0].match_basis, 'official_url');
+    assert.ok(evidence.evidence_duplicates[0].candidates.some((item) => item.match_basis === 'body_hash'));
+    assert.ok(evidence.evidence_duplicates[0].candidates.some((item) => item.match_basis === 'document_no'));
+    assert.equal(evidence.evidence_duplicates.flatMap((item) => item.candidates).some((item) => item.candidate_id === similarCandidate.candidate.candidate_id), false, '标题相似但 URL、文号、正文证据不同不得误判');
+    assert.deepEqual(await value.repository.counts(), before, 'GET preflight must not write Evidence data');
+    assert.equal((await value.repository.getCandidateForReview(created.candidate.candidate_id)).candidate.legal_status, 'pending');
+
+    for (const [mutate, expectedCode] of [
+      [(item) => { item.official_url = 'https://fgk.chinatax.gov.cn/zcfgk/other/content.html'; }, 'OFFICIAL_URL_CHANGED'],
+      [(item) => { item.document_no = '国税发〔2020〕999号'; }, 'DOCUMENT_NO_CHANGED'],
+      [(item) => { item.document_no_provenance.evidence.text = 'changed'; }, 'DOCUMENT_NO_PROVENANCE_CHANGED'],
+      [(item) => { item.title = 'changed'; }, 'TITLE_CHANGED'],
+      [(item) => { item.body_hash = 'a'.repeat(64); }, 'BODY_HASH_CHANGED'],
+      [(item) => { item.parser_version = 'changed-parser'; }, 'PARSER_VERSION_CHANGED'],
+      [(item) => { item.risk_assessment.rule_version = 'changed-risk-rule'; }, 'RISK_RULE_VERSION_CHANGED'],
+      [(item) => { item.metadata_suggestion.rule_version = 'changed-metadata-rule'; }, 'METADATA_RULE_VERSION_CHANGED'],
+      [(item) => { item.relation_proposals.proposed_count = 1; item.relation_proposals.state = 'proposed'; }, 'RELATION_PROPOSAL_STATE_CHANGED']
+    ]) {
+      const changed = clone(preview); mutate(changed.items[0]);
+      const blocked = await value.repository.preflightControlledImportManifest(frozen.manifest.controlled_manifest_id, { current_preview: changed });
+      assert.equal(blocked.validation.state, 'blocked');
+      assert.ok(blocked.validation.changes.some((item) => item.code === expectedCode));
+    }
+
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => value.repository,
+      fetchImpl: fakeFetch,
+      phase3c1PreviewFactory: async () => preview,
+      listPublicPolicies: async () => ({ results: [{ id: 'public-match' }] }),
+      readPublicPolicy: async () => ({ id: 'public-match', source_url: first.official_url, document_no: first.document_no, evidence: { normalized_text: '' } })
+    }) });
+    const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+    process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-preflight-token';
+    try {
+      const response = await request(handler, `/api/admin/evidence/phase3c1/import-manifests/${frozen.manifest.controlled_manifest_id}/preflight`, { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+      assert.equal(response.response.status, 200);
+      assert.equal(response.body.public_projection_duplicate_free, false);
+      assert.equal(response.body.validation.state, 'blocked');
+      assert.deepEqual(response.body.public_projections[0].projections[0].match_basis, ['official_url', 'document_no']);
+      assert.equal('raw_html' in response.body, false);
+      assert.equal('legal_status' in response.body, false);
+    } finally { if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous; }
+  } finally { await close(value); }
+});

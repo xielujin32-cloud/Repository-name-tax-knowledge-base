@@ -4,6 +4,7 @@ import { POLICY_STATUSES } from './policy-schema.js';
 import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-risk-assessment.js';
 import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
 import { LOW_RISK_BATCH_CONFIRMATION, chooseSampleCandidateIds, confirmedFieldsFromLowRiskCandidate, lowRiskEligibility, manifestHash, sampleSizeForBatch } from './risk-review-queue.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint } from './phase3c1-controlled-import.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
 const stable = (value) => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}` : JSON.stringify(value);
@@ -20,6 +21,15 @@ const relationProposalRow = (row) => row && ({ ...row, target_reference: jsonObj
 const batchManifestRow = (row) => row && ({ ...row, filter_spec: jsonObject(row.filter_spec) });
 const batchItemRow = (row) => row && ({ ...row, confirmed_fields: jsonObject(row.confirmed_fields) });
 const projectionJobRow = (row) => row && ({ ...row });
+const controlledImportManifestRow = (row) => row && ({ ...row, selection_criteria: jsonObject(row.selection_criteria) });
+const controlledImportManifestItemRow = (row) => row && ({
+  ...row,
+  document_no_provenance: jsonObject(row.document_no_provenance),
+  issuing_authority: jsonObject(row.issuing_authority, []),
+  risk_assessment: jsonObject(row.risk_assessment),
+  metadata_suggestion: jsonObject(row.metadata_suggestion),
+  relation_proposals: jsonObject(row.relation_proposals)
+});
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
@@ -753,6 +763,97 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('该 Candidate 正在审核中，请稍后重试。');
     return locked.result;
   }
+  function validatePhase3C1Preview(preview) {
+    if (!preview || typeof preview !== 'object' || Array.isArray(preview)) throw new Error('Phase 3C-1 manifest 需要服务端 preview。');
+    if (preview.manifest_key !== PHASE3C1_IMPORT_MANIFEST_KEY) throw new Error('Phase 3C-1 manifest key 无效。');
+    if (!Array.isArray(preview.items) || preview.items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('Phase 3C-1 必须且只能冻结 10 条政策。');
+    for (const [offset, item] of preview.items.entries()) {
+      if (Number(item.ordinal) !== offset + 1 || canonical(item.official_url) !== PHASE3C1_FIXED_IMPORT_URLS[offset]) throw new Error('Phase 3C-1 只能使用服务器固定 URL 顺序。');
+      if (!/^[a-f0-9]{64}$/.test(String(item.body_hash || ''))) throw new Error('Phase 3C-1 正文 hash 无效。');
+      if (!item.document_no || item.document_no_provenance?.confidence !== 'high' || !['structured_field', 'title_nearby', 'body_lead'].includes(item.document_no_provenance?.source)) throw new Error('Phase 3C-1 需要可靠文号。');
+      if (item.risk_assessment?.risk_level !== 'low' || Number(item.risk_assessment?.risk_score) !== 0) throw new Error('Phase 3C-1 仅允许 Low Risk 0 分条目。');
+      if (Number(item.relation_proposals?.proposed_count) !== 0) throw new Error('Phase 3C-1 不允许存在待确认关系线索。');
+    }
+    const expectedHash = phase3c1ManifestFingerprint({ items: preview.items, selection_criteria: preview.selection_criteria });
+    if (preview.manifest_hash !== expectedHash) throw new Error('Phase 3C-1 preview manifest hash 不一致。');
+  }
+  async function getControlledImportManifest(controlledManifestId) {
+    const manifest = (await pool.query('SELECT * FROM controlled_import_manifests WHERE controlled_manifest_id=$1', [required(controlledManifestId, 'controlled_manifest_id')])).rows[0];
+    if (!manifest) throw new Error('controlled import manifest 不存在。');
+    const items = (await pool.query('SELECT * FROM controlled_import_manifest_items WHERE controlled_manifest_id=$1 ORDER BY ordinal ASC', [manifest.controlled_manifest_id])).rows.map(controlledImportManifestItemRow);
+    return { manifest: controlledImportManifestRow(manifest), items };
+  }
+  async function createPhase3C1FrozenImportManifest({ preview, created_by = 'netlify-admin' } = {}) {
+    validatePhase3C1Preview(preview);
+    const locked = await withExclusiveLock(`taxkb:controlled-import:${PHASE3C1_IMPORT_MANIFEST_KEY}`, async () => {
+      const existing = (await pool.query('SELECT * FROM controlled_import_manifests WHERE manifest_key=$1', [PHASE3C1_IMPORT_MANIFEST_KEY])).rows[0];
+      if (existing) {
+        if (existing.manifest_hash !== preview.manifest_hash) throw new Error('已冻结的 Phase 3C-1 manifest 与当前官方正文或规则不一致，必须人工处理。');
+        return { created: false, ...(await getControlledImportManifest(existing.controlled_manifest_id)) };
+      }
+      const manifestId = id('controlled-import-manifest');
+      const timestamp = clock();
+      await transaction(async (client) => {
+        await client.query(`INSERT INTO controlled_import_manifests (controlled_manifest_id,manifest_key,selection_criteria,manifest_hash,manifest_state,created_by,created_at,updated_at) VALUES ($1,$2,$3,$4,'frozen',$5,$6,$6)`, [manifestId, PHASE3C1_IMPORT_MANIFEST_KEY, JSON.stringify(preview.selection_criteria), preview.manifest_hash, required(created_by, 'created_by'), timestamp]);
+        for (const item of preview.items) await client.query(
+          `INSERT INTO controlled_import_manifest_items (controlled_manifest_item_id,controlled_manifest_id,ordinal,official_url,canonical_url,title,document_no,document_no_provenance,issuing_authority,publish_date,effective_date,body_hash,parser_version,risk_assessment,metadata_suggestion,relation_proposals,item_fingerprint,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+          [id('controlled-import-manifest-item'), manifestId, item.ordinal, canonical(item.official_url), canonical(item.canonical_url || item.official_url), required(item.title, 'title'), required(item.document_no, 'document_no'), JSON.stringify(item.document_no_provenance), JSON.stringify(item.issuing_authority || []), required(item.publish_date, 'publish_date'), item.effective_date || null, required(item.body_hash, 'body_hash'), required(item.parser_version, 'parser_version'), JSON.stringify(item.risk_assessment), JSON.stringify(item.metadata_suggestion), JSON.stringify(item.relation_proposals), required(item.item_fingerprint, 'item_fingerprint'), timestamp]
+        );
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length }), timestamp]);
+      });
+      return { created: true, ...(await getControlledImportManifest(manifestId)) };
+    });
+    if (!locked.acquired) throw new Error('Phase 3C-1 manifest 正在冻结，请稍后重试。');
+    return locked.result;
+  }
+  async function preflightControlledImportManifest(controlledManifestId, { current_preview } = {}) {
+    if (!current_preview || typeof current_preview !== 'object') throw new Error('preflight 需要服务端当前 preview。');
+    const frozen = await getControlledImportManifest(controlledManifestId);
+    const current = current_preview.items || [];
+    const currentByOrdinal = new Map(current.map((item) => [Number(item.ordinal), item]));
+    const changes = frozen.manifest.manifest_state === 'frozen' ? [] : [{ code: 'MANIFEST_NOT_FROZEN' }];
+    for (const item of frozen.items) {
+      const fresh = currentByOrdinal.get(Number(item.ordinal));
+      if (!fresh) { changes.push({ ordinal: item.ordinal, code: 'MANIFEST_ITEM_MISSING' }); continue; }
+      if (item.official_url !== fresh.official_url) changes.push({ ordinal: item.ordinal, code: 'OFFICIAL_URL_CHANGED' });
+      if (item.title !== fresh.title) changes.push({ ordinal: item.ordinal, code: 'TITLE_CHANGED' });
+      if (item.document_no !== fresh.document_no) changes.push({ ordinal: item.ordinal, code: 'DOCUMENT_NO_CHANGED' });
+      if (stable(item.document_no_provenance) !== stable(fresh.document_no_provenance)) changes.push({ ordinal: item.ordinal, code: 'DOCUMENT_NO_PROVENANCE_CHANGED' });
+      if (stable(item.issuing_authority) !== stable(fresh.issuing_authority)) changes.push({ ordinal: item.ordinal, code: 'ISSUING_AUTHORITY_CHANGED' });
+      if (String(item.publish_date) !== String(fresh.publish_date)) changes.push({ ordinal: item.ordinal, code: 'PUBLISH_DATE_CHANGED' });
+      if (String(item.effective_date || '') !== String(fresh.effective_date || '')) changes.push({ ordinal: item.ordinal, code: 'EFFECTIVE_DATE_CHANGED' });
+      if (item.body_hash !== fresh.body_hash) changes.push({ ordinal: item.ordinal, code: 'BODY_HASH_CHANGED' });
+      if (item.parser_version !== fresh.parser_version) changes.push({ ordinal: item.ordinal, code: 'PARSER_VERSION_CHANGED' });
+      if (item.risk_assessment?.assessment_hash !== fresh.risk_assessment?.assessment_hash) changes.push({ ordinal: item.ordinal, code: 'RISK_ASSESSMENT_CHANGED' });
+      if (item.risk_assessment?.rule_version !== fresh.risk_assessment?.rule_version) changes.push({ ordinal: item.ordinal, code: 'RISK_RULE_VERSION_CHANGED' });
+      if (item.risk_assessment?.risk_level !== fresh.risk_assessment?.risk_level || Number(item.risk_assessment?.risk_score) !== Number(fresh.risk_assessment?.risk_score)) changes.push({ ordinal: item.ordinal, code: 'RISK_LEVEL_OR_SCORE_CHANGED' });
+      if (item.metadata_suggestion?.suggestion_hash !== fresh.metadata_suggestion?.suggestion_hash) changes.push({ ordinal: item.ordinal, code: 'METADATA_SUGGESTION_CHANGED' });
+      if (item.metadata_suggestion?.rule_version !== fresh.metadata_suggestion?.rule_version) changes.push({ ordinal: item.ordinal, code: 'METADATA_RULE_VERSION_CHANGED' });
+      if (item.metadata_suggestion?.input_body_sha256 !== fresh.metadata_suggestion?.input_body_sha256) changes.push({ ordinal: item.ordinal, code: 'METADATA_BODY_HASH_CHANGED' });
+      if (item.relation_proposals?.rule_version !== fresh.relation_proposals?.rule_version) changes.push({ ordinal: item.ordinal, code: 'RELATION_RULE_VERSION_CHANGED' });
+      if (Number(item.relation_proposals?.proposed_count) !== Number(fresh.relation_proposals?.proposed_count)) changes.push({ ordinal: item.ordinal, code: 'RELATION_PROPOSAL_STATE_CHANGED' });
+      if (item.relation_proposals?.state !== fresh.relation_proposals?.state) changes.push({ ordinal: item.ordinal, code: 'RELATION_PROPOSAL_STATE_CHANGED' });
+    }
+    if (current.length !== frozen.items.length) changes.push({ code: 'MANIFEST_ITEM_COUNT_CHANGED' });
+    const duplicates = [];
+    for (const item of frozen.items) {
+      const snapshotRows = (await pool.query(`SELECT snapshot_id, CASE WHEN canonical_url=$1 OR official_url=$1 THEN 'official_url' ELSE 'body_hash' END AS match_basis FROM raw_snapshots WHERE canonical_url=$1 OR official_url=$1 OR normalized_text_sha256=$2`, [item.official_url, item.body_hash])).rows;
+      const candidateRows = (await pool.query(`SELECT candidate_id, CASE WHEN canonical_url=$1 OR official_url=$1 THEN 'official_url' WHEN normalized_text_sha256=$2 THEN 'body_hash' ELSE 'document_no' END AS match_basis FROM candidates WHERE canonical_url=$1 OR official_url=$1 OR normalized_text_sha256=$2 OR (parsed_fields->>'document_no'=$3 AND parsed_fields->>'document_no_confidence'='high' AND parsed_fields->>'document_no_source' IN ('structured_field','title_nearby','body_lead'))`, [item.official_url, item.body_hash, item.document_no])).rows;
+      const reviewedRows = (await pool.query(`SELECT DISTINCT c.candidate_id,rd.review_decision_id,rd.decision,CASE WHEN c.canonical_url=$1 OR c.official_url=$1 THEN 'official_url' WHEN c.normalized_text_sha256=$2 THEN 'body_hash' ELSE 'document_no' END AS match_basis FROM candidates c JOIN review_decisions rd ON rd.candidate_id=c.candidate_id WHERE c.canonical_url=$1 OR c.official_url=$1 OR c.normalized_text_sha256=$2 OR (c.parsed_fields->>'document_no'=$3 AND c.parsed_fields->>'document_no_confidence'='high' AND c.parsed_fields->>'document_no_source' IN ('structured_field','title_nearby','body_lead'))`, [item.official_url, item.body_hash, item.document_no])).rows;
+      const versionRows = (await pool.query(`SELECT DISTINCT p.policy_id,pv.policy_version_id,CASE WHEN pv.official_url=$1 OR pv.canonical_url=$1 THEN 'official_url' WHEN pv.document_no=$2 THEN 'document_no' ELSE 'candidate_body_hash' END AS match_basis FROM policy_versions pv JOIN policies p ON p.policy_id=pv.policy_id LEFT JOIN candidates c ON c.candidate_id=pv.candidate_id WHERE pv.official_url=$1 OR pv.canonical_url=$1 OR pv.document_no=$2 OR c.normalized_text_sha256=$3`, [item.official_url, item.document_no, item.body_hash])).rows;
+      const policiesById = new Map();
+      for (const row of versionRows) {
+        const existing = policiesById.get(row.policy_id) || { policy_id: row.policy_id, match_basis: new Set() };
+        existing.match_basis.add(row.match_basis);
+        policiesById.set(row.policy_id, existing);
+      }
+      const policyRows = [...policiesById.values()].map((row) => ({ policy_id: row.policy_id, match_basis: [...row.match_basis] }));
+      duplicates.push({ ordinal: item.ordinal, official_url: item.official_url, raw_snapshots: snapshotRows, candidates: candidateRows, reviewed_candidates: reviewedRows, policies: policyRows, policy_versions: versionRows });
+    }
+    const duplicateConflicts = duplicates.filter((item) => item.raw_snapshots.length || item.candidates.length || item.reviewed_candidates.length || item.policies.length || item.policy_versions.length);
+    if (duplicateConflicts.length) changes.push({ code: 'DUPLICATE_EVIDENCE_EXISTS', ordinals: duplicateConflicts.map((item) => item.ordinal) });
+    return { manifest: frozen.manifest, items: frozen.items, validation: { state: changes.length ? 'blocked' : 'ready', changes }, evidence_duplicates: duplicates, evidence_duplicate_free: duplicateConflicts.length === 0 };
+  }
   async function hasCompletedCandidatesForUrls({ source_id, canonical_urls = [] } = {}) {
     const urls = [...new Set(canonical_urls.map(canonical))];
     if (!required(source_id, 'source_id') || !urls.length) return false;
@@ -794,5 +895,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

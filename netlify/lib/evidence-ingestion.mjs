@@ -6,7 +6,8 @@ import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../..
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
-import { importPolicies } from './policy-store.mjs';
+import { importPolicies, listPolicies, readPolicy } from './policy-store.mjs';
+import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
@@ -258,6 +259,62 @@ function safeManifest(value) {
       item_state: item.item_state,
       last_error: item.last_error || null
     }))
+  };
+}
+
+function safePhase3C1Preview(preview) {
+  return {
+    manifest_key: preview.manifest_key,
+    selection_criteria: preview.selection_criteria,
+    created_at: preview.created_at,
+    manifest_hash: preview.manifest_hash,
+    items: preview.items.map((item) => ({
+      ordinal: item.ordinal,
+      official_url: item.official_url,
+      title: item.title,
+      document_no: item.document_no,
+      document_no_provenance: item.document_no_provenance,
+      issuing_authority: item.issuing_authority,
+      publish_date: item.publish_date,
+      effective_date: item.effective_date,
+      body_hash: item.body_hash,
+      body_length: item.body_length,
+      parser_version: item.parser_version,
+      risk_assessment: item.risk_assessment,
+      metadata_suggestion: item.metadata_suggestion,
+      relation_proposals: item.relation_proposals,
+      item_fingerprint: item.item_fingerprint
+    }))
+  };
+}
+
+async function publicProjectionPreflight(items, { listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+  const index = await listPublicPolicies({ limit: 100, offset: 0 });
+  const policies = await Promise.all((index.results || []).map((entry) => readPublicPolicy(entry.id)));
+  return items.map((item) => {
+    const matches = [];
+    for (const policy of policies.filter(Boolean)) {
+      const bases = [];
+      if (policy.source_url === item.official_url || policy.evidence?.official_url === item.official_url) bases.push('official_url');
+      if (item.document_no && policy.document_no === item.document_no) bases.push('document_no');
+      if (String(policy.evidence?.normalized_text || '') && sha256(policy.evidence.normalized_text) === item.body_hash) bases.push('body_hash');
+      if (bases.length) matches.push({ policy_id: policy.id, match_basis: bases });
+    }
+    return { ordinal: item.ordinal, official_url: item.official_url, projections: matches };
+  });
+}
+
+function safePhase3C1Preflight(value, publicProjection) {
+  return {
+    manifest: value.manifest,
+    validation: value.validation,
+    evidence_duplicate_free: value.evidence_duplicate_free,
+    evidence_duplicates: value.evidence_duplicates,
+    public_projections: publicProjection,
+    public_projection_duplicate_free: publicProjection.every((item) => !item.projections.length),
+    ready_for_future_apply: value.validation.state === 'ready'
+      && value.evidence_duplicate_free
+      && publicProjection.every((item) => !item.projections.length)
   };
 }
 
@@ -550,7 +607,7 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
@@ -579,6 +636,30 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       return json(await generatePhase2BMetadataSuggestions({ repository: repositoryFactory() }));
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/status') return json(await readEvidenceStatus({ repository: repositoryFactory() }));
+    if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview') {
+      return json({ mode: 'read_only_preview', preview: safePhase3C1Preview(await phase3c1PreviewFactory({ fetchImpl })) });
+    }
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/phase3c1/import-manifests') {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 2 || input.freeze !== true || input.confirmation !== PHASE3C1_IMPORT_MANIFEST_CONFIRMATION) {
+        return json({ error: 'Phase 3C-1 manifest 只接受固定 freeze 与确认短语，不接受 URL、Candidate、正文、Policy 字段或 legal_status。' }, 400);
+      }
+      const preview = await phase3c1PreviewFactory({ fetchImpl });
+      const frozen = await repositoryFactory().createPhase3C1FrozenImportManifest({ preview });
+      return json({ mode: 'frozen_manifest', created: frozen.created, manifest: frozen.manifest, items: safePhase3C1Preview(preview).items });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+$/.test(pathname)) {
+      const manifestId = decodeURIComponent(pathname.split('/').pop());
+      const value = await repositoryFactory().getControlledImportManifest(manifestId);
+      return json({ manifest: value.manifest, items: value.items });
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/preflight$/.test(pathname)) {
+      const manifestId = decodeURIComponent(pathname.split('/')[6]);
+      const preview = await phase3c1PreviewFactory({ fetchImpl });
+      const value = await repositoryFactory().preflightControlledImportManifest(manifestId, { current_preview: preview });
+      const projection = await publicProjectionPreflight(value.items, { listPublicPolicies, readPublicPolicy });
+      return json(safePhase3C1Preflight(value, projection));
+    }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/risk-queue/manifests') {
       const input = await requestBody(request);
       if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => key !== 'filters')) return json({ error: 'Low Risk manifest 只接受服务端筛选条件，不接受 Candidate ID 或政策内容。' }, 400);
