@@ -9,6 +9,8 @@ export const PHASE3C1_IMPORT_MANIFEST_KEY = 'phase3c1-first-ten-v1';
 export const PHASE3C1_IMPORT_PARSER_VERSION = 'chinatax-evidence-2.1.0-dom-body';
 export const PHASE3C1_IMPORT_MANIFEST_CONFIRMATION = 'FREEZE_PHASE3C1_FIRST_TEN';
 export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MANIFEST';
+const PHASE3C1_PREVIEW_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)';
+const PHASE3C1_FETCH_TIMEOUT_MS = 20_000;
 export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
   selection_version: 'phase3c1-fixed-preview-v1',
   source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
@@ -49,6 +51,130 @@ const canonical = (value) => normalizeChinaTaxPolicyUrl(value) || (() => { const
 function metadataSuggestionFingerprint(metadata) {
   const { generated_at: ignored, ...content } = metadata || {};
   return sha256(stable(content));
+}
+
+/**
+ * Both the official preview and its diagnostic must use this exact request
+ * shape. No credentials, cookies, referer, Accept, or Accept-Language are
+ * added to an upstream China Tax request.
+ */
+export function phase3c1OfficialFetchOptions() {
+  return {
+    headers: { 'user-agent': PHASE3C1_PREVIEW_USER_AGENT },
+    signal: AbortSignal.timeout(PHASE3C1_FETCH_TIMEOUT_MS)
+  };
+}
+
+export const PHASE3C1_FETCH_ENVIRONMENT = Object.freeze({
+  method: 'GET (fetch default)',
+  redirect: 'follow (fetch default)',
+  user_agent: { configured: true, value: PHASE3C1_PREVIEW_USER_AGENT },
+  accept: { configured: false },
+  accept_language: { configured: false },
+  referer: { configured: false },
+  cookie: { configured: false },
+  authorization: { configured: false }
+});
+
+/** Shared upstream fetch used by preview, diagnostics, manifest, and Apply. */
+export async function fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl = fetch } = {}) {
+  const requestedUrl = canonical(officialUrl);
+  const response = await fetchImpl(requestedUrl, phase3c1OfficialFetchOptions());
+  const raw_html = await response.text();
+  return { requested_url: requestedUrl, response, raw_html };
+}
+
+function safeTitle(html) {
+  const match = String(html || '').match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  const value = String(match?.[1] || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return value ? value.slice(0, 500) : null;
+}
+
+function classSelectorCount(html, className) {
+  const openingTags = String(html || '').match(/<[a-z][\w:-]*\b[^>]*>/gi) || [];
+  return openingTags.filter((tag) => {
+    const match = tag.match(/\bclass\s*=\s*(["'])([\s\S]*?)\1/i);
+    return match?.[2].split(/\s+/).includes(className);
+  }).length;
+}
+
+function diagnosticSelectors(html) {
+  const articleCount = (String(html || '').match(/<article\b[^>]*>/gi) || []).length;
+  const classes = {
+    '.arc_cont': classSelectorCount(html, 'arc_cont'),
+    '.TRS_Editor': classSelectorCount(html, 'TRS_Editor'),
+    '.article-content': classSelectorCount(html, 'article-content'),
+    '.article_content': classSelectorCount(html, 'article_content'),
+    article: articleCount
+  };
+  return Object.fromEntries(Object.entries(classes).map(([selector, count]) => [selector, { exists: count > 0, count }]));
+}
+
+function wafSignals(html) {
+  const value = String(html || '');
+  return {
+    captcha_or_verification: /(?:验证码|安全验证|人机验证|验证身份|captcha|verify you are human)/i.test(value),
+    access_denied_or_forbidden: /(?:access denied|forbidden|拒绝访问|无权访问)/i.test(value),
+    likely_error_page: /(?:系统错误|服务异常|页面不存在|not found|error page)/i.test(value)
+  };
+}
+
+function diagnosticParse(rawHtml) {
+  try {
+    parseChinaTaxPolicyEvidence(rawHtml);
+    return { result: 'PASS', error_code: null };
+  } catch (error) {
+    const message = String(error?.message || '');
+    return {
+      result: 'FAIL',
+      error_code: message === '国家税务总局详情页未找到受支持的政策正文容器。'
+        ? 'POLICY_BODY_CONTAINER_MISSING'
+        : 'PARSER_ERROR'
+    };
+  }
+}
+
+/**
+ * Admin-only callers receive response diagnostics, never raw HTML or policy
+ * prose. It deliberately does not throw on one failed item so a Production
+ * operator can see every fixed URL affected by an upstream variant.
+ */
+export async function diagnosePhase3C1ImportPreview({ fetchImpl = fetch } = {}) {
+  const items = [];
+  for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
+    const ordinal = offset + 1;
+    try {
+      const { requested_url, response, raw_html } = await fetchPhase3C1OfficialDetail(configuredUrl, { fetchImpl });
+      items.push(Object.freeze({
+        ordinal,
+        official_url: requested_url,
+        http_status: response.status,
+        response_ok: response.ok,
+        content_type: response.headers?.get?.('content-type') || null,
+        final_url: response.url || requested_url,
+        redirect: { occurred: Boolean(response.redirected), count: response.redirected ? null : 0 },
+        html_character_length: raw_html.length,
+        html_utf8_byte_length: new TextEncoder().encode(raw_html).byteLength,
+        html_sha256: sha256(raw_html),
+        page_title: safeTitle(raw_html),
+        selectors: diagnosticSelectors(raw_html),
+        waf_signals: wafSignals(raw_html),
+        parse: diagnosticParse(raw_html)
+      }));
+    } catch (error) {
+      items.push(Object.freeze({
+        ordinal,
+        official_url: canonical(configuredUrl),
+        fetch_error: { code: 'UPSTREAM_FETCH_FAILED', name: String(error?.name || 'Error') },
+        parse: { result: 'FAIL', error_code: 'UPSTREAM_FETCH_FAILED' }
+      }));
+    }
+  }
+  return Object.freeze({
+    mode: 'read_only_diagnostic',
+    fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
+    items: Object.freeze(items)
+  });
 }
 
 function frozenItemShape(item) {
@@ -143,11 +269,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
   for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
     const ordinal = offset + 1;
     const officialUrl = canonical(configuredUrl);
-    const response = await fetchImpl(officialUrl, {
-      headers: { 'user-agent': 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)' },
-      signal: AbortSignal.timeout(20_000)
-    });
-    const rawHtml = await response.text();
+    const { response, raw_html: rawHtml } = await fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl });
     if (!response.ok) throw new Error(`Phase 3C-1 官方详情请求失败：${response.status} (${ordinal})`);
     const parsed = parseChinaTaxPolicyEvidence(rawHtml);
     const metadata = suggestEvidenceMetadata({ title: parsed.title, normalized_text: parsed.normalized_text, generated_at: now });
