@@ -88,6 +88,48 @@ test('Phase 3C-1 服务端固定 preview 冻结 10 条，浏览器不能指定�
   }
 });
 
+test('Phase 3C-1 Preview fail-closed 返回安全的失败 ordinal 和阶段，不泄露正文', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-failure-token';
+  const secret = 'TOP_SECRET_POLICY_BODY_MUST_NOT_LEAK';
+  const calls = [];
+  const failingFetch = async (url) => {
+    const ordinal = PHASE3C1_FIXED_IMPORT_URLS.indexOf(String(url)) + 1;
+    calls.push(ordinal);
+    if (ordinal === 4) return new Response(`<html><head><title>short response</title></head><body>${secret}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } });
+    return new Response(html(ordinal), { status: 200, headers: { 'content-type': 'text/html' } });
+  };
+  try {
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({ fetchImpl: failingFetch }) });
+    const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(result.response.status, 422);
+    assert.deepEqual(calls, [1, 2, 3, 4], 'first failure must stop the remaining fixed URLs');
+    const failure = result.body.failure;
+    assert.equal(failure.failed_ordinal, 4);
+    assert.equal(failure.failure_stage, 'body-container');
+    assert.equal(failure.failure_code, 'POLICY_BODY_CONTAINER_MISSING');
+    assert.equal(failure.successfully_processed_count, 3);
+    assert.equal(failure.official_url, PHASE3C1_FIXED_IMPORT_URLS[3]);
+    assert.equal(failure.http_status, 200); assert.equal(failure.content_type, 'text/html');
+    assert.equal(failure.final_url, PHASE3C1_FIXED_IMPORT_URLS[3]);
+    assert.deepEqual(failure.redirect, { occurred: false, count: 0 });
+    assert.equal(failure.html_character_length, `<html><head><title>short response</title></head><body>${secret}</body></html>`.length);
+    assert.equal(failure.html_utf8_byte_length, new TextEncoder().encode(`<html><head><title>short response</title></head><body>${secret}</body></html>`).byteLength);
+    assert.match(failure.html_sha256, /^[a-f0-9]{64}$/);
+    assert.equal(failure.page_title, 'short response');
+    assert.deepEqual(failure.selectors, {
+      '.arc_cont': { exists: false, count: 0 }, '.TRS_Editor': { exists: false, count: 0 },
+      '.article-content': { exists: false, count: 0 }, '.article_content': { exists: false, count: 0 }, article: { exists: false, count: 0 }
+    });
+    assert.equal(failure.parser_error_code, 'POLICY_BODY_CONTAINER_MISSING');
+    const serialized = JSON.stringify(result.body);
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes(process.env.NETLIFY_TAXKB_ADMIN_TOKEN), false);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
 test('Phase 3C-1 预检只读识别 URL、可信文号、正文 hash、Candidate、Review、Policy 和公开投影', async () => {
   const value = await fixture();
   try {

@@ -189,6 +189,41 @@ function diagnosticItem({ ordinal, requested_url, response, raw_html }, { includ
 }
 
 /**
+ * A deliberately content-free error context for the fail-closed official
+ * preview.  It is safe to return only to the existing admin-only endpoint:
+ * raw HTML, normalized policy text, request credentials, and upstream error
+ * text never become part of this object.
+ */
+export class Phase3C1PreviewFailure extends Error {
+  constructor({ ordinal, stage, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, code = 'PREVIEW_ITEM_FAILED' } = {}) {
+    super(`Phase 3C-1 Preview stopped at ordinal ${ordinal}.`);
+    this.name = 'Phase3C1PreviewFailure';
+    const hasHtml = typeof raw_html === 'string';
+    this.safe_diagnostic = Object.freeze({
+      failed_ordinal: ordinal,
+      failure_stage: stage,
+      failure_code: code,
+      successfully_processed_count: processed_count,
+      official_url: requested_url || null,
+      http_status: response?.status ?? null,
+      content_type: response?.headers?.get?.('content-type') || null,
+      final_url: response?.url || requested_url || null,
+      redirect: response ? { occurred: Boolean(response.redirected), count: response.redirected ? null : 0 } : null,
+      html_character_length: hasHtml ? raw_html.length : null,
+      html_utf8_byte_length: hasHtml ? new TextEncoder().encode(raw_html).byteLength : null,
+      html_sha256: hasHtml ? sha256(raw_html) : null,
+      page_title: hasHtml ? safeTitle(raw_html) : null,
+      selectors: hasHtml ? diagnosticSelectors(raw_html) : null,
+      parser_error_code: parser_error_code || (hasHtml ? diagnosticParse(raw_html).error_code : null)
+    });
+  }
+}
+
+function phase3c1PreviewFailure(input) {
+  return new Phase3C1PreviewFailure(input);
+}
+
+/**
  * Admin-only callers receive response diagnostics, never raw HTML or policy
  * prose. It deliberately does not throw on one failed item so a Production
  * operator can see every fixed URL affected by an upstream variant.
@@ -339,10 +374,29 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
   for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
     const ordinal = offset + 1;
     const officialUrl = canonical(configuredUrl);
-    const { response, raw_html: rawHtml } = await fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl });
-    if (!response.ok) throw new Error(`Phase 3C-1 官方详情请求失败：${response.status} (${ordinal})`);
-    const parsed = parseChinaTaxPolicyEvidence(rawHtml);
-    const metadata = suggestEvidenceMetadata({ title: parsed.title, normalized_text: parsed.normalized_text, generated_at: now });
+    let fetched;
+    try {
+      fetched = await fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl });
+    } catch {
+      throw phase3c1PreviewFailure({ ordinal, stage: 'fetch', processed_count: items.length, requested_url: officialUrl, code: 'UPSTREAM_FETCH_FAILED' });
+    }
+    const { response, raw_html: rawHtml } = fetched;
+    if (!response.ok) {
+      throw phase3c1PreviewFailure({ ordinal, stage: 'http', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'UPSTREAM_HTTP_NOT_OK' });
+    }
+    let parsed;
+    try {
+      parsed = parseChinaTaxPolicyEvidence(rawHtml);
+    } catch {
+      const parser = diagnosticParse(rawHtml);
+      throw phase3c1PreviewFailure({ ordinal, stage: parser.error_code === 'POLICY_BODY_CONTAINER_MISSING' ? 'body-container' : 'parse', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, parser_error_code: parser.error_code, code: parser.error_code || 'PARSER_ERROR' });
+    }
+    let metadata;
+    try {
+      metadata = suggestEvidenceMetadata({ title: parsed.title, normalized_text: parsed.normalized_text, generated_at: now });
+    } catch {
+      throw phase3c1PreviewFailure({ ordinal, stage: 'metadata', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'METADATA_SUGGESTION_FAILED' });
+    }
     const fields = {
       title: parsed.title,
       document_no: parsed.document_no,
@@ -355,8 +409,18 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       expiry_date: parsed.expiry_date,
       metadata_suggestion: metadata
     };
-    const risk = evaluateCandidateRisk(syntheticRiskDetail({ ordinal, officialUrl, rawHtml, parsed, fields }));
-    const proposals = proposeCandidateRelations({ normalized_text: parsed.normalized_text });
+    let risk;
+    try {
+      risk = evaluateCandidateRisk(syntheticRiskDetail({ ordinal, officialUrl, rawHtml, parsed, fields }));
+    } catch {
+      throw phase3c1PreviewFailure({ ordinal, stage: 'risk', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RISK_ASSESSMENT_FAILED' });
+    }
+    let proposals;
+    try {
+      proposals = proposeCandidateRelations({ normalized_text: parsed.normalized_text });
+    } catch {
+      throw phase3c1PreviewFailure({ ordinal, stage: 'relation', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RELATION_PROPOSAL_FAILED' });
+    }
     const item = {
       ordinal,
       official_url: officialUrl,
@@ -394,7 +458,12 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
     };
     item.item_fingerprint = phase3c1ItemFingerprint(item);
     const issues = eligibilityProblems(item);
-    if (issues.length) throw new Error(`Phase 3C-1 固定条目 ${ordinal} 不再满足冻结条件：${issues.join(',')}`);
+    if (issues.length) {
+      const stage = issues.includes('RISK_NOT_LOW_ZERO') ? 'risk'
+        : issues.includes('RELATION_PROPOSAL_PRESENT') ? 'relation'
+          : 'eligibility';
+      throw phase3c1PreviewFailure({ ordinal, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0] });
+    }
     items.push(Object.freeze(item));
     materials.push(Object.freeze({
       ordinal,
