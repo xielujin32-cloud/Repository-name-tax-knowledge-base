@@ -333,6 +333,46 @@ export async function diagnosePhase3C1ShortCadence({ fetchImpl = fetch, waitImpl
   });
 }
 
+/**
+ * The full, fixed-list counterpart to cadence-short. Its order, interval,
+ * and maximum request count are server-owned and cannot be altered by an
+ * admin request. This is observability only; it never opens a repository.
+ */
+export async function diagnosePhase3C1FullCadence({ fetchImpl = fetch, waitImpl = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)) } = {}) {
+  const ordinals = Object.freeze(PHASE3C1_FIXED_IMPORT_URLS.map((_, offset) => offset + 1));
+  const items = [];
+  let blocked = false;
+  for (const [offset, ordinal] of ordinals.entries()) {
+    if (offset > 0) await waitImpl(PHASE3C1_SHORT_CADENCE_DELAY_MS);
+    const configuredUrl = PHASE3C1_FIXED_IMPORT_URLS[ordinal - 1];
+    try {
+      const fetched = await fetchPhase3C1OfficialDetail(configuredUrl, { fetchImpl });
+      const item = Object.freeze({
+        request_sequence: offset + 1,
+        ...diagnosticItem({ ordinal, ...fetched }, { include_response_headers: true })
+      });
+      items.push(item);
+      if (!item.response_ok || item.parse.result !== 'PASS') {
+        blocked = true;
+        break;
+      }
+    } catch (error) {
+      items.push(cadenceFetchFailure({ request_sequence: offset + 1, ordinal, official_url: canonical(configuredUrl), error }));
+      blocked = true;
+      break;
+    }
+  }
+  return Object.freeze({
+    mode: 'read_only_full_cadence_diagnostic',
+    fixed_ordinals: ordinals,
+    fixed_delay_ms: PHASE3C1_SHORT_CADENCE_DELAY_MS,
+    maximum_requests: ordinals.length,
+    result: blocked ? 'BLOCKED' : 'PASS',
+    fetch_environment: PHASE3C1_FETCH_ENVIRONMENT,
+    items: Object.freeze(items)
+  });
+}
+
 function frozenItemShape(item) {
   return {
     ordinal: item.ordinal,

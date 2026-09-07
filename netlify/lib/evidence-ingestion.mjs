@@ -7,7 +7,7 @@ import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/ev
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
 import { importPolicies, listPolicies, readPolicy } from './policy-store.mjs';
-import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, Phase3C1PreviewFailure, collectPhase3C1ApplyMaterial, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, diagnosePhase3C1ShortCadence, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
+import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, Phase3C1PreviewFailure, collectPhase3C1ApplyMaterial, diagnosePhase3C1FullCadence, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, diagnosePhase3C1ShortCadence, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
@@ -634,7 +634,7 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
@@ -681,6 +681,9 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics/cadence-short') {
       return json(await phase3c1ShortCadenceDiagnosticFactory({ fetchImpl }));
+    }
+    if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics/cadence-full') {
+      return json(await phase3c1FullCadenceDiagnosticFactory({ fetchImpl }));
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/phase3c1/import-manifests') {
       const input = await requestBody(request);
