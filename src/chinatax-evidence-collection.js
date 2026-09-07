@@ -129,17 +129,92 @@ function titleFromDetail(html) {
   return policyTitle || (pageTitle && /税|法|条例|公告|通知|办法|规定/.test(pageTitle) ? pageTitle : null) || headings[0] || pageTitle;
 }
 
-function documentNoFromText(text) {
-  // Only retain an actual document-number literal visible in the official page.
-  const authority = '(?:国家税务总局|财政部|税务总局|中国证监会|海关总署|国务院)';
-  const expression = new RegExp(`(?:${authority})(?:[、，,\\s]+${authority})*\\s*(?:公告|令|通知|决定)\\s*(?:〔\\d{4}〕\\d+号|\\d{4}年第\\d+号|第\\d+号)`);
-  return clean(String(text || '').match(expression)?.[0]);
+const DOCUMENT_NO_AUTHORITY = '(?:国家税务总局|财政部|税务总局|中国证监会|海关总署|国务院)';
+const DOCUMENT_NO_LITERAL = new RegExp(`${DOCUMENT_NO_AUTHORITY}(?:[、，,\\s]+${DOCUMENT_NO_AUTHORITY})*\\s*(?:公告|令|通知|决定)\\s*(?:〔\\d{4}〕\\d+号|\\d{4}年第\\d+号|第\\d+号)`, 'g');
+const DOCUMENT_NO_REFERENCE_CONTEXT = /(?:根据|按照|依照|依据|参照|废止|修订|修改|替代|取代|附件|见)[^。；\n]{0,80}$/;
+
+function plausibleDocumentNo(value) {
+  const documentNo = clean(value);
+  if (!documentNo || documentNo.length > 160) return null;
+  return /(?:公告|令|通知|决定)\s*(?:〔\d{4}〕\d+号|\d{4}年第\d+号|第\d+号)$/.test(documentNo) ? documentNo : null;
+}
+
+function plausibleStructuredDocumentNo(value) {
+  const documentNo = clean(value);
+  if (!documentNo || documentNo.length > 160) return null;
+  if (/(?:公告|令|通知|决定)\s*(?:〔\d{4}〕\d+号|\d{4}年第\d+号|第\d+号)$/.test(documentNo)) return documentNo;
+  // Historical STA detail pages place codes such as 国税发〔1994〕122号
+  // and 国税函[1999]207号 in their own header <h5>. Accept these only from
+  // that structural field, never from the policy body or cited materials.
+  return /^(?:国税(?:发|函|函发|函字)?|税总(?:发|函)?|财税(?:字)?)\s*[〔\[【(]?\s*\d{4}\s*[〕\]】)]?\s*\d+号$/.test(documentNo)
+    ? documentNo
+    : null;
+}
+
+function documentNoCandidate(text, { source, maxStart = Infinity } = {}) {
+  const value = String(text || '');
+  DOCUMENT_NO_LITERAL.lastIndex = 0;
+  let match;
+  while ((match = DOCUMENT_NO_LITERAL.exec(value))) {
+    if (match.index > maxStart) break;
+    const documentNo = plausibleDocumentNo(match[0]);
+    if (!documentNo) continue;
+    const prefix = value.slice(Math.max(0, match.index - 220), match.index);
+    // A cited instrument is never evidence of this page's own document number.
+    if (DOCUMENT_NO_REFERENCE_CONTEXT.test(prefix)) continue;
+    return {
+      document_no: documentNo,
+      document_no_source: source,
+      document_no_confidence: 'high',
+      document_no_evidence: { source, start: match.index, end: match.index + match[0].length, text: documentNo }
+    };
+  }
+  return null;
+}
+
+function structuredDocumentNo(detailHtml) {
+  const value = textFromFirst(detailHtml, /<h5\b[^>]*\bclass\s*=\s*["'][^"']*\bactfwzh\b[^"']*["'][^>]*>([\s\S]*?)<\/h5>/i);
+  const documentNo = plausibleStructuredDocumentNo(value);
+  if (documentNo) return { document_no: documentNo, document_no_source: 'structured_field', document_no_confidence: 'high', document_no_evidence: { source: 'structured_field', start: 0, end: documentNo.length, text: documentNo } };
+  const headerEnd = detailHtml.indexOf('<div class="article"');
+  const headerHtml = headerEnd >= 0 ? detailHtml.slice(0, headerEnd) : detailHtml;
+  const candidates = [...headerHtml.matchAll(/<h5\b[^>]*>([\s\S]*?)<\/h5>/gi)]
+    .map((match) => ({ documentNo: plausibleStructuredDocumentNo(htmlToText(match[1])), start: match.index }))
+    .filter((item) => item.documentNo);
+  // A single header H5 is a stable, page-owned field. Multiple candidates are
+  // deliberately left unresolved rather than guessing which one is current.
+  if (candidates.length !== 1) return null;
+  return { document_no: candidates[0].documentNo, document_no_source: 'structured_field', document_no_confidence: 'high', document_no_evidence: { source: 'structured_field', start: candidates[0].start, end: candidates[0].start + candidates[0].documentNo.length, text: candidates[0].documentNo } };
+}
+
+function documentNoNearTitle(detailHtml, title) {
+  const headerEnd = detailHtml.indexOf('<div class="article"');
+  const headerText = htmlToText(headerEnd >= 0 ? detailHtml.slice(0, headerEnd) : detailHtml);
+  const titleStart = title ? headerText.indexOf(title) : -1;
+  if (titleStart < 0) return null;
+  const nearby = headerText.slice(Math.max(0, titleStart - 120), titleStart + title.length + 320);
+  const candidate = documentNoCandidate(nearby, { source: 'title_nearby' });
+  if (!candidate) return null;
+  return { ...candidate, document_no_evidence: { ...candidate.document_no_evidence, start: candidate.document_no_evidence.start + Math.max(0, titleStart - 120), end: candidate.document_no_evidence.end + Math.max(0, titleStart - 120) } };
+}
+
+function documentNoFromBodyLead(bodyText) {
+  return documentNoCandidate(String(bodyText || '').slice(0, 600), { source: 'body_lead' });
+}
+
+function missingDocumentNo() {
+  return { document_no: null, document_no_source: 'missing', document_no_confidence: 'none', document_no_evidence: null };
 }
 
 function authoritiesFromDocumentNo(documentNo) {
   if (!documentNo) return [];
   const prefix = documentNo.split(/公告|令|通知|决定/)[0] || '';
   return [...new Set(AUTHORITY_NAMES.filter((authority) => prefix.includes(authority)))];
+}
+
+function authoritiesFromTitle(title) {
+  const heading = String(title || '').split(/关于|公告|通知|办法|规定|条例/)[0] || '';
+  return [...new Set(AUTHORITY_NAMES.filter((authority) => heading.includes(authority)))];
 }
 
 function labelledDate(text, labels) {
@@ -180,14 +255,24 @@ export function parseChinaTaxPolicyEvidence(html) {
   const bodyHtml = extractChinaTaxPolicyBodyHtml(html);
   if (!bodyHtml) throw new Error('国家税务总局详情页未找到受支持的政策正文容器。');
   const normalizedText = policyText(bodyHtml);
-  const detailText = htmlToText(documentDetailHtml(html));
-  const documentNo = textFromFirst(documentDetailHtml(html), /<h5\b[^>]*\bclass\s*=\s*["'][^"']*\bactfwzh\b[^"']*["'][^>]*>([\s\S]*?)<\/h5>/i)
-    || documentNoFromText(detailText);
+  const detailHtml = documentDetailHtml(html);
+  const detailText = htmlToText(detailHtml);
+  const title = titleFromDetail(html);
+  // Never scan the full detail text: it can contain cited instruments,
+  // attachments, recommendations and other page-local content. A missing
+  // number is safer than assigning a referenced policy's number to this page.
+  const documentNo = structuredDocumentNo(detailHtml)
+    || documentNoNearTitle(detailHtml, title)
+    || documentNoFromBodyLead(normalizedText)
+    || missingDocumentNo();
   const publishedMeta = dateOnly(metaContent(html, 'PubDate'));
   return Object.freeze({
-    title: titleFromDetail(html),
-    document_no: documentNo,
-    issuing_authority: authoritiesFromDocumentNo(documentNo),
+    title,
+    document_no: documentNo.document_no,
+    document_no_source: documentNo.document_no_source,
+    document_no_confidence: documentNo.document_no_confidence,
+    document_no_evidence: documentNo.document_no_evidence,
+    issuing_authority: authoritiesFromDocumentNo(documentNo.document_no).length ? authoritiesFromDocumentNo(documentNo.document_no) : authoritiesFromTitle(title),
     // The template's PubDate can be the CMS page-generation time. A labelled
     // document date shown in the official detail area is stronger evidence.
     publish_date: labelledDate(detailText, ['发布日期', '发布时间', '成文日期', '发文日期']) || publishedMeta,
@@ -258,6 +343,9 @@ export async function collectPhase2BDetails({ repository, source_id = CHINA_TAX_
         parse_result: {
           title: parsed.title,
           document_no: parsed.document_no,
+          document_no_source: parsed.document_no_source,
+          document_no_confidence: parsed.document_no_confidence,
+          document_no_evidence: parsed.document_no_evidence,
           issuing_authority: parsed.issuing_authority,
           publish_date: parsed.publish_date,
           effective_date: parsed.effective_date,
@@ -270,6 +358,9 @@ export async function collectPhase2BDetails({ repository, source_id = CHINA_TAX_
         parsed_fields: {
           title: parsed.title,
           document_no: parsed.document_no,
+          document_no_source: parsed.document_no_source,
+          document_no_confidence: parsed.document_no_confidence,
+          document_no_evidence: parsed.document_no_evidence,
           issuing_authority: parsed.issuing_authority,
           publish_date: parsed.publish_date,
           effective_date: parsed.effective_date,

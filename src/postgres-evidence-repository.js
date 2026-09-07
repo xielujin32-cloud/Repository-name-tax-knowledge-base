@@ -195,11 +195,18 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
   async function detectCandidateRiskConflicts(detail) {
     const candidate = detail.candidate;
     const documentNo = textValue(candidate.parsed_fields?.document_no);
-    const document_no_conflicts = documentNo
+    const documentNoTrusted = documentNo
+      && candidate.parsed_fields?.document_no_confidence === 'high'
+      && ['structured_field', 'title_nearby', 'body_lead'].includes(candidate.parsed_fields?.document_no_source);
+    const document_no_conflicts = documentNoTrusted
       ? (await pool.query(
         `SELECT candidate_id,canonical_url,normalized_text_sha256,parsed_fields->>'title' AS title
          FROM candidates
-         WHERE candidate_id<>$1 AND parsed_fields->>'document_no'=$2 AND normalized_text_sha256<>$3`,
+         WHERE candidate_id<>$1
+           AND parsed_fields->>'document_no'=$2
+           AND parsed_fields->>'document_no_confidence'='high'
+           AND parsed_fields->>'document_no_source' IN ('structured_field','title_nearby','body_lead')
+           AND normalized_text_sha256<>$3`,
         [candidate.candidate_id, documentNo, candidate.normalized_text_sha256]
       )).rows.map((row) => ({ candidate_id: row.candidate_id, canonical_url: row.canonical_url, title: row.title || null }))
       : [];

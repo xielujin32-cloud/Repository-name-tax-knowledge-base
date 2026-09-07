@@ -66,6 +66,14 @@ function sourceProblem(detail) {
   }
 }
 
+function trustedDocumentNo(fields) {
+  const source = text(fields.document_no_source);
+  const confidence = text(fields.document_no_confidence);
+  return Boolean(text(fields.document_no))
+    && confidence === 'high'
+    && ['structured_field', 'title_nearby', 'body_lead'].includes(source);
+}
+
 /**
  * Deterministic Phase 3A risk evaluation. It only describes data quality and
  * evidence risk; it never returns or changes a legal-status conclusion.
@@ -107,7 +115,10 @@ export function evaluateCandidateRisk(detail, { ruleVersion = CANDIDATE_RISK_RUL
       actual: metadataSuggestion.input_body_sha256
     });
   }
-  if (conflicts.document_no_conflicts?.length) {
+  // A document number can be a cited instrument unless the parser recorded
+  // narrow, current-document provenance. Never turn unproven text into a
+  // duplicate hard blocker.
+  if (trustedDocumentNo(fields) && conflicts.document_no_conflicts?.length) {
     add('DOCUMENT_NO_CONFLICT', 100, 'document_no', { conflicts: conflicts.document_no_conflicts }, { hardBlocker: true });
   }
   if (conflicts.suspected_version_changes?.length) {
@@ -127,6 +138,8 @@ export function evaluateCandidateRisk(detail, { ruleVersion = CANDIDATE_RISK_RUL
     http_status: snapshot.http_status ?? null,
     title: fields.title || null,
     document_no: fields.document_no || null,
+    document_no_source: fields.document_no_source || 'missing',
+    document_no_confidence: fields.document_no_confidence || 'none',
     issuing_authority: array(fields.issuing_authority).map(text).filter(Boolean),
     publish_date: fields.publish_date || null,
     metadata_suggestion_input_body_sha256: metadataSuggestion.input_body_sha256 || null,
@@ -148,6 +161,7 @@ export function evaluateCandidateRisk(detail, { ruleVersion = CANDIDATE_RISK_RUL
       evidence_chain_valid: !chainProblems.length,
       title_present: Boolean(text(fields.title)),
       document_no_present: Boolean(text(fields.document_no)),
+      document_no_trusted: trustedDocumentNo(fields),
       issuing_authority_present: Boolean(array(fields.issuing_authority).map(text).filter(Boolean).length),
       publish_date_present: Boolean(text(fields.publish_date)),
       parser_version: parserVersion,

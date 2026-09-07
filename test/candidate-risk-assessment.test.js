@@ -23,6 +23,7 @@ function detailFixture({ body = longBody, fields = {}, candidate = {}, snapshot 
         normalized_text_sha256: normalizedHash, parsed_normalized_text: null, verification_state: 'pending_review', legal_status: 'pending',
         parsed_fields: {
           title: '财政部 税务总局关于规范限售股个人所得税政策的公告', document_no: '财政部 税务总局公告2026年第26号',
+          document_no_source: 'structured_field', document_no_confidence: 'high', document_no_evidence: { source: 'structured_field', start: 0, end: 18 },
           issuing_authority: ['财政部', '税务总局'], publish_date: '2026-08-28', effective_date: null, expiry_date: null,
           ...fields
         },
@@ -93,6 +94,29 @@ test('风险规则保存模板污染、字段缺失、冲突和证据链异常�
   const chain = broken.risk_reasons.find((item) => item.code === 'EVIDENCE_CHAIN_INVALID');
   assert.equal(broken.risk_level, 'high');
   assert.deepEqual(chain.evidence.problems, ['candidate.snapshot_id']);
+});
+
+test('只有有可信 provenance 的文号才能触发文号冲突硬阻断', () => {
+  const conflicts = { document_no_conflicts: [{ candidate_id: 'candidate-other', canonical_url: 'https://fgk.chinatax.gov.cn/zcfgk/other/content.html' }] };
+  const missing = detailFixture({ fields: {
+    document_no: null, document_no_source: 'missing', document_no_confidence: 'none', document_no_evidence: null
+  }, conflicts });
+  const noNumber = evaluateCandidateRisk(missing.detail, { conflicts });
+  assert.equal(noNumber.risk_level, 'low');
+  assert.ok(noNumber.risk_reasons.some((item) => item.code === 'DOCUMENT_NO_MISSING'));
+  assert.ok(!noNumber.risk_reasons.some((item) => item.code === 'DOCUMENT_NO_CONFLICT'));
+
+  const untrusted = detailFixture({ fields: {
+    document_no_source: 'missing', document_no_confidence: 'none', document_no_evidence: null
+  }, conflicts });
+  const ignored = evaluateCandidateRisk(untrusted.detail, { conflicts });
+  assert.equal(ignored.risk_level, 'low');
+  assert.ok(!ignored.risk_reasons.some((item) => item.code === 'DOCUMENT_NO_CONFLICT'));
+
+  const trusted = detailFixture({ conflicts });
+  const conflict = evaluateCandidateRisk(trusted.detail, { conflicts });
+  assert.equal(conflict.risk_level, 'high');
+  assert.ok(conflict.risk_reasons.some((item) => item.code === 'DOCUMENT_NO_CONFLICT' && item.hard_blocker));
 });
 
 async function databaseFixture() {
@@ -169,6 +193,38 @@ test('风险评估持久化幂等，正文/解析器/规则变化保留历史且
       /cannot be deleted/
     );
     assert.equal((await fixture.repository.getCandidateForReview(fixture.candidate.candidate_id)).candidate.legal_status, 'pending');
+  } finally {
+    await fixture.database.stop();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('持久化重复检测只把双方均有可信文号 provenance 的记录视为文号冲突', async () => {
+  const fixture = await databaseFixture();
+  try {
+    const otherBody = `${longBody}\n另一份官方正文。`;
+    const run = await fixture.repository.createCollectionRun({ source_id: 'source-risk-db', mode: 'risk-conflict-test' });
+    const snapshot = await fixture.repository.recordRawSnapshot({
+      source_id: 'source-risk-db', collection_run_id: run.collection_run_id,
+      official_url: 'https://fgk.chinatax.gov.cn/zcfgk/risk-other/content.html', canonical_url: 'https://fgk.chinatax.gov.cn/zcfgk/risk-other/content.html',
+      http_status: 200, content_type: 'text/html', raw_content: `<article>${otherBody}</article>`, normalized_text: otherBody,
+      parser_version: 'risk-parser-v1', parse_result: { title: '另一份风险测试政策' }
+    });
+    const other = await fixture.repository.createCandidate({
+      snapshot_id: snapshot.snapshot_id,
+      parsed_fields: { title: '另一份风险测试政策', document_no: '税总公告2026年第99号', document_no_source: 'structured_field', document_no_confidence: 'high', issuing_authority: ['国家税务总局'], publish_date: '2026-09-01' },
+      verification_state: 'pending_review', legal_status: 'pending'
+    });
+    const initial = await fixture.repository.detectCandidateRiskConflicts(await fixture.repository.getCandidateForReview(fixture.candidate.candidate_id));
+    assert.deepEqual(initial.document_no_conflicts, []);
+
+    await fixture.repository.reparseCandidate(fixture.candidate.candidate_id, {
+      parsed_fields: { title: '风险测试政策', document_no: '税总公告2026年第99号', document_no_source: 'title_nearby', document_no_confidence: 'high', issuing_authority: ['国家税务总局'], publish_date: '2026-09-01' },
+      normalized_text: longBody, parser_version: 'risk-parser-v2'
+    });
+    const trusted = await fixture.repository.detectCandidateRiskConflicts(await fixture.repository.getCandidateForReview(fixture.candidate.candidate_id));
+    assert.equal(trusted.document_no_conflicts.length, 1);
+    assert.equal(trusted.document_no_conflicts[0].candidate_id, other.candidate.candidate_id);
   } finally {
     await fixture.database.stop();
     await rm(fixture.root, { recursive: true, force: true });

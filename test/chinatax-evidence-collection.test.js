@@ -31,6 +31,9 @@ test('两条官方详情页只解析页面明确载明的字段，状态保持�
   const second = parseChinaTaxPolicyEvidence(pages.get(secondUrl));
   assert.equal(first.title, '财政部 税务总局 中国证监会关于规范转让上市公司限售股个人所得税政策的公告');
   assert.equal(first.document_no, '财政部 税务总局 中国证监会公告2026年第26号');
+  assert.equal(first.document_no_source, 'structured_field');
+  assert.equal(first.document_no_confidence, 'high');
+  assert.equal(first.document_no_evidence.source, 'structured_field');
   assert.deepEqual(first.issuing_authority, ['财政部', '税务总局', '中国证监会']);
   assert.equal(first.publish_date, '2026-08-28');
   assert.equal(first.effective_date, '2026-09-01');
@@ -39,6 +42,44 @@ test('两条官方详情页只解析页面明确载明的字段，状态保持�
   assert.equal(second.expiry_date, null);
   assert.equal(second.verification_state, 'pending_review');
   assert.equal(second.legal_status, 'pending');
+});
+
+test('国家税务总局详情页文号只取当前文件的受限区域，引用文件不得充当当前文号', () => {
+  const noOwnNumber = `<html><head><meta name="ArticleTitle" content="国家税务总局关于测试无文号通知的说明" /></head><body>
+    <div class="detials contentLeft"><h3>国家税务总局关于测试无文号通知的说明</h3><div class="article"><div class="arc_cont">
+      <p>根据国家税务总局公告2024年第1号的规定，现说明如下。</p>
+      <p>本说明同时参照财政部 税务总局公告2025年第2号执行。</p>
+      <p>对被废止的国家税务总局公告2023年第9号不再适用。</p>
+    </div></div></div></body></html>`;
+  const parsedMissing = parseChinaTaxPolicyEvidence(noOwnNumber);
+  assert.equal(parsedMissing.document_no, null);
+  assert.equal(parsedMissing.document_no_source, 'missing');
+  assert.equal(parsedMissing.document_no_confidence, 'none');
+  assert.equal(parsedMissing.document_no_evidence, null);
+
+  const titleNearby = `<html><body><div class="detials contentLeft"><h3>国家税务总局关于测试标题附近文号的公告</h3>
+    <p>国家税务总局公告2026年第99号</p><div class="article"><div class="arc_cont"><p>第一条 测试正文。</p></div></div></div></body></html>`;
+  const parsedNearby = parseChinaTaxPolicyEvidence(titleNearby);
+  assert.equal(parsedNearby.document_no, '国家税务总局公告2026年第99号');
+  assert.equal(parsedNearby.document_no_source, 'title_nearby');
+  assert.equal(parsedNearby.document_no_confidence, 'high');
+
+  const bodyLead = `<html><body><div class="detials contentLeft"><h3>国家税务总局关于测试正文开头文号的公告</h3><div class="article"><div class="arc_cont">
+    <p>国家税务总局公告2026年第100号</p><p>第一条 测试正文。</p><p>根据国家税务总局公告2024年第1号执行。</p>
+  </div></div></div></body></html>`;
+  const parsedLead = parseChinaTaxPolicyEvidence(bodyLead);
+  assert.equal(parsedLead.document_no, '国家税务总局公告2026年第100号');
+  assert.equal(parsedLead.document_no_source, 'body_lead');
+  assert.equal(parsedLead.document_no_confidence, 'high');
+
+  const historicalStructured = `<html><body><div class="detials contentLeft"><h3>国家税务总局关于历史文号测试的通知</h3>
+    <div class="arctips"><h5>国税发〔1994〕122号</h5></div><div class="article"><div class="arc_cont">
+      <p>根据国家税务总局公告2026年第18号的规定，现通知如下。</p>
+    </div></div></div></body></html>`;
+  const parsedHistorical = parseChinaTaxPolicyEvidence(historicalStructured);
+  assert.equal(parsedHistorical.document_no, '国税发〔1994〕122号');
+  assert.equal(parsedHistorical.document_no_source, 'structured_field');
+  assert.equal(parsedHistorical.document_no_confidence, 'high');
 });
 
 test('国家税务总局详情页只提取 .arc_cont 政策正文，排除网站模板污染', () => {
