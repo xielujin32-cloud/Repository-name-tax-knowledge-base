@@ -672,7 +672,14 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
         return json({ mode: 'read_only_preview', preview: safePhase3C1Preview(await phase3c1PreviewFactory({ fetchImpl })) });
       } catch (error) {
         if (error instanceof Phase3C1PreviewFailure) {
-          return json({ error: '固定十条 Production Preview 已停止。', failure: error.safe_diagnostic }, 422);
+          return json({
+            mode: 'read_only_preview',
+            preview_result: 'BLOCKED',
+            error: '固定十条 Production Preview 已停止。',
+            failure: error.safe_diagnostic,
+            ready_to_create_frozen_manifest: 'NO',
+            production_writes: 0
+          }, 422);
         }
         throw error;
       }

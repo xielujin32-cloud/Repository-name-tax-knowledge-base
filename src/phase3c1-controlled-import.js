@@ -11,6 +11,11 @@ export const PHASE3C1_IMPORT_MANIFEST_CONFIRMATION = 'FREEZE_PHASE3C1_FIRST_TEN'
 export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MANIFEST';
 const PHASE3C1_PREVIEW_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (phase3c1-controlled-preview)';
 const PHASE3C1_FETCH_TIMEOUT_MS = 20_000;
+// Keep synchronous collection below the platform ceiling and reserve time to
+// send a safe JSON response instead of allowing an opaque gateway 502.
+export const PHASE3C1_PREVIEW_TIME_BUDGET_MS = 45_000;
+const PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS = 5_000;
+const PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS = 1_000;
 const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
 const PHASE3C1_TRANSIENT_MAX_ATTEMPTS = 2;
 const PHASE3C1_TRANSIENT_RETRY_DELAY_MS = 5_000;
@@ -105,10 +110,10 @@ function metadataSuggestionFingerprint(metadata) {
  * shape. No credentials, cookies, referer, Accept, or Accept-Language are
  * added to an upstream China Tax request.
  */
-export function phase3c1OfficialFetchOptions() {
+export function phase3c1OfficialFetchOptions(timeout_ms = PHASE3C1_FETCH_TIMEOUT_MS) {
   return {
     headers: { 'user-agent': PHASE3C1_PREVIEW_USER_AGENT },
-    signal: AbortSignal.timeout(PHASE3C1_FETCH_TIMEOUT_MS)
+    signal: AbortSignal.timeout(timeout_ms)
   };
 }
 
@@ -124,9 +129,9 @@ export const PHASE3C1_FETCH_ENVIRONMENT = Object.freeze({
 });
 
 /** Shared upstream fetch used by preview, diagnostics, manifest, and Apply. */
-export async function fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl = fetch } = {}) {
+export async function fetchPhase3C1OfficialDetail(officialUrl, { fetchImpl = fetch, timeout_ms = PHASE3C1_FETCH_TIMEOUT_MS } = {}) {
   const requestedUrl = canonical(officialUrl);
-  const response = await fetchImpl(requestedUrl, phase3c1OfficialFetchOptions());
+  const response = await fetchImpl(requestedUrl, phase3c1OfficialFetchOptions(timeout_ms));
   const raw_html = await response.text();
   return { requested_url: requestedUrl, response, raw_html };
 }
@@ -242,7 +247,7 @@ function diagnosticItem({ ordinal, requested_url, response, raw_html }, { includ
  * text never become part of this object.
  */
 export class Phase3C1PreviewFailure extends Error {
-  constructor({ ordinal, stage, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, code = 'PREVIEW_ITEM_FAILED', upstream_attempts = [] } = {}) {
+  constructor({ ordinal, stage, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, code = 'PREVIEW_ITEM_FAILED', upstream_attempts = [], elapsed_ms = null, time_budget_ms = null } = {}) {
     super(`Phase 3C-1 Preview stopped at ordinal ${ordinal}.`);
     this.name = 'Phase3C1PreviewFailure';
     const hasHtml = typeof raw_html === 'string';
@@ -262,6 +267,8 @@ export class Phase3C1PreviewFailure extends Error {
       page_title: hasHtml ? safeTitle(raw_html) : null,
       selectors: hasHtml ? diagnosticSelectors(raw_html) : null,
       parser_error_code: parser_error_code || (hasHtml ? diagnosticParse(raw_html).error_code : null),
+      elapsed_ms,
+      time_budget_ms,
       upstream_attempts: Object.freeze([...(upstream_attempts || [])])
     });
   }
@@ -272,6 +279,52 @@ function phase3c1PreviewFailure(input) {
 }
 
 const waitFor = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function createPreviewTimeBudget({ time_budget_ms = PHASE3C1_PREVIEW_TIME_BUDGET_MS, clock = Date.now } = {}) {
+  if (!Number.isFinite(time_budget_ms) || time_budget_ms <= PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS + PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS) {
+    throw new TypeError('Phase 3C preview time budget is invalid.');
+  }
+  const started_at_ms = clock();
+  return Object.freeze({ time_budget_ms, clock, started_at_ms });
+}
+
+function elapsedPreviewBudgetMs(budget) {
+  return Math.max(0, budget.clock() - budget.started_at_ms);
+}
+
+function remainingPreviewBudgetMs(budget) {
+  return Math.max(0, budget.time_budget_ms - elapsedPreviewBudgetMs(budget));
+}
+
+function timeBudgetFailure({ budget, ordinal, processed_count, requested_url, response = null, raw_html = null, parser_error_code = null, upstream_attempts = [] } = {}) {
+  return phase3c1PreviewFailure({
+    ordinal,
+    stage: 'time-budget',
+    processed_count,
+    requested_url,
+    response,
+    raw_html,
+    parser_error_code,
+    code: 'PREVIEW_TIME_BUDGET_EXCEEDED',
+    elapsed_ms: elapsedPreviewBudgetMs(budget),
+    time_budget_ms: budget.time_budget_ms,
+    upstream_attempts
+  });
+}
+
+function fetchTimeoutWithinPreviewBudget({ budget, ordinal, processed_count, requested_url, upstream_attempts = [] } = {}) {
+  if (!budget) return PHASE3C1_FETCH_TIMEOUT_MS;
+  const remaining = remainingPreviewBudgetMs(budget);
+  if (remaining <= PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS + PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS) {
+    throw timeBudgetFailure({ budget, ordinal, processed_count, requested_url, upstream_attempts });
+  }
+  return Math.min(PHASE3C1_FETCH_TIMEOUT_MS, remaining - PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS);
+}
+
+function canWaitAndRetryWithinPreviewBudget(budget, delay_ms) {
+  if (!budget) return true;
+  return remainingPreviewBudgetMs(budget) > delay_ms + PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS + PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS;
+}
 
 function retryAfterDelay(headers) {
   const seconds = String(headers?.get?.('retry-after') || '').trim();
@@ -325,24 +378,31 @@ function retryDecision({ response = null, diagnostic = null, error = null } = {}
  * material collection. Diagnostics deliberately continue to call the raw
  * one-shot fetch helper so they expose upstream behavior without recovery.
  */
-export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl = fetch, waitImpl = waitFor, ordinal = null, processed_count = 0 } = {}) {
+export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl = fetch, waitImpl = waitFor, ordinal = null, processed_count = 0, preview_time_budget = null } = {}) {
   const requestedUrl = canonical(officialUrl);
   const upstreamAttempts = [];
   for (let attempt = 1; attempt <= PHASE3C1_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
     let fetched;
     try {
-      fetched = await fetchPhase3C1OfficialDetail(requestedUrl, { fetchImpl });
+      const timeout_ms = fetchTimeoutWithinPreviewBudget({ budget: preview_time_budget, ordinal, processed_count, requested_url: requestedUrl, upstream_attempts: upstreamAttempts });
+      fetched = await fetchPhase3C1OfficialDetail(requestedUrl, { fetchImpl, timeout_ms });
     } catch (error) {
+      if (error instanceof Phase3C1PreviewFailure) throw error;
       const decision = retryDecision({ error });
-      const canRetry = decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS;
+      const retryBudgetAllowsWait = canWaitAndRetryWithinPreviewBudget(preview_time_budget, decision.delay_ms);
+      const canRetry = decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && retryBudgetAllowsWait;
       upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: requestedUrl, fetch_error: error, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
       if (canRetry) { await waitImpl(decision.delay_ms); continue; }
+      if (decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && !retryBudgetAllowsWait) {
+        throw timeBudgetFailure({ budget: preview_time_budget, ordinal, processed_count, requested_url: requestedUrl, upstream_attempts: upstreamAttempts });
+      }
       throw phase3c1PreviewFailure({ ordinal, stage: 'fetch', processed_count, requested_url: requestedUrl, code: decision.code || 'UPSTREAM_FETCH_FAILED', upstream_attempts: upstreamAttempts });
     }
     const diagnostic = diagnosticItem({ ordinal, ...fetched });
     const decision = retryDecision({ response: fetched.response, diagnostic });
     const success = fetched.response.ok && diagnostic.parse.result === 'PASS';
-    const canRetry = !success && decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS;
+    const retryBudgetAllowsWait = canWaitAndRetryWithinPreviewBudget(preview_time_budget, decision.delay_ms);
+    const canRetry = !success && decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && retryBudgetAllowsWait;
     upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, diagnostic, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
     if (success) {
       let parsed;
@@ -351,6 +411,9 @@ export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { f
       return Object.freeze({ ...fetched, parsed, upstream_attempts: Object.freeze(upstreamAttempts) });
     }
     if (canRetry) { await waitImpl(decision.delay_ms); continue; }
+    if (!success && decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && !retryBudgetAllowsWait) {
+      throw timeBudgetFailure({ budget: preview_time_budget, ordinal, processed_count, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, parser_error_code: diagnostic.parse.error_code, upstream_attempts: upstreamAttempts });
+    }
     const stage = !fetched.response.ok ? 'http' : diagnostic.parse.error_code === 'POLICY_BODY_CONTAINER_MISSING' ? 'body-container' : 'parse';
     throw phase3c1PreviewFailure({ ordinal, stage, processed_count, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, parser_error_code: diagnostic.parse.error_code, code: decision.code || diagnostic.parse.error_code || 'UPSTREAM_HTTP_NOT_OK', upstream_attempts: upstreamAttempts });
   }
@@ -651,10 +714,11 @@ function attachSkipAudit(error, skipAudit) {
  * Evidence records or Blob objects. The caller can persist only its output
  * through the dedicated controlled-import repository method.
  */
-export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor } = {}) {
+export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor, time_budget_ms = PHASE3C1_PREVIEW_TIME_BUDGET_MS, clock = Date.now } = {}) {
   const items = [];
   const materials = [];
   const skipAudit = [];
+  const preview_time_budget = createPreviewTimeBudget({ time_budget_ms, clock });
   for (const candidate of PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
     if (items.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
     const ordinal = items.length + 1;
@@ -662,7 +726,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
     let fetched;
     try {
       fetched = await fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, {
-        fetchImpl, waitImpl, ordinal: candidate.original_rank, processed_count: items.length
+        fetchImpl, waitImpl, ordinal: candidate.original_rank, processed_count: items.length, preview_time_budget
       });
     } catch (error) {
       if (exhaustedTransientUpstreamFailure(error)) {

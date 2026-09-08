@@ -9,7 +9,7 @@ import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, PHASE3C1_PREVIEW_TIME_BUDGET_MS, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
 import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -337,6 +337,132 @@ test('Phase 3C Preview stays read-only and never retries a downstream risk/eligi
     assert.equal(result.body.failure.upstream_attempts.length, 1);
     assert.equal(repositoryFactoryCalls, 0);
     assert.deepEqual(calls, [PHASE3C1_FIXED_IMPORT_URLS[0]]);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
+test('Phase 3C Preview 在总预算内完成，并且不会改变既有 deterministic fallback 选择', async () => {
+  let monotonicNow = 0;
+  const preview = await preparePhase3C1ImportPreview({
+    fetchImpl: fakeFetch,
+    now: '2026-09-07T00:00:00.000Z',
+    clock: () => monotonicNow,
+    time_budget_ms: PHASE3C1_PREVIEW_TIME_BUDGET_MS
+  });
+  assert.equal(preview.items.length, 10);
+  assert.deepEqual(preview.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.equal(preview.skip_audit.length, 0);
+});
+
+test('Phase 3C Preview 在下一条 fetch 前总预算不足时 fail-closed，且不请求后续 URL', async () => {
+  let monotonicNow = 0;
+  const calls = [];
+  await assert.rejects(
+    () => preparePhase3C1ImportPreview({
+      fetchImpl: async (url) => {
+        const rank = poolRankFor(url); calls.push(rank);
+        monotonicNow = 39_000;
+        return new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+      },
+      clock: () => monotonicNow,
+      time_budget_ms: 45_000
+    }),
+    (error) => error instanceof Phase3C1PreviewFailure
+      && error.safe_diagnostic.failure_stage === 'time-budget'
+      && error.safe_diagnostic.failure_code === 'PREVIEW_TIME_BUDGET_EXCEEDED'
+      && error.safe_diagnostic.failed_ordinal === 2
+      && error.safe_diagnostic.successfully_processed_count === 1
+      && error.safe_diagnostic.elapsed_ms === 39_000
+      && error.safe_diagnostic.time_budget_ms === 45_000
+  );
+  assert.deepEqual(calls, [1]);
+});
+
+test('Phase 3C Preview 在 retry 前或 retry wait 会耗尽总预算时停止，不发送第二次或后续 URL', async () => {
+  let monotonicNow = 0;
+  const calls = [];
+  const waits = [];
+  const incomplete = '<html><body>temporary shell</body></html>';
+  await assert.rejects(
+    () => preparePhase3C1ImportPreview({
+      fetchImpl: async (url) => {
+        calls.push(poolRankFor(url));
+        monotonicNow = 39_000;
+        return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } });
+      },
+      waitImpl: async (milliseconds) => { waits.push(milliseconds); monotonicNow += milliseconds; },
+      clock: () => monotonicNow,
+      time_budget_ms: 45_000
+    }),
+    (error) => error instanceof Phase3C1PreviewFailure
+      && error.safe_diagnostic.failure_stage === 'time-budget'
+      && error.safe_diagnostic.failure_code === 'PREVIEW_TIME_BUDGET_EXCEEDED'
+      && error.safe_diagnostic.upstream_attempts.length === 1
+      && error.safe_diagnostic.upstream_attempts[0].retry_eligible === false
+      && error.safe_diagnostic.upstream_attempts[0].wait_before_next_ms === 0
+  );
+  assert.deepEqual(calls, [1]);
+  assert.deepEqual(waits, []);
+
+  monotonicNow = 0;
+  const recoveredCalls = [];
+  const recoveredWaits = [];
+  const recovered = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const rank = poolRankFor(url);
+      recoveredCalls.push(rank);
+      if (rank === 1 && recoveredCalls.length === 1) {
+        monotonicNow = 33_000;
+        return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } });
+      }
+      return new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+    },
+    waitImpl: async (milliseconds) => { recoveredWaits.push(milliseconds); monotonicNow += milliseconds; },
+    clock: () => monotonicNow,
+    time_budget_ms: 45_000
+  });
+  assert.equal(recovered.items.length, 10);
+  assert.deepEqual(recoveredCalls.slice(0, 2), [1, 1]);
+  assert.deepEqual(recoveredWaits, [5000]);
+  assert.equal(monotonicNow, 38_000, 'retry wait must leave the response reserve and must not exceed the total budget');
+});
+
+test('Phase 3C Preview 时间预算保留 retry wait 与安全返回窗口，且 422 只返回安全字段并保持只读', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-time-budget-token';
+  const secret = 'TIME_BUDGET_SECRET_MUST_NOT_LEAK';
+  let repositoryFactoryCalls = 0;
+  try {
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('time-budget preview must not open repository'); },
+      phase3c1PreviewFactory: async () => {
+        throw new Phase3C1PreviewFailure({
+          ordinal: 4,
+          stage: 'time-budget',
+          processed_count: 3,
+          requested_url: PHASE3C1_FIXED_IMPORT_URLS[3],
+          raw_html: `<html><body>${secret}</body></html>`,
+          code: 'PREVIEW_TIME_BUDGET_EXCEEDED',
+          elapsed_ms: 45_000,
+          time_budget_ms: 45_000
+        });
+      }
+    }) });
+    const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(result.response.status, 422);
+    assert.equal(result.body.mode, 'read_only_preview');
+    assert.equal(result.body.preview_result, 'BLOCKED');
+    assert.equal(result.body.failure.failure_code, 'PREVIEW_TIME_BUDGET_EXCEEDED');
+    assert.equal(result.body.failure.failed_ordinal, 4);
+    assert.equal(result.body.failure.successfully_processed_count, 3);
+    assert.equal(result.body.failure.elapsed_ms, 45_000);
+    assert.equal(result.body.failure.time_budget_ms, 45_000);
+    assert.equal(result.body.ready_to_create_frozen_manifest, 'NO');
+    assert.equal(result.body.production_writes, 0);
+    assert.equal(repositoryFactoryCalls, 0);
+    assert.equal(JSON.stringify(result.body).includes(secret), false);
+    assert.equal(JSON.stringify(result.body).includes(process.env.NETLIFY_TAXKB_ADMIN_TOKEN), false);
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
   }

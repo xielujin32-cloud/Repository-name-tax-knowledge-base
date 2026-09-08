@@ -31,7 +31,7 @@ test('Phase 3C Production Preview wrapper 使用隐藏 GUI Token 输入，且不
 
 test('Phase 3C Production Preview wrapper 只构造安全摘要并在 BLOCKED 时停止', async () => {
   const wrapper = await readFile(wrapperPath, 'utf8');
-  for (const required of ['preview_result', 'items_count', 'original_rank_index', 'skip_audit', 'fallback_item', 'ready_to_create_frozen_manifest', 'production_writes', 'Safe-Failure', 'Safe-PreviewItem']) {
+  for (const required of ['preview_result', 'items_count', 'original_rank_index', 'skip_audit', 'fallback_item', 'ready_to_create_frozen_manifest', 'production_writes', 'elapsed_ms', 'time_budget_ms', 'Safe-Failure', 'Safe-PreviewItem']) {
     assert.match(wrapper, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
   assert.match(wrapper, /preview_result = 'BLOCKED'/);

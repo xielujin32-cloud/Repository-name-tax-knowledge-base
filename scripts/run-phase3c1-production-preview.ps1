@@ -181,6 +181,8 @@ function Safe-Failure {
     page_title = Safe-Value $Failure.page_title
     selector_counts = Selector-Counts $Failure.selectors
     parser_error_code = Safe-Value $Failure.parser_error_code
+    elapsed_ms = $Failure.elapsed_ms
+    time_budget_ms = $Failure.time_budget_ms
     upstream_attempts = Safe-UpstreamAttempts $Failure.upstream_attempts
   }
 }
