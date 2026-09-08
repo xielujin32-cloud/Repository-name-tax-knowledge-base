@@ -5,7 +5,7 @@ import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-
 import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
 import { suggestEvidenceMetadata } from './evidence-metadata-suggestion.js';
 
-export const PHASE3C1_IMPORT_MANIFEST_KEY = 'phase3c1-first-ten-v1';
+export const PHASE3C1_IMPORT_MANIFEST_KEY = 'phase3c1-first-ten-v2-fallback';
 export const PHASE3C1_IMPORT_PARSER_VERSION = 'chinatax-evidence-2.1.0-dom-body';
 export const PHASE3C1_IMPORT_MANIFEST_CONFIRMATION = 'FREEZE_PHASE3C1_FIRST_TEN';
 export const PHASE3C2_CONTROLLED_APPLY_CONFIRMATION = 'APPLY_PHASE3C2_FROZEN_MANIFEST';
@@ -15,32 +15,8 @@ const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
 const PHASE3C1_TRANSIENT_MAX_ATTEMPTS = 2;
 const PHASE3C1_TRANSIENT_RETRY_DELAY_MS = 5_000;
 const PHASE3C1_RATE_LIMIT_MAX_DELAY_MS = 15_000;
-export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
-  selection_version: 'phase3c1-fixed-preview-v1',
-  source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
-  eligibility: Object.freeze([
-    'official STA policy detail URL', 'HTTP 200', 'supported DOM body extraction', 'no template contamination',
-    'title/issuing authority/publish date present', 'trusted document number', 'risk low with score 0',
-    'no document-number conflict', 'no suspected duplicate/version change', 'no relation proposal'
-  ]),
-  selection: 'Fixed ordinal allowlist below; browser input cannot add, remove, or reorder items.'
-});
-
-// This immutable list is the outcome of the accepted Phase 3C-0.5 dry-run.
-// It is deliberately server-owned: no request can replace it with URL, body,
-// Candidate, Policy, or legal-status input.
-export const PHASE3C1_FIXED_IMPORT_URLS = Object.freeze([
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5194512/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5211588/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193287/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5214066/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5207053/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193409/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193400/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193388/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193156/content.html',
-  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5210371/content.html'
-]);
+export const PHASE3C1_FALLBACK_SELECTION_RULE_VERSION = 'phase3c1-production-preview-fallback-v2';
+export const PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION = 'phase3c0-eligible-ranked-v1';
 
 const sha256 = (value) => createHash('sha256').update(String(value || '')).digest('hex');
 const stable = (value) => Array.isArray(value)
@@ -49,6 +25,73 @@ const stable = (value) => Array.isArray(value)
     ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`
     : JSON.stringify(value);
 const canonical = (value) => normalizeChinaTaxPolicyUrl(value) || (() => { const url = new URL(value); url.hash = ''; return url.toString(); })();
+
+// This server-owned pool is the deterministically ranked eligible subset of
+// the accepted Phase 3C-0 fifty-item audit. `original_index` is the source
+// position within those fifty records; `original_rank` is the established
+// diversity-sort order among the 21 entries that met every original rule.
+// It is intentionally data, not a title/URL-specific fallback branch.
+export const PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL = Object.freeze([
+  [4, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5194512/content.html'],
+  [41, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5211588/content.html'],
+  [21, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193287/content.html'],
+  [38, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5214066/content.html'],
+  [24, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5207053/content.html'],
+  [25, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193409/content.html'],
+  [22, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193400/content.html'],
+  [29, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193388/content.html'],
+  [11, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193156/content.html'],
+  [10, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5210371/content.html'],
+  [12, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193135/content.html'],
+  [50, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5194150/content.html'],
+  [42, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193839/content.html'],
+  [34, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193733/content.html'],
+  [35, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193688/content.html'],
+  [27, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193652/content.html'],
+  [18, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193228/content.html'],
+  [17, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193221/content.html'],
+  [14, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193201/content.html'],
+  [8, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193137/content.html'],
+  [9, 'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5193134/content.html']
+].map(([original_index, official_url], offset) => Object.freeze({
+  original_rank: offset + 1,
+  original_index,
+  official_url
+})));
+
+const candidatePoolShape = () => PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.map((item) => ({
+  original_rank: item.original_rank,
+  original_index: item.original_index,
+  official_url: item.official_url
+}));
+
+export const PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH = sha256(stable({
+  candidate_pool_version: PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION,
+  original_candidate_count: 50,
+  eligible_candidate_count: PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length,
+  candidates: candidatePoolShape()
+}));
+
+export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
+  selection_version: PHASE3C1_FALLBACK_SELECTION_RULE_VERSION,
+  source: 'Phase 3C-0 verified STA list.html through list_4.html, preserve page order, URL dedupe, first 50',
+  eligibility: Object.freeze([
+    'official STA policy detail URL', 'HTTP 200', 'supported DOM body extraction', 'no template contamination',
+    'title/issuing authority/publish date present', 'trusted document number', 'risk low with score 0',
+    'no document-number conflict', 'no suspected duplicate/version change', 'no relation proposal'
+  ]),
+  candidate_pool_version: PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION,
+  candidate_pool_hash: PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH,
+  original_candidate_count: 50,
+  eligible_candidate_count: PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length,
+  selection: 'Server-owned original eligible ranking; after exhausted transient upstream acquisition failure only, skip that rank for this preview and continue in rank order. Browser input cannot add, remove, reorder, or exclude items.'
+});
+
+// Existing diagnostics remain bound to the historical first ten and deliberately
+// do not use fallback, so they expose the raw upstream response behavior.
+export const PHASE3C1_FIXED_IMPORT_URLS = Object.freeze(
+  PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.slice(0, 10).map((item) => item.official_url)
+);
 // generated_at is audit metadata, not a change to the deterministic rule
 // output. Including it would incorrectly block a later preflight for exactly
 // the same official content.
@@ -466,6 +509,8 @@ export async function diagnosePhase3C1FullCadence({ fetchImpl = fetch, waitImpl 
 function frozenItemShape(item) {
   return {
     ordinal: item.ordinal,
+    original_rank: item.original_rank,
+    original_index: item.original_index,
     official_url: item.official_url,
     canonical_url: item.canonical_url,
     title: item.title,
@@ -544,6 +589,63 @@ function eligibilityProblems(item) {
   return issues;
 }
 
+function safeFallbackSkipRecord(candidate, failure) {
+  const diagnostic = failure?.safe_diagnostic || {};
+  return Object.freeze({
+    original_rank: candidate.original_rank,
+    original_index: candidate.original_index,
+    official_url: candidate.official_url,
+    failure_stage: diagnostic.failure_stage || null,
+    failure_code: diagnostic.failure_code || null,
+    attempts: Object.freeze([...(diagnostic.upstream_attempts || [])]),
+    http_status: diagnostic.http_status ?? null,
+    content_type: diagnostic.content_type ?? null,
+    final_url: diagnostic.final_url || candidate.official_url,
+    html_length: diagnostic.html_character_length ?? null,
+    html_sha256: diagnostic.html_sha256 ?? null,
+    page_title: diagnostic.page_title ?? null,
+    selector_counts: diagnostic.selectors ?? null,
+    parser_error_code: diagnostic.parser_error_code ?? null,
+    skip_reason: 'UPSTREAM_TRANSIENT_RETRY_EXHAUSTED'
+  });
+}
+
+function exhaustedTransientUpstreamFailure(error) {
+  if (!(error instanceof Phase3C1PreviewFailure)) return false;
+  const diagnostic = error.safe_diagnostic || {};
+  const attempts = diagnostic.upstream_attempts || [];
+  const allowedCode = [
+    'INCOMPLETE_HTML_200', 'UPSTREAM_HTTP_429', 'UPSTREAM_HTTP_502',
+    'UPSTREAM_HTTP_503', 'UPSTREAM_HTTP_504', 'UPSTREAM_FETCH_FAILED'
+  ].includes(diagnostic.failure_code);
+  return allowedCode
+    && ['fetch', 'http', 'body-container'].includes(diagnostic.failure_stage)
+    && attempts.length === PHASE3C1_TRANSIENT_MAX_ATTEMPTS
+    && attempts.some((attempt) => attempt.retry_eligible === true);
+}
+
+function selectionCriteriaFor(items, skipAudit) {
+  return Object.freeze({
+    ...PHASE3C1_IMPORT_SELECTION_CRITERIA,
+    selected: Object.freeze(items.map((item) => Object.freeze({
+      ordinal: item.ordinal,
+      original_rank: item.original_rank,
+      original_index: item.original_index,
+      official_url: item.official_url
+    }))),
+    skip_audit: Object.freeze([...skipAudit])
+  });
+}
+
+function attachSkipAudit(error, skipAudit) {
+  if (!(error instanceof Phase3C1PreviewFailure)) return error;
+  error.safe_diagnostic = Object.freeze({
+    ...error.safe_diagnostic,
+    selection_skip_audit: Object.freeze([...skipAudit])
+  });
+  return error;
+}
+
 /**
  * Read-only collection/parse/risk preview for the frozen 10. It creates no
  * Evidence records or Blob objects. The caller can persist only its output
@@ -552,16 +654,29 @@ function eligibilityProblems(item) {
 export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor } = {}) {
   const items = [];
   const materials = [];
-  for (const [offset, configuredUrl] of PHASE3C1_FIXED_IMPORT_URLS.entries()) {
-    const ordinal = offset + 1;
-    const officialUrl = canonical(configuredUrl);
-    const fetched = await fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl, waitImpl, ordinal, processed_count: items.length });
+  const skipAudit = [];
+  for (const candidate of PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
+    if (items.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
+    const ordinal = items.length + 1;
+    const officialUrl = canonical(candidate.official_url);
+    let fetched;
+    try {
+      fetched = await fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, {
+        fetchImpl, waitImpl, ordinal: candidate.original_rank, processed_count: items.length
+      });
+    } catch (error) {
+      if (exhaustedTransientUpstreamFailure(error)) {
+        skipAudit.push(safeFallbackSkipRecord(candidate, error));
+        continue;
+      }
+      throw attachSkipAudit(error, skipAudit);
+    }
     const { response, raw_html: rawHtml, parsed, upstream_attempts: upstreamAttempts } = fetched;
     let metadata;
     try {
       metadata = suggestEvidenceMetadata({ title: parsed.title, normalized_text: parsed.normalized_text, generated_at: now });
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'metadata', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'METADATA_SUGGESTION_FAILED', upstream_attempts: upstreamAttempts });
+      throw attachSkipAudit(phase3c1PreviewFailure({ ordinal: candidate.original_rank, stage: 'metadata', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'METADATA_SUGGESTION_FAILED', upstream_attempts: upstreamAttempts }), skipAudit);
     }
     const fields = {
       title: parsed.title,
@@ -579,16 +694,18 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
     try {
       risk = evaluateCandidateRisk(syntheticRiskDetail({ ordinal, officialUrl, rawHtml, parsed, fields }));
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'risk', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RISK_ASSESSMENT_FAILED', upstream_attempts: upstreamAttempts });
+      throw attachSkipAudit(phase3c1PreviewFailure({ ordinal: candidate.original_rank, stage: 'risk', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RISK_ASSESSMENT_FAILED', upstream_attempts: upstreamAttempts }), skipAudit);
     }
     let proposals;
     try {
       proposals = proposeCandidateRelations({ normalized_text: parsed.normalized_text });
     } catch {
-      throw phase3c1PreviewFailure({ ordinal, stage: 'relation', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RELATION_PROPOSAL_FAILED', upstream_attempts: upstreamAttempts });
+      throw attachSkipAudit(phase3c1PreviewFailure({ ordinal: candidate.original_rank, stage: 'relation', processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: 'RELATION_PROPOSAL_FAILED', upstream_attempts: upstreamAttempts }), skipAudit);
     }
     const item = {
       ordinal,
+      original_rank: candidate.original_rank,
+      original_index: candidate.original_index,
       official_url: officialUrl,
       canonical_url: officialUrl,
       http_status: response.status,
@@ -629,11 +746,13 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       const stage = issues.includes('RISK_NOT_LOW_ZERO') ? 'risk'
         : issues.includes('RELATION_PROPOSAL_PRESENT') ? 'relation'
           : 'eligibility';
-      throw phase3c1PreviewFailure({ ordinal, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0], upstream_attempts: upstreamAttempts });
+      throw attachSkipAudit(phase3c1PreviewFailure({ ordinal: candidate.original_rank, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0], upstream_attempts: upstreamAttempts }), skipAudit);
     }
     items.push(Object.freeze(item));
     materials.push(Object.freeze({
       ordinal,
+      original_rank: candidate.original_rank,
+      original_index: candidate.original_index,
       official_url: officialUrl,
       http_status: response.status,
       response_headers_subset: headersSubset(response.headers),
@@ -642,14 +761,24 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       normalized_text: parsed.normalized_text
     }));
   }
-  if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('Phase 3C-1 固定清单数量异常。');
+  if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) {
+    throw attachSkipAudit(phase3c1PreviewFailure({
+      ordinal: null,
+      stage: 'selection',
+      processed_count: items.length,
+      code: 'CANDIDATE_POOL_EXHAUSTED',
+      upstream_attempts: []
+    }), skipAudit);
+  }
+  const selectionCriteria = selectionCriteriaFor(items, skipAudit);
   const preview = Object.freeze({
     manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY,
-    selection_criteria: PHASE3C1_IMPORT_SELECTION_CRITERIA,
+    selection_criteria: selectionCriteria,
+    skip_audit: Object.freeze(skipAudit),
     created_at: now,
     items: Object.freeze(items),
     materials: Object.freeze(materials),
-    manifest_hash: phase3c1ManifestFingerprint({ items })
+    manifest_hash: phase3c1ManifestFingerprint({ items, selection_criteria: selectionCriteria })
   });
   const { materials: safeMaterials, ...publicPreview } = preview;
   return Object.freeze({ preview: Object.freeze(publicPreview), materials: safeMaterials });
@@ -658,6 +787,71 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
 /** Public/admin preview deliberately omits raw HTML and normalized text. */
 export async function preparePhase3C1ImportPreview(options = {}) {
   return (await collectPhase3C1ApplyMaterial(options)).preview;
+}
+
+function validSkipAuditRecord(record) {
+  const attempts = record?.attempts || [];
+  return record?.skip_reason === 'UPSTREAM_TRANSIENT_RETRY_EXHAUSTED'
+    && [
+      'INCOMPLETE_HTML_200', 'UPSTREAM_HTTP_429', 'UPSTREAM_HTTP_502',
+      'UPSTREAM_HTTP_503', 'UPSTREAM_HTTP_504', 'UPSTREAM_FETCH_FAILED'
+    ].includes(record?.failure_code)
+    && ['fetch', 'http', 'body-container'].includes(record?.failure_stage)
+    && attempts.length === PHASE3C1_TRANSIENT_MAX_ATTEMPTS
+    && attempts.some((attempt) => attempt?.retry_eligible === true);
+}
+
+function matchesCanonicalUrl(value, expected) {
+  try { return canonical(value) === expected; } catch { return false; }
+}
+
+/**
+ * Validates that a preview was selected solely from the immutable ranked pool.
+ * Repository callers use this as defence in depth: even an internal caller
+ * cannot submit a different URL, reorder the pool, or invent a skip record.
+ */
+export function validatePhase3C1FallbackSelection(preview) {
+  const issues = [];
+  const criteria = preview?.selection_criteria || {};
+  const items = Array.isArray(preview?.items) ? preview.items : [];
+  const selected = Array.isArray(criteria.selected) ? criteria.selected : [];
+  const skipAudit = Array.isArray(criteria.skip_audit) ? criteria.skip_audit : [];
+  if (criteria.selection_version !== PHASE3C1_FALLBACK_SELECTION_RULE_VERSION) issues.push('SELECTION_RULE_VERSION_INVALID');
+  if (criteria.candidate_pool_version !== PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION) issues.push('CANDIDATE_POOL_VERSION_INVALID');
+  if (criteria.candidate_pool_hash !== PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH) issues.push('CANDIDATE_POOL_HASH_INVALID');
+  if (Number(criteria.original_candidate_count) !== 50 || Number(criteria.eligible_candidate_count) !== PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length) issues.push('CANDIDATE_POOL_SIZE_INVALID');
+  if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length || selected.length !== items.length) issues.push('SELECTION_ITEM_COUNT_INVALID');
+  const poolByRank = new Map(PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.map((entry) => [entry.original_rank, entry]));
+  const skippedRanks = new Set();
+  for (const record of skipAudit) {
+    const entry = poolByRank.get(Number(record?.original_rank));
+    if (!entry || skippedRanks.has(entry.original_rank)
+      || Number(record?.original_index) !== entry.original_index
+      || !matchesCanonicalUrl(record?.official_url, entry.official_url)
+      || !validSkipAuditRecord(record)) issues.push('SKIP_AUDIT_INVALID');
+    skippedRanks.add(Number(record?.original_rank));
+  }
+  const expected = [];
+  for (const entry of PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
+    if (!skippedRanks.has(entry.original_rank)) expected.push(entry);
+    if (expected.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
+  }
+  if (expected.length !== PHASE3C1_FIXED_IMPORT_URLS.length) issues.push('CANDIDATE_POOL_EXHAUSTED');
+  for (const [offset, item] of items.entries()) {
+    const expectedEntry = expected[offset];
+    const selectionEntry = selected[offset];
+    if (!expectedEntry || Number(item?.ordinal) !== offset + 1
+      || Number(item?.original_rank) !== expectedEntry.original_rank
+      || Number(item?.original_index) !== expectedEntry.original_index
+      || !matchesCanonicalUrl(item?.official_url, expectedEntry.official_url)
+      || !selectionEntry
+      || Number(selectionEntry.ordinal) !== offset + 1
+      || Number(selectionEntry.original_rank) !== expectedEntry.original_rank
+      || Number(selectionEntry.original_index) !== expectedEntry.original_index
+      || !matchesCanonicalUrl(selectionEntry.official_url, expectedEntry.official_url)) issues.push('SELECTION_ORDER_INVALID');
+  }
+  if ([...skippedRanks].some((rank) => expected.some((item) => item.original_rank === rank))) issues.push('SKIPPED_ITEM_SELECTED');
+  return Object.freeze({ valid: issues.length === 0, issues: Object.freeze([...new Set(issues)]) });
 }
 
 /** Returns immutable-field mismatches without mutating an existing manifest. */
@@ -672,6 +866,8 @@ export function comparePhase3C1FrozenManifest(frozenItems, currentItems) {
     const before = frozen.get(ordinal);
     const after = current.get(ordinal);
     if (!after) { changes.push({ ordinal, code: 'MANIFEST_ITEM_MISSING' }); continue; }
+    if (Number(before.original_rank) !== Number(after.original_rank)) changes.push({ ordinal, code: 'ORIGINAL_RANK_CHANGED' });
+    if (Number(before.original_index) !== Number(after.original_index)) changes.push({ ordinal, code: 'ORIGINAL_INDEX_CHANGED' });
     if (before.official_url !== after.official_url) changes.push({ ordinal, code: 'OFFICIAL_URL_CHANGED' });
     if (before.body_hash !== after.body_hash) changes.push({ ordinal, code: 'BODY_HASH_CHANGED' });
     if (before.parser_version !== after.parser_version) changes.push({ ordinal, code: 'PARSER_VERSION_CHANGED' });

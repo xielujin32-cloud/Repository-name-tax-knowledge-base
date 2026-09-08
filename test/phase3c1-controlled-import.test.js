@@ -9,7 +9,7 @@ import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
 import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -37,6 +37,7 @@ function fakeFetch(url) {
   if (!index) return Promise.resolve(new Response('not found', { status: 404 }));
   return Promise.resolve(new Response(html(index), { status: 200, headers: { 'content-type': 'text/html' } }));
 }
+const poolRankFor = (url) => PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.find((item) => item.official_url === String(url))?.original_rank || 0;
 async function request(handler, pathname, { method = 'GET', token = '', body: input } = {}) {
   const response = await handler(new Request(`https://taxkb.example${pathname}`, {
     method,
@@ -149,19 +150,127 @@ test('Phase 3C transient retry only recovers a strictly incomplete 200 page and 
   assert.equal(JSON.stringify(preview).includes(incomplete), false);
 });
 
-test('Phase 3C transient retry fails closed after two incomplete pages and never fetches a later fixed URL', async () => {
-  const calls = [];
-  const waits = [];
+test('Phase 3C fallback keeps original rank 10 when its transient incomplete page recovers', async () => {
+  const calls = []; const waits = []; const attempts = new Map();
   const incomplete = '<html><body>temporary shell</body></html>';
-  await assert.rejects(
-    () => preparePhase3C1ImportPreview({ fetchImpl: async (url) => { calls.push(String(url)); return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } }); }, waitImpl: async (milliseconds) => { waits.push(milliseconds); } }),
-    (error) => error instanceof Phase3C1PreviewFailure
-      && error.safe_diagnostic.failed_ordinal === 1
-      && error.safe_diagnostic.upstream_attempts.length === 2
-      && error.safe_diagnostic.upstream_attempts.every((item) => item.parser_error_code === 'POLICY_BODY_CONTAINER_MISSING')
-  );
-  assert.deepEqual(calls, [PHASE3C1_FIXED_IMPORT_URLS[0], PHASE3C1_FIXED_IMPORT_URLS[0]]);
+  const preview = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const rank = poolRankFor(url); calls.push(rank); attempts.set(rank, (attempts.get(rank) || 0) + 1);
+      if (rank === 10 && attempts.get(rank) === 1) return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } });
+      return new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+    },
+    waitImpl: async (milliseconds) => { waits.push(milliseconds); }, now: '2026-09-07T00:00:00.000Z'
+  });
+  assert.deepEqual(preview.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  assert.deepEqual(preview.skip_audit, []);
+  assert.equal(calls.includes(11), false);
+  assert.equal(calls.filter((rank) => rank === 10).length, 2);
   assert.deepEqual(waits, [5000]);
+});
+
+test('Phase 3C fallback skips exhausted rank 10 and naturally selects original rank 11', async () => {
+  const calls = []; const waits = []; const incomplete = '<html><body>temporary shell</body></html>';
+  const preview = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const rank = poolRankFor(url); calls.push(rank);
+      return rank === 10
+        ? new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } })
+        : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+    }, waitImpl: async (milliseconds) => { waits.push(milliseconds); }, now: '2026-09-07T00:00:00.000Z'
+  });
+  assert.deepEqual(preview.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]);
+  assert.equal(preview.items[9].original_index, 12);
+  assert.equal(preview.items[9].official_url, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL[10].official_url);
+  assert.equal(preview.skip_audit.length, 1);
+  assert.deepEqual(preview.skip_audit[0].original_rank, 10);
+  assert.equal(preview.skip_audit[0].failure_code, 'INCOMPLETE_HTML_200');
+  assert.equal(preview.skip_audit[0].attempts.length, 2);
+  assert.equal(JSON.stringify(preview).includes(incomplete), false);
+  assert.deepEqual(calls, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11]);
+  assert.deepEqual(waits, [5000]);
+  assert.deepEqual(validatePhase3C1FallbackSelection(preview), { valid: true, issues: [] });
+  const repeated = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const rank = poolRankFor(url);
+      return rank === 10
+        ? new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } })
+        : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+    }, waitImpl: async () => {}, now: '2026-09-07T00:00:00.000Z'
+  });
+  assert.equal(repeated.manifest_hash, preview.manifest_hash, '相同上游结果必须产生相同的 fallback set、skip audit 与 manifest hash');
+  assert.deepEqual(repeated.selection_criteria, preview.selection_criteria);
+});
+
+test('Phase 3C fallback preview exposes only safe skip audit metadata and stays repository-free', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-fallback-token';
+  const secret = 'FALLBACK_UPSTREAM_HTML_MUST_NOT_LEAK';
+  let repositoryFactoryCalls = 0;
+  try {
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('Preview must not open repository'); },
+      fetchImpl: async (url) => {
+        const rank = poolRankFor(url);
+        return rank === 10
+          ? new Response(`<html><body>${secret}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } })
+          : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+      }
+    }) });
+    const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.preview.items[9].original_rank, 11);
+    assert.equal(result.body.preview.skip_audit[0].original_rank, 10);
+    const serialized = JSON.stringify(result.body);
+    assert.equal(serialized.includes(secret), false);
+    assert.equal(serialized.includes(process.env.NETLIFY_TAXKB_ADMIN_TOKEN), false);
+    assert.equal(repositoryFactoryCalls, 0);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
+test('Phase 3C fallback continues through multiple exhausted upstream candidates but fails closed when pool is insufficient', async () => {
+  const incomplete = '<html><body>temporary shell</body></html>';
+  const multipleCalls = [];
+  const multiple = await preparePhase3C1ImportPreview({
+    fetchImpl: async (url) => {
+      const rank = poolRankFor(url); multipleCalls.push(rank);
+      return [10, 11].includes(rank)
+        ? new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } })
+        : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+    }, waitImpl: async () => {}, now: '2026-09-07T00:00:00.000Z'
+  });
+  assert.deepEqual(multiple.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 12]);
+  assert.deepEqual(multiple.skip_audit.map((item) => item.original_rank), [10, 11]);
+  assert.deepEqual(multipleCalls.slice(-5), [9, 10, 10, 11, 11, 12].slice(-5));
+
+  await assert.rejects(
+    () => preparePhase3C1ImportPreview({
+      fetchImpl: async () => new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } }),
+      waitImpl: async () => {}
+    }),
+    (error) => error instanceof Phase3C1PreviewFailure
+      && error.safe_diagnostic.failure_stage === 'selection'
+      && error.safe_diagnostic.failure_code === 'CANDIDATE_POOL_EXHAUSTED'
+      && error.safe_diagnostic.selection_skip_audit.length === PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length
+  );
+});
+
+test('Phase 3C fallback never treats a business eligibility failure as an upstream skip', async () => {
+  const calls = [];
+  const missingDocumentNo = html(10).replace(/<h5 class="actfwzh">[\s\S]*?<\/h5>/, '');
+  await assert.rejects(
+    () => preparePhase3C1ImportPreview({
+      fetchImpl: async (url) => {
+        const rank = poolRankFor(url); calls.push(rank);
+        return new Response(rank === 10 ? missingDocumentNo : html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
+      }, waitImpl: async () => {}
+    }),
+    (error) => error instanceof Phase3C1PreviewFailure
+      && error.safe_diagnostic.failure_stage === 'risk'
+      && error.safe_diagnostic.selection_skip_audit.length === 0
+  );
+  assert.deepEqual(calls, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 });
 
 test('Phase 3C retry classifier caps transient HTTP and network failures, but never retries non-transient or complete-page parse failures', async () => {
@@ -231,6 +340,29 @@ test('Phase 3C Preview stays read-only and never retries a downstream risk/eligi
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
   }
+});
+
+test('Phase 3C preflight blocks any selection rule, pool hash, provenance, or body change', async () => {
+  const value = await fixture();
+  try {
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview, created_by: 'test-admin' });
+    for (const [mutate, expected] of [
+      [(current) => { current.selection_criteria.selection_version = 'unexpected-rule'; }, 'SELECTION_RULE_VERSION_CHANGED'],
+      [(current) => { current.selection_criteria.candidate_pool_hash = 'b'.repeat(64); }, 'CANDIDATE_POOL_HASH_CHANGED'],
+      [(current) => { current.selection_criteria.selected[9].original_rank = 11; }, 'SELECTION_PROVENANCE_CHANGED'],
+      [(current) => { current.items[0].body_hash = 'a'.repeat(64); }, 'BODY_HASH_CHANGED']
+    ]) {
+      const current = clone(preview); mutate(current);
+      const result = await value.repository.preflightControlledImportManifest(frozen.manifest.controlled_manifest_id, { current_preview: current });
+      assert.equal(result.validation.state, 'blocked');
+      assert.ok(result.validation.changes.some((change) => change.code === expected));
+    }
+    const injected = clone(preview);
+    injected.items[9].official_url = 'https://attacker.invalid/content.html';
+    injected.items[9].original_rank = 11;
+    assert.deepEqual(validatePhase3C1FallbackSelection(injected).valid, false, '候选 URL 或 original rank 不能由调用方替换');
+  } finally { await close(value); }
 });
 
 test('Phase 3C-1 预检只读识别 URL、可信文号、正文 hash、Candidate、Review、Policy 和公开投影', async () => {

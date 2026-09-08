@@ -4,7 +4,7 @@ import { POLICY_STATUSES } from './policy-schema.js';
 import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-risk-assessment.js';
 import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
 import { LOW_RISK_BATCH_CONFIRMATION, chooseSampleCandidateIds, confirmedFieldsFromLowRiskCandidate, lowRiskEligibility, manifestHash, sampleSizeForBatch } from './risk-review-queue.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint } from './phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint, validatePhase3C1FallbackSelection } from './phase3c1-controlled-import.js';
 import { CHINA_TAX_POLICY_SOURCE } from './chinatax-evidence-adapter.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
@@ -777,8 +777,10 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!preview || typeof preview !== 'object' || Array.isArray(preview)) throw new Error('Phase 3C-1 manifest 需要服务端 preview。');
     if (preview.manifest_key !== PHASE3C1_IMPORT_MANIFEST_KEY) throw new Error('Phase 3C-1 manifest key 无效。');
     if (!Array.isArray(preview.items) || preview.items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('Phase 3C-1 必须且只能冻结 10 条政策。');
+    const selection = validatePhase3C1FallbackSelection(preview);
+    if (!selection.valid) throw new Error(`Phase 3C-1 fallback selection 无效：${selection.issues.join(',')}`);
     for (const [offset, item] of preview.items.entries()) {
-      if (Number(item.ordinal) !== offset + 1 || canonical(item.official_url) !== PHASE3C1_FIXED_IMPORT_URLS[offset]) throw new Error('Phase 3C-1 只能使用服务器固定 URL 顺序。');
+      if (Number(item.ordinal) !== offset + 1) throw new Error('Phase 3C-1 frozen ordinal 无效。');
       if (!/^[a-f0-9]{64}$/.test(String(item.body_hash || ''))) throw new Error('Phase 3C-1 正文 hash 无效。');
       if (!item.document_no || item.document_no_provenance?.confidence !== 'high' || !['structured_field', 'title_nearby', 'body_lead'].includes(item.document_no_provenance?.source)) throw new Error('Phase 3C-1 需要可靠文号。');
       if (item.risk_assessment?.risk_level !== 'low' || Number(item.risk_assessment?.risk_score) !== 0) throw new Error('Phase 3C-1 仅允许 Low Risk 0 分条目。');
@@ -828,7 +830,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
           `INSERT INTO controlled_import_manifest_items (controlled_manifest_item_id,controlled_manifest_id,ordinal,official_url,canonical_url,title,document_no,document_no_provenance,issuing_authority,publish_date,effective_date,body_hash,parser_version,risk_assessment,metadata_suggestion,relation_proposals,item_fingerprint,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
           [id('controlled-import-manifest-item'), manifestId, item.ordinal, canonical(item.official_url), canonical(item.canonical_url || item.official_url), required(item.title, 'title'), required(item.document_no, 'document_no'), JSON.stringify(item.document_no_provenance), JSON.stringify(item.issuing_authority || []), required(item.publish_date, 'publish_date'), item.effective_date || null, required(item.body_hash, 'body_hash'), required(item.parser_version, 'parser_version'), JSON.stringify(item.risk_assessment), JSON.stringify(item.metadata_suggestion), JSON.stringify(item.relation_proposals), required(item.item_fingerprint, 'item_fingerprint'), timestamp]
         );
-        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length, upstream_attempts: phase3c1UpstreamAttemptAudit(preview) }), timestamp]);
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length, selection_criteria: preview.selection_criteria, skip_audit: preview.selection_criteria?.skip_audit || [], upstream_attempts: phase3c1UpstreamAttemptAudit(preview) }), timestamp]);
       });
       return { created: true, ...(await getControlledImportManifest(manifestId)) };
     });
@@ -841,9 +843,20 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const current = current_preview.items || [];
     const currentByOrdinal = new Map(current.map((item) => [Number(item.ordinal), item]));
     const changes = frozen.manifest.manifest_state === 'frozen' ? [] : [{ code: 'MANIFEST_NOT_FROZEN' }];
+    const frozenCriteria = frozen.manifest.selection_criteria || {};
+    const currentCriteria = current_preview.selection_criteria || {};
+    if (frozenCriteria.selection_version !== currentCriteria.selection_version) changes.push({ code: 'SELECTION_RULE_VERSION_CHANGED' });
+    if (frozenCriteria.candidate_pool_version !== currentCriteria.candidate_pool_version) changes.push({ code: 'CANDIDATE_POOL_VERSION_CHANGED' });
+    if (frozenCriteria.candidate_pool_hash !== currentCriteria.candidate_pool_hash) changes.push({ code: 'CANDIDATE_POOL_HASH_CHANGED' });
+    if (stable(frozenCriteria.selected || []) !== stable(currentCriteria.selected || [])) changes.push({ code: 'SELECTION_PROVENANCE_CHANGED' });
+    if (stable(frozenCriteria.skip_audit || []) !== stable(currentCriteria.skip_audit || [])) changes.push({ code: 'SKIP_AUDIT_CHANGED' });
+    const frozenSelectionByOrdinal = new Map((frozenCriteria.selected || []).map((item) => [Number(item.ordinal), item]));
     for (const item of frozen.items) {
       const fresh = currentByOrdinal.get(Number(item.ordinal));
       if (!fresh) { changes.push({ ordinal: item.ordinal, code: 'MANIFEST_ITEM_MISSING' }); continue; }
+      const frozenSelection = frozenSelectionByOrdinal.get(Number(item.ordinal));
+      if (!frozenSelection || Number(frozenSelection.original_rank) !== Number(fresh.original_rank)) changes.push({ ordinal: item.ordinal, code: 'ORIGINAL_RANK_CHANGED' });
+      if (!frozenSelection || Number(frozenSelection.original_index) !== Number(fresh.original_index)) changes.push({ ordinal: item.ordinal, code: 'ORIGINAL_INDEX_CHANGED' });
       if (item.official_url !== fresh.official_url) changes.push({ ordinal: item.ordinal, code: 'OFFICIAL_URL_CHANGED' });
       if (item.title !== fresh.title) changes.push({ ordinal: item.ordinal, code: 'TITLE_CHANGED' });
       if (item.document_no !== fresh.document_no) changes.push({ ordinal: item.ordinal, code: 'DOCUMENT_NO_CHANGED' });
@@ -884,7 +897,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     return { manifest: frozen.manifest, items: frozen.items, validation: { state: changes.length ? 'blocked' : 'ready', changes }, evidence_duplicates: duplicates, evidence_duplicate_free: duplicateConflicts.length === 0 };
   }
   function previewHash(preview) {
-    return sha256(stable({ manifest_key: preview?.manifest_key, manifest_hash: preview?.manifest_hash, items: preview?.items || [] }));
+    return sha256(stable({ manifest_key: preview?.manifest_key, manifest_hash: preview?.manifest_hash, selection_criteria: preview?.selection_criteria || {}, items: preview?.items || [] }));
   }
   function phase3c2Expired(value) {
     const date = new Date(value || 0);

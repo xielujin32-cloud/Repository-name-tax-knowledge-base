@@ -266,10 +266,13 @@ function safePhase3C1Preview(preview) {
   return {
     manifest_key: preview.manifest_key,
     selection_criteria: preview.selection_criteria,
+    skip_audit: preview.skip_audit || [],
     created_at: preview.created_at,
     manifest_hash: preview.manifest_hash,
     items: preview.items.map((item) => ({
       ordinal: item.ordinal,
+      original_rank: item.original_rank,
+      original_index: item.original_index,
       official_url: item.official_url,
       title: item.title,
       document_no: item.document_no,
