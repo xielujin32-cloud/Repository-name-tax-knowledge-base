@@ -4,7 +4,7 @@ import { POLICY_STATUSES } from './policy-schema.js';
 import { CANDIDATE_RISK_RULE_VERSION, evaluateCandidateRisk } from './candidate-risk-assessment.js';
 import { CANDIDATE_RELATION_RULE_VERSION, proposeCandidateRelations } from './candidate-relation-proposal.js';
 import { LOW_RISK_BATCH_CONFIRMATION, chooseSampleCandidateIds, confirmedFieldsFromLowRiskCandidate, lowRiskEligibility, manifestHash, sampleSizeForBatch } from './risk-review-queue.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint, validatePhase3C1FallbackSelection } from './phase3c1-controlled-import.js';
+import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_KEY, phase3c1ManifestFingerprint, validatePhase3C1FallbackSelection, phase3c1PreviewJobSelectionHash, phase3c1PreviewJobSelectionInput } from './phase3c1-controlled-import.js';
 import { CHINA_TAX_POLICY_SOURCE } from './chinatax-evidence-adapter.js';
 
 const sha256 = (value) => createHash('sha256').update(String(value)).digest('hex');
@@ -40,6 +40,13 @@ const controlledImportManifestItemRow = (row) => row && ({
 });
 const controlledImportPreflightRow = (row) => row && ({ ...row, validation: jsonObject(row.validation) });
 const controlledImportApplyRow = (row) => row && ({ ...row, result: jsonObject(row.result) });
+const phase3c1PreviewJobRow = (row) => row && ({ ...row, selection_input: jsonObject(row.selection_input), selected_items: jsonObject(row.selected_items, []), skip_audit: jsonObject(row.skip_audit, []), safe_failure: jsonObject(row.safe_failure) });
+const PHASE3C1_PREVIEW_JOB_STALE_AFTER_MS = 20 * 60_000;
+const phase3c1PreviewJobIsStale = (row, timestamp) => {
+  if (!row || !['queued', 'running'].includes(row.job_state)) return false;
+  const observed = Date.parse(row.heartbeat_at || row.started_at || row.created_at || ''); const current = Date.parse(timestamp || '');
+  return Number.isFinite(observed) && Number.isFinite(current) && current - observed > PHASE3C1_PREVIEW_JOB_STALE_AFTER_MS;
+};
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
@@ -773,11 +780,11 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('该 Candidate 正在审核中，请稍后重试。');
     return locked.result;
   }
-  function validatePhase3C1Preview(preview) {
+  function validatePhase3C1Preview(preview, frozen_selection_input = null) {
     if (!preview || typeof preview !== 'object' || Array.isArray(preview)) throw new Error('Phase 3C-1 manifest 需要服务端 preview。');
     if (preview.manifest_key !== PHASE3C1_IMPORT_MANIFEST_KEY) throw new Error('Phase 3C-1 manifest key 无效。');
     if (!Array.isArray(preview.items) || preview.items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('Phase 3C-1 必须且只能冻结 10 条政策。');
-    const selection = validatePhase3C1FallbackSelection(preview);
+    const selection = validatePhase3C1FallbackSelection(preview, frozen_selection_input);
     if (!selection.valid) throw new Error(`Phase 3C-1 fallback selection 无效：${selection.issues.join(',')}`);
     for (const [offset, item] of preview.items.entries()) {
       if (Number(item.ordinal) !== offset + 1) throw new Error('Phase 3C-1 frozen ordinal 无效。');
@@ -1096,6 +1103,43 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('controlled import Apply 正在执行，请稍后重试。');
     return locked.result;
   }
+  // Preview Jobs are audit-only. Their selection input is built here from the
+  // immutable server-owned pool; callers cannot submit URLs, ranks or excludes.
+  async function createPhase3C1PreviewJob({ created_by = 'netlify-admin' } = {}) {
+    const selectionInput = phase3c1PreviewJobSelectionInput(); const selectionHash = phase3c1PreviewJobSelectionHash();
+    const locked = await withExclusiveLock(`taxkb:phase3c1-preview-job:${selectionHash}`, async () => {
+      const active = (await pool.query("SELECT * FROM phase3c1_preview_jobs WHERE selection_hash=$1 AND job_state IN ('queued','running') ORDER BY created_at DESC LIMIT 1", [selectionHash])).rows[0];
+      if (active && !phase3c1PreviewJobIsStale(active, clock())) return { created: false, job: phase3c1PreviewJobRow(active) };
+      const timestamp = clock(); const jobId = id('phase3c1-preview-job');
+      await transaction(async (client) => {
+        if (active) {
+          await client.query(`UPDATE phase3c1_preview_jobs SET job_state='failed',failure_code='PREVIEW_JOB_STALE',safe_failure=$2,completed_at=$3,updated_at=$3,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state IN ('queued','running')`, [active.job_id, JSON.stringify({ failure_stage: 'worker-liveness', failure_code: 'PREVIEW_JOB_STALE' }), timestamp]);
+        }
+        await client.query(`INSERT INTO phase3c1_preview_jobs (job_id,phase,job_mode,job_state,selection_rule_version,candidate_pool_version,candidate_pool_hash,selection_input,selection_hash,created_by,created_at,updated_at) VALUES ($1,'phase3c1','production_preview','queued',$2,$3,$4,$5,$6,$7,$8,$8)`, [jobId, selectionInput.selection_rule_version, selectionInput.candidate_pool_version, selectionInput.candidate_pool_hash, JSON.stringify(selectionInput), selectionHash, required(created_by, 'created_by'), timestamp]);
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'phase3c1_preview_job', jobId, 'phase3c1_preview_job_queued', JSON.stringify({ selection_hash: selectionHash, business_production_writes: 0 }), timestamp]);
+      });
+      return { created: true, job: phase3c1PreviewJobRow((await pool.query('SELECT * FROM phase3c1_preview_jobs WHERE job_id=$1', [jobId])).rows[0]) };
+    });
+    if (!locked.acquired) throw new Error('Phase 3C1 Preview Job 正在创建，请稍后重试。'); return locked.result;
+  }
+  async function getPhase3C1PreviewJob(jobId) { const row = (await pool.query('SELECT * FROM phase3c1_preview_jobs WHERE job_id=$1', [required(jobId, 'job_id')])).rows[0]; if (!row) throw new Error('Phase 3C1 Preview Job 不存在。'); return { ...phase3c1PreviewJobRow(row), is_stale: phase3c1PreviewJobIsStale(row, clock()) }; }
+  async function beginPhase3C1PreviewJob(jobId) {
+    const timestamp = clock(); const result = await pool.query("UPDATE phase3c1_preview_jobs SET job_state='running',started_at=COALESCE(started_at,$2),heartbeat_at=$2,updated_at=$2,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='queued' RETURNING *", [required(jobId, 'job_id'), timestamp]);
+    if (!result.rows[0]) return { claimed: false, job: await getPhase3C1PreviewJob(jobId) };
+    return { claimed: true, job: phase3c1PreviewJobRow(result.rows[0]) };
+  }
+  async function updatePhase3C1PreviewJobProgress(jobId, progress = {}) {
+    const timestamp = clock(); const result = await pool.query(`UPDATE phase3c1_preview_jobs SET completed_count=$2,current_ordinal=$3,selected_items=$4,skip_audit=$5,heartbeat_at=$6,updated_at=$6,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='running' RETURNING *`, [required(jobId, 'job_id'), Number(progress.completed_count || 0), progress.current_ordinal ?? null, JSON.stringify(progress.selected_items || []), JSON.stringify(progress.skip_audit || []), timestamp]);
+    if (!result.rows[0]) throw new Error('Phase 3C1 Preview Job 不再处于 running 状态。'); return phase3c1PreviewJobRow(result.rows[0]);
+  }
+  async function finishPhase3C1PreviewJob(jobId, { preview, state, failure = null, frozen_selection_input = null } = {}) {
+    const timestamp = clock(); const isPassed = state === 'passed';
+    if (isPassed) validatePhase3C1Preview(preview, frozen_selection_input);
+    const result = await pool.query(`UPDATE phase3c1_preview_jobs SET job_state=$2,completed_count=$3,current_ordinal=$4,selected_items=$5,skip_audit=$6,failure_code=$7,safe_failure=$8,result_hash=$9,heartbeat_at=$10,completed_at=$10,updated_at=$10,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='running' RETURNING *`, [required(jobId, 'job_id'), state, isPassed ? 10 : Number(failure?.successfully_processed_count || 0), isPassed ? 10 : failure?.failed_ordinal ?? null, JSON.stringify(isPassed ? preview.selection_criteria.selected : []), JSON.stringify(isPassed ? preview.skip_audit : failure?.selection_skip_audit || []), isPassed ? null : failure?.failure_code || 'PREVIEW_JOB_WORKER_FAILED', JSON.stringify(isPassed ? {} : failure || {}), isPassed ? preview.manifest_hash : null, timestamp]);
+    if (!result.rows[0]) throw new Error('Phase 3C1 Preview Job 未能完成。'); return phase3c1PreviewJobRow(result.rows[0]);
+  }
+  async function blockPhase3C1PreviewJob(jobId, failure) { return finishPhase3C1PreviewJob(jobId, { state: 'blocked', failure }); }
+  async function failPhase3C1PreviewJob(jobId, failure = {}) { return finishPhase3C1PreviewJob(jobId, { state: 'failed', failure: { failure_code: 'PREVIEW_JOB_WORKER_FAILED', failure_stage: 'worker', ...failure } }); }
   async function hasCompletedCandidatesForUrls({ source_id, canonical_urls = [] } = {}) {
     const urls = [...new Set(canonical_urls.map(canonical))];
     if (!required(source_id, 'source_id') || !urls.length) return false;
@@ -1137,5 +1181,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

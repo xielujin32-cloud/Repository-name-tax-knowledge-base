@@ -35,6 +35,31 @@ function defaultRepositoryFactory() {
   return createPostgresEvidenceRepository({ objectStore: createNetlifyBlobsEvidenceObjectStore() });
 }
 
+async function defaultPhase3C1PreviewJobDispatcher({ job_id }) {
+  const baseUrl = String(process.env.URL || '').replace(/\/$/, '');
+  const dispatchToken = String(process.env.NETLIFY_PHASE3C1_PREVIEW_JOB_DISPATCH_TOKEN || '');
+  if (!baseUrl || !dispatchToken) throw new Error('Phase 3C1 Preview Job dispatcher 未配置。');
+  const response = await fetch(`${baseUrl}/.netlify/functions/phase3c1-preview-job-background`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-phase3c1-preview-dispatch': dispatchToken }, body: JSON.stringify({ job_id })
+  });
+  if (!response.ok && response.status !== 202) throw new Error('Phase 3C1 Preview Job 未能调度。');
+}
+
+function safePhase3C1PreviewJob(job) {
+  const stale = Boolean(job?.is_stale);
+  const status = stale ? 'failed' : (job?.job_state || 'failed');
+  return {
+    job_id: job?.job_id || null, phase: 'phase3c1', mode: 'production_preview', status,
+    completed_count: Number(job?.completed_count || 0), total_count: Number(job?.total_count || 10), current_ordinal: job?.current_ordinal ?? null,
+    selection_rule_version: job?.selection_rule_version || null, candidate_pool_version: job?.candidate_pool_version || null,
+    candidate_pool_hash: job?.candidate_pool_hash || null, selection_hash: job?.selection_hash || null,
+    selected_items: Array.isArray(job?.selected_items) ? job.selected_items : [], skip_audit: Array.isArray(job?.skip_audit) ? job.skip_audit : [],
+    failure_code: stale ? 'PREVIEW_JOB_STALE' : (job?.failure_code || null), failure: stale ? { failure_stage: 'worker-liveness', failure_code: 'PREVIEW_JOB_STALE' } : (job?.safe_failure || null), result_hash: job?.result_hash || null,
+    preview_job_audit_writes: Number(job?.preview_job_audit_writes || 0), business_production_writes: 0,
+    ready_to_create_frozen_manifest: status === 'passed' ? 'YES' : 'NO'
+  };
+}
+
 function safeCandidate(candidate) {
   return {
     candidate_id: candidate.candidate_id,
@@ -638,7 +663,7 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1PreviewJobDispatcher = defaultPhase3C1PreviewJobDispatcher, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
@@ -683,6 +708,17 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
         }
         throw error;
       }
+    }
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/phase3c1/import-preview-jobs') {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length) return json({ error: 'Phase 3C1 Preview Job 不接受 URL、ordinal、rank、候选或任何参数。' }, 400);
+      const result = await repositoryFactory().createPhase3C1PreviewJob();
+      try { await phase3c1PreviewJobDispatcher({ job_id: result.job.job_id }); }
+      catch { return json({ job: safePhase3C1PreviewJob(result.job), dispatch: 'not_scheduled', business_production_writes: 0 }, 503); }
+      return json({ created: result.created, dispatch: 'scheduled', job: safePhase3C1PreviewJob(result.job), business_production_writes: 0 }, result.created ? 202 : 200);
+    }
+    if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-preview-jobs\/[^/]+$/.test(pathname)) {
+      return json({ job: safePhase3C1PreviewJob(await repositoryFactory().getPhase3C1PreviewJob(decodeURIComponent(pathname.split('/').pop()))), business_production_writes: 0 });
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics') {
       return json(await diagnosePhase3C1ImportPreview({ fetchImpl }));

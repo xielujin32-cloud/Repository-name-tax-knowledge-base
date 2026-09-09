@@ -14,6 +14,10 @@ const PHASE3C1_FETCH_TIMEOUT_MS = 20_000;
 // Keep synchronous collection below the platform ceiling and reserve time to
 // send a safe JSON response instead of allowing an opaque gateway 502.
 export const PHASE3C1_PREVIEW_TIME_BUDGET_MS = 45_000;
+// Background Preview Jobs deliberately have a separate budget. They retain
+// the same parser/retry/fail-closed rules, but are not constrained by the
+// synchronous API gateway lifetime.
+export const PHASE3C1_ASYNC_PREVIEW_TIME_BUDGET_MS = 12 * 60_000;
 const PHASE3C1_PREVIEW_RESPONSE_RESERVE_MS = 5_000;
 const PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS = 1_000;
 const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
@@ -70,12 +74,62 @@ const candidatePoolShape = () => PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.map((
   official_url: item.official_url
 }));
 
+const poolHashFor = ({ candidate_pool_version, candidate_pool }) => sha256(stable({
+  candidate_pool_version,
+  original_candidate_count: 50,
+  eligible_candidate_count: candidate_pool.length,
+  candidates: candidate_pool.map(({ original_rank, original_index, official_url }) => ({ original_rank, original_index, official_url }))
+}));
+
+function frozenCandidatePoolSnapshot(candidatePool = PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
+  return Object.freeze(candidatePool.map((item, offset) => Object.freeze({
+    frozen_pool_ordinal: offset + 1,
+    original_rank: item.original_rank,
+    original_index: item.original_index,
+    official_url: canonical(item.official_url),
+    candidate_key: sha256(stable({ original_rank: item.original_rank, original_index: item.original_index, official_url: canonical(item.official_url) }))
+  })));
+}
+
 export const PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH = sha256(stable({
   candidate_pool_version: PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION,
   original_candidate_count: 50,
   eligible_candidate_count: PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length,
   candidates: candidatePoolShape()
 }));
+
+export function phase3c1PreviewJobSelectionInput() {
+  const frozen_candidate_pool = frozenCandidatePoolSnapshot();
+  return Object.freeze({
+    phase: 'phase3c1', mode: 'production_preview', manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY,
+    selection_rule_version: PHASE3C1_FALLBACK_SELECTION_RULE_VERSION,
+    candidate_pool_version: PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION,
+    candidate_pool_hash: PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH,
+    original_candidate_count: 50, eligible_candidate_count: frozen_candidate_pool.length,
+    total_count: PHASE3C1_FIXED_IMPORT_URLS.length, frozen_candidate_pool
+  });
+}
+export function phase3c1PreviewJobSelectionHash() { return sha256(stable(phase3c1PreviewJobSelectionInput())); }
+
+/** Validates only the durable Job snapshot, never the current module pool. */
+export function validatePhase3C1PreviewJobSelectionInput(input) {
+  const fail = () => { throw new Error('FROZEN_SELECTION_INPUT_INVALID'); };
+  if (!input || input.phase !== 'phase3c1' || input.mode !== 'production_preview' || input.manifest_key !== PHASE3C1_IMPORT_MANIFEST_KEY
+    || !String(input.selection_rule_version || '').trim() || !String(input.candidate_pool_version || '').trim()
+    || !/^[a-f0-9]{64}$/.test(String(input.candidate_pool_hash || '')) || Number(input.total_count) !== 10
+    || Number(input.original_candidate_count) !== 50 || !Array.isArray(input.frozen_candidate_pool) || input.frozen_candidate_pool.length < 10) fail();
+  const seenRank = new Set(); const seenIndex = new Set(); const seenUrl = new Set();
+  const pool = input.frozen_candidate_pool.map((item, offset) => {
+    if (!item || Number(item.frozen_pool_ordinal) !== offset + 1 || Number(item.original_rank) !== offset + 1 || !Number.isInteger(Number(item.original_index))) fail();
+    let official_url; try { official_url = canonical(item.official_url); } catch { fail(); }
+    const candidate_key = sha256(stable({ original_rank: Number(item.original_rank), original_index: Number(item.original_index), official_url }));
+    if (item.candidate_key !== candidate_key || seenRank.has(Number(item.original_rank)) || seenIndex.has(Number(item.original_index)) || seenUrl.has(official_url)) fail();
+    seenRank.add(Number(item.original_rank)); seenIndex.add(Number(item.original_index)); seenUrl.add(official_url);
+    return Object.freeze({ frozen_pool_ordinal: Number(item.frozen_pool_ordinal), original_rank: Number(item.original_rank), original_index: Number(item.original_index), official_url, candidate_key });
+  });
+  if (Number(input.eligible_candidate_count) !== pool.length || poolHashFor({ candidate_pool_version: input.candidate_pool_version, candidate_pool: pool }) !== input.candidate_pool_hash) fail();
+  return Object.freeze({ ...input, frozen_candidate_pool: Object.freeze(pool) });
+}
 
 export const PHASE3C1_IMPORT_SELECTION_CRITERIA = Object.freeze({
   selection_version: PHASE3C1_FALLBACK_SELECTION_RULE_VERSION,
@@ -687,9 +741,17 @@ function exhaustedTransientUpstreamFailure(error) {
     && attempts.some((attempt) => attempt.retry_eligible === true);
 }
 
-function selectionCriteriaFor(items, skipAudit) {
+function selectionCriteriaFor(items, skipAudit, frozenSelection = null) {
+  const pool = frozenSelection?.frozen_candidate_pool || PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL;
   return Object.freeze({
     ...PHASE3C1_IMPORT_SELECTION_CRITERIA,
+    ...(frozenSelection ? {
+      selection_version: frozenSelection.selection_rule_version,
+      candidate_pool_version: frozenSelection.candidate_pool_version,
+      candidate_pool_hash: frozenSelection.candidate_pool_hash,
+      original_candidate_count: frozenSelection.original_candidate_count,
+      eligible_candidate_count: pool.length
+    } : {}),
     selected: Object.freeze(items.map((item) => Object.freeze({
       ordinal: item.ordinal,
       original_rank: item.original_rank,
@@ -714,12 +776,16 @@ function attachSkipAudit(error, skipAudit) {
  * Evidence records or Blob objects. The caller can persist only its output
  * through the dedicated controlled-import repository method.
  */
-export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor, time_budget_ms = PHASE3C1_PREVIEW_TIME_BUDGET_MS, clock = Date.now } = {}) {
+export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = new Date().toISOString(), waitImpl = waitFor, time_budget_ms = PHASE3C1_PREVIEW_TIME_BUDGET_MS, clock = Date.now, onProgress = null, frozen_selection_input = null } = {}) {
   const items = [];
   const materials = [];
   const skipAudit = [];
   const preview_time_budget = createPreviewTimeBudget({ time_budget_ms, clock });
-  for (const candidate of PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
+  // A Job can supply only its already-validated durable snapshot. The normal
+  // synchronous Preview remains bound to the compiled server-owned pool.
+  const frozenSelection = frozen_selection_input ? validatePhase3C1PreviewJobSelectionInput(frozen_selection_input) : null;
+  const candidatePool = frozenSelection?.frozen_candidate_pool || PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL;
+  for (const candidate of candidatePool) {
     if (items.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
     const ordinal = items.length + 1;
     const officialUrl = canonical(candidate.official_url);
@@ -731,6 +797,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
     } catch (error) {
       if (exhaustedTransientUpstreamFailure(error)) {
         skipAudit.push(safeFallbackSkipRecord(candidate, error));
+        if (onProgress) await onProgress(Object.freeze({ current_ordinal: candidate.original_rank, completed_count: items.length, total_count: PHASE3C1_FIXED_IMPORT_URLS.length, selected_items: selectionCriteriaFor(items, [], frozenSelection).selected, skip_audit: Object.freeze([...skipAudit]) }));
         continue;
       }
       throw attachSkipAudit(error, skipAudit);
@@ -824,6 +891,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       raw_html: rawHtml,
       normalized_text: parsed.normalized_text
     }));
+    if (onProgress) await onProgress(Object.freeze({ current_ordinal: candidate.original_rank, completed_count: items.length, total_count: PHASE3C1_FIXED_IMPORT_URLS.length, selected_items: selectionCriteriaFor(items, [], frozenSelection).selected, skip_audit: Object.freeze([...skipAudit]) }));
   }
   if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) {
     throw attachSkipAudit(phase3c1PreviewFailure({
@@ -834,7 +902,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       upstream_attempts: []
     }), skipAudit);
   }
-  const selectionCriteria = selectionCriteriaFor(items, skipAudit);
+  const selectionCriteria = selectionCriteriaFor(items, skipAudit, frozenSelection);
   const preview = Object.freeze({
     manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY,
     selection_criteria: selectionCriteria,
@@ -874,18 +942,25 @@ function matchesCanonicalUrl(value, expected) {
  * Repository callers use this as defence in depth: even an internal caller
  * cannot submit a different URL, reorder the pool, or invent a skip record.
  */
-export function validatePhase3C1FallbackSelection(preview) {
+export function validatePhase3C1FallbackSelection(preview, frozen_selection_input = null) {
   const issues = [];
   const criteria = preview?.selection_criteria || {};
   const items = Array.isArray(preview?.items) ? preview.items : [];
   const selected = Array.isArray(criteria.selected) ? criteria.selected : [];
   const skipAudit = Array.isArray(criteria.skip_audit) ? criteria.skip_audit : [];
-  if (criteria.selection_version !== PHASE3C1_FALLBACK_SELECTION_RULE_VERSION) issues.push('SELECTION_RULE_VERSION_INVALID');
-  if (criteria.candidate_pool_version !== PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION) issues.push('CANDIDATE_POOL_VERSION_INVALID');
-  if (criteria.candidate_pool_hash !== PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH) issues.push('CANDIDATE_POOL_HASH_INVALID');
-  if (Number(criteria.original_candidate_count) !== 50 || Number(criteria.eligible_candidate_count) !== PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.length) issues.push('CANDIDATE_POOL_SIZE_INVALID');
+  let frozenSelection = null;
+  try { frozenSelection = frozen_selection_input ? validatePhase3C1PreviewJobSelectionInput(frozen_selection_input) : null; }
+  catch { return Object.freeze({ valid: false, issues: Object.freeze(['FROZEN_SELECTION_INPUT_INVALID']) }); }
+  const pool = frozenSelection?.frozen_candidate_pool || PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL;
+  const selectionVersion = frozenSelection?.selection_rule_version || PHASE3C1_FALLBACK_SELECTION_RULE_VERSION;
+  const poolVersion = frozenSelection?.candidate_pool_version || PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION;
+  const poolHash = frozenSelection?.candidate_pool_hash || PHASE3C1_ORIGINAL_CANDIDATE_POOL_HASH;
+  if (criteria.selection_version !== selectionVersion) issues.push('SELECTION_RULE_VERSION_INVALID');
+  if (criteria.candidate_pool_version !== poolVersion) issues.push('CANDIDATE_POOL_VERSION_INVALID');
+  if (criteria.candidate_pool_hash !== poolHash) issues.push('CANDIDATE_POOL_HASH_INVALID');
+  if (Number(criteria.original_candidate_count) !== 50 || Number(criteria.eligible_candidate_count) !== pool.length) issues.push('CANDIDATE_POOL_SIZE_INVALID');
   if (items.length !== PHASE3C1_FIXED_IMPORT_URLS.length || selected.length !== items.length) issues.push('SELECTION_ITEM_COUNT_INVALID');
-  const poolByRank = new Map(PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.map((entry) => [entry.original_rank, entry]));
+  const poolByRank = new Map(pool.map((entry) => [entry.original_rank, entry]));
   const skippedRanks = new Set();
   for (const record of skipAudit) {
     const entry = poolByRank.get(Number(record?.original_rank));
@@ -896,7 +971,7 @@ export function validatePhase3C1FallbackSelection(preview) {
     skippedRanks.add(Number(record?.original_rank));
   }
   const expected = [];
-  for (const entry of PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL) {
+  for (const entry of pool) {
     if (!skippedRanks.has(entry.original_rank)) expected.push(entry);
     if (expected.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
   }
