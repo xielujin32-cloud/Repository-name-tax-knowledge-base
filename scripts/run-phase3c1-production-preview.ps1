@@ -2,9 +2,13 @@
 param()
 
 # This wrapper deliberately has no URL, endpoint, rank, or query parameters.
-# It performs exactly one GET of the server-owned Phase 3C preview endpoint.
+# It creates one server-owned Phase 3C asynchronous Preview Job, then polls only
+# that returned Job's fixed status endpoint. It never creates a manifest or Apply.
 $ErrorActionPreference = 'Stop'
-$previewUrl = 'https://xielujin-tax-knowledge-base.netlify.app/api/admin/evidence/phase3c1/import-preview'
+$createJobUrl = 'https://xielujin-tax-knowledge-base.netlify.app/api/admin/evidence/phase3c1/import-preview-jobs'
+$jobStatusUrlPrefix = 'https://xielujin-tax-knowledge-base.netlify.app/api/admin/evidence/phase3c1/import-preview-jobs'
+$pollIntervalMs = 5000
+$pollTimeoutMs = 900000
 $token = $null
 $tokenBstr = [IntPtr]::Zero
 $stage = 'token_input'
@@ -15,7 +19,7 @@ function Read-GuiSecureString {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
   $form = New-Object System.Windows.Forms.Form
-  $form.Text = 'Phase 3C 只读 Production Preview'
+  $form.Text = 'Phase 3C Production Preview Job'
   $form.StartPosition = 'CenterScreen'
   $form.Size = New-Object System.Drawing.Size(560, 190)
   $form.FormBorderStyle = 'FixedDialog'
@@ -36,7 +40,7 @@ function Read-GuiSecureString {
   $form.Controls.Add($input)
 
   $ok = New-Object System.Windows.Forms.Button
-  $ok.Text = '执行一次只读 Preview'
+  $ok.Text = '创建只读 Preview Job'
   $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
   $ok.Location = New-Object System.Drawing.Point(285, 95)
   $form.Controls.Add($ok)
@@ -54,16 +58,12 @@ function Read-GuiSecureString {
   $plainValue = $input.Text
   $input.Clear()
   $form.Dispose()
-  if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
-    throw [System.OperationCanceledException]::new('token_input_cancelled')
-  }
-  if ([string]::IsNullOrWhiteSpace($plainValue)) {
-    throw [System.InvalidOperationException]::new('token_empty_after_secure_input')
-  }
+  if ($result -ne [System.Windows.Forms.DialogResult]::OK) { throw [System.OperationCanceledException]::new('token_input_cancelled') }
+  if ([string]::IsNullOrWhiteSpace($plainValue)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
 
   # Avoid ConvertTo-SecureString: this Windows PowerShell host can fail to
   # auto-load Microsoft.PowerShell.Security. The plaintext exists only long
-  # enough to build the in-memory SecureString used for this single request.
+  # enough to build the in-memory SecureString used for this request sequence.
   $secureValue = New-Object System.Security.SecureString
   foreach ($character in $plainValue.ToCharArray()) { $secureValue.AppendChar($character) }
   $secureValue.MakeReadOnly()
@@ -79,114 +79,6 @@ function Safe-Value {
   return ($text -replace '[\x00-\x1F\x7F]', ' ').Trim()
 }
 
-function Selector-Counts {
-  param($Selectors)
-  $result = [ordered]@{}
-  foreach ($name in @('.arc_cont', '.TRS_Editor', '.article-content', '.article_content', 'article')) {
-    $value = $Selectors.PSObject.Properties[$name].Value
-    $result[$name] = if ($null -eq $value) { 0 } else { [int]$value.count }
-  }
-  return $result
-}
-
-function Safe-UpstreamAttempts {
-  param($Attempts)
-  return @($Attempts | ForEach-Object {
-    [ordered]@{
-      attempt_number = $_.attempt_number
-      retry_eligible = $_.retry_eligible
-      wait_before_next_ms = $_.wait_before_next_ms
-      http_status = $_.http_status
-      content_type = Safe-Value $_.content_type
-      final_url = Safe-Value $_.final_url
-      html_length = $_.html_length
-      html_sha256 = $_.html_sha256
-      page_title = Safe-Value $_.page_title
-      selector_counts = Selector-Counts $_.selector_counts
-      parser_result = $_.parser_result
-      parser_error_code = Safe-Value $_.parser_error_code
-    }
-  })
-}
-
-function Safe-SkipAudit {
-  param($SkipAudit)
-  return @($SkipAudit | ForEach-Object {
-    [ordered]@{
-      original_rank = $_.original_rank
-      original_index = $_.original_index
-      official_url = Safe-Value $_.official_url
-      failure_stage = Safe-Value $_.failure_stage
-      failure_code = Safe-Value $_.failure_code
-      skip_reason = Safe-Value $_.skip_reason
-      attempts = Safe-UpstreamAttempts $_.attempts
-    }
-  })
-}
-
-function Safe-PreviewItem {
-  param($Item)
-  return [ordered]@{
-    ordinal = $Item.ordinal
-    original_rank = $Item.original_rank
-    original_index = $Item.original_index
-    title = Safe-Value $Item.title
-    official_url = Safe-Value $Item.official_url
-    document_no = Safe-Value $Item.document_no
-    document_no_provenance = [ordered]@{
-      source = Safe-Value $Item.document_no_provenance.source
-      confidence = Safe-Value $Item.document_no_provenance.confidence
-      evidence = Safe-Value $Item.document_no_provenance.evidence
-    }
-    publish_date = Safe-Value $Item.publish_date
-    body_hash = Safe-Value $Item.body_hash
-    body_length = $Item.body_length
-    parser_version = Safe-Value $Item.parser_version
-    parser_result = 'PASS'
-    risk = [ordered]@{
-      level = Safe-Value $Item.risk_assessment.risk_level
-      score = $Item.risk_assessment.risk_score
-      reasons = @($Item.risk_assessment.reasons | ForEach-Object { Safe-Value $_ })
-    }
-    metadata = [ordered]@{
-      rule_version = Safe-Value $Item.metadata_suggestion.rule_version
-      suggestion_hash = Safe-Value $Item.metadata_suggestion.suggestion_hash
-      tax_categories = @($Item.metadata_suggestion.tax_categories | ForEach-Object { Safe-Value $_ })
-    }
-    relation = [ordered]@{
-      state = Safe-Value $Item.relation_proposals.state
-      proposed_count = $Item.relation_proposals.proposed_count
-      rule_version = Safe-Value $Item.relation_proposals.rule_version
-    }
-    legal_status = $null # Preview is read-only and does not carry a legal-status mutation.
-    upstream_attempts = Safe-UpstreamAttempts $Item.upstream_attempts
-  }
-}
-
-function Safe-Failure {
-  param($Failure)
-  if ($null -eq $Failure) { return $null }
-  return [ordered]@{
-    failed_ordinal = $Failure.failed_ordinal
-    failure_stage = Safe-Value $Failure.failure_stage
-    failure_code = Safe-Value $Failure.failure_code
-    successfully_processed_count = $Failure.successfully_processed_count
-    official_url = Safe-Value $Failure.official_url
-    http_status = $Failure.http_status
-    content_type = Safe-Value $Failure.content_type
-    final_url = Safe-Value $Failure.final_url
-    html_character_length = $Failure.html_character_length
-    html_utf8_byte_length = $Failure.html_utf8_byte_length
-    html_sha256 = Safe-Value $Failure.html_sha256
-    page_title = Safe-Value $Failure.page_title
-    selector_counts = Selector-Counts $Failure.selectors
-    parser_error_code = Safe-Value $Failure.parser_error_code
-    elapsed_ms = $Failure.elapsed_ms
-    time_budget_ms = $Failure.time_budget_ms
-    upstream_attempts = Safe-UpstreamAttempts $Failure.upstream_attempts
-  }
-}
-
 function Read-JsonResponse {
   param([Parameter(Mandatory = $true)]$Response)
   $stream = $Response.GetResponseStream()
@@ -196,25 +88,76 @@ function Read-JsonResponse {
   } finally { $stream.Dispose() }
 }
 
-function Write-SafePreviewSummary {
-  param([Parameter(Mandatory = $true)]$HttpStatus, [Parameter(Mandatory = $true)]$Body)
-  $preview = $Body.preview
-  $items = @($preview.items | ForEach-Object { Safe-PreviewItem $_ })
-  $skipAudit = Safe-SkipAudit $preview.skip_audit
-  $fallbackItem = @($items | Where-Object { $_.original_rank -ne $_.ordinal } | Select-Object -Last 1)
-  [ordered]@{
-    http_status = [int]$HttpStatus
-    mode = Safe-Value $Body.mode
-    preview_result = if ($Body.mode -eq 'read_only_preview' -and $items.Count -eq 10) { 'PASS' } else { 'BLOCKED' }
-    items_count = $items.Count
-    original_rank_index = @($items | ForEach-Object { [ordered]@{ ordinal = $_.ordinal; original_rank = $_.original_rank; original_index = $_.original_index } })
-    skip_audit = $skipAudit
-    fallback_item = if ($fallbackItem.Count) { [ordered]@{ title = $fallbackItem[0].title; document_no = $fallbackItem[0].document_no; official_url = $fallbackItem[0].official_url } } else { $null }
-    items = $items
-    legal_status = 'not_modified_by_read_only_preview'
-    ready_to_create_frozen_manifest = if ($Body.mode -eq 'read_only_preview' -and $items.Count -eq 10) { 'YES' } else { 'NO' }
-    production_writes = if ($Body.PSObject.Properties.Name -contains 'production_writes') { $Body.production_writes } else { 0 }
-  } | ConvertTo-Json -Depth 12
+function Preview-ResultForStatus {
+  param($Status)
+  if ($Status -eq 'passed') { return 'PASS' }
+  if ($Status -in @('blocked', 'failed')) { return 'BLOCKED' }
+  return 'IN_PROGRESS'
+}
+
+function Safe-JobSummary {
+  param($Job)
+  if ($null -eq $Job) { return $null }
+  return [ordered]@{
+    job_id = Safe-Value $Job.job_id
+    mode = Safe-Value $Job.mode
+    status = Safe-Value $Job.status
+    completed_count = $Job.completed_count
+    total_count = $Job.total_count
+    current_ordinal = $Job.current_ordinal
+    preview_result = Preview-ResultForStatus $Job.status
+    failure_code = Safe-Value $Job.failure_code
+    ready_to_create_frozen_manifest = Safe-Value $Job.ready_to_create_frozen_manifest
+    preview_job_audit_writes = $Job.preview_job_audit_writes
+    business_production_writes = if ($null -eq $Job.business_production_writes) { 0 } else { $Job.business_production_writes }
+  }
+}
+
+function Write-SafeJson {
+  param([Parameter(Mandatory = $true)]$Value)
+  $Value | ConvertTo-Json -Depth 8
+}
+
+function Write-CreateSummary {
+  param([Parameter(Mandatory = $true)][int]$HttpStatus, $Body)
+  $dispatch = if ($Body) { Safe-Value $Body.dispatch } else { $null }
+  $dispatchCode = if ($HttpStatus -eq 401) { 'ADMIN_UNAUTHORIZED' } elseif ($dispatch -eq 'not_scheduled') { 'DISPATCH_NOT_SCHEDULED' } elseif ($HttpStatus -lt 200 -or $HttpStatus -ge 300) { 'CREATE_JOB_HTTP_ERROR' } else { $null }
+  Write-SafeJson ([ordered]@{
+    event = 'create_job'
+    http_status = $HttpStatus
+    mode = if ($Body -and $Body.job) { Safe-Value $Body.job.mode } else { 'production_preview' }
+    job_id = if ($Body -and $Body.job) { Safe-Value $Body.job.job_id } else { $null }
+    job_status = if ($Body -and $Body.job) { Safe-Value $Body.job.status } else { $null }
+    dispatch_status = $dispatch
+    dispatch_error_code = $dispatchCode
+    preview_job_audit_writes = if ($Body -and $Body.job) { $Body.job.preview_job_audit_writes } else { 0 }
+    business_production_writes = if ($Body -and $Body.PSObject.Properties.Name -contains 'business_production_writes') { $Body.business_production_writes } elseif ($Body -and $Body.job) { $Body.job.business_production_writes } else { 0 }
+  })
+}
+
+function Write-FinalSummary {
+  param([Parameter(Mandatory = $true)]$Job, [string]$TerminalReason = $null)
+  $summary = Safe-JobSummary $Job
+  $summary['event'] = 'job_status'
+  $summary['polling_terminal_reason'] = $TerminalReason
+  Write-SafeJson $summary
+}
+
+function Get-JobStatus {
+  param([Parameter(Mandatory = $true)][string]$JobId)
+  $statusUrl = "$jobStatusUrlPrefix/$([uri]::EscapeDataString($JobId))"
+  try {
+    $response = Invoke-WebRequest -Method Get -Uri $statusUrl -Headers @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' } -UseBasicParsing -ErrorAction Stop
+    return [ordered]@{ http_status = [int]$response.StatusCode; body = ($response.Content | ConvertFrom-Json) }
+  } catch {
+    $httpResponse = $_.Exception.Response
+    if ($httpResponse) {
+      $body = $null
+      try { $body = Read-JsonResponse -Response $httpResponse } catch { $body = $null }
+      return [ordered]@{ http_status = [int]$httpResponse.StatusCode; body = $body }
+    }
+    throw
+  }
 }
 
 try {
@@ -224,36 +167,51 @@ try {
   if ([string]::IsNullOrWhiteSpace($token)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
 
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  $stage = 'single_read_only_preview_request'
-  $response = Invoke-WebRequest -Method Get -Uri $previewUrl -Headers @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' } -UseBasicParsing -ErrorAction Stop
-  $body = $response.Content | ConvertFrom-Json
-  $stage = 'safe_summary'
-  Write-SafePreviewSummary -HttpStatus $response.StatusCode -Body $body
-  if ($body.mode -ne 'read_only_preview' -or @($body.preview.items).Count -ne 10) { exit 1 }
-}
-catch {
+  $stage = 'create_preview_job'
+  $createResponse = Invoke-WebRequest -Method Post -Uri $createJobUrl -Headers @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' } -ContentType 'application/json' -Body '{}' -UseBasicParsing -ErrorAction Stop
+  $createBody = $createResponse.Content | ConvertFrom-Json
+  Write-CreateSummary -HttpStatus $createResponse.StatusCode -Body $createBody
+
+  $jobId = if ($createBody.job) { [string]$createBody.job.job_id } else { '' }
+  if (($createResponse.StatusCode -ne 202 -and $createResponse.StatusCode -ne 200) -or [string]::IsNullOrWhiteSpace($jobId)) { exit 1 }
+
+  $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+  while ($true) {
+    $stage = 'poll_preview_job_status'
+    $statusResponse = Get-JobStatus -JobId $jobId
+    if ($statusResponse.http_status -ne 200 -or -not $statusResponse.body.job) {
+      Write-SafeJson ([ordered]@{ event = 'job_status'; http_status = $statusResponse.http_status; job_id = Safe-Value $jobId; preview_result = 'BLOCKED'; failure_code = 'JOB_STATUS_REQUEST_FAILED'; ready_to_create_frozen_manifest = 'NO'; business_production_writes = 0 })
+      exit 1
+    }
+
+    $job = $statusResponse.body.job
+    if ($job.status -in @('passed', 'blocked', 'failed')) {
+      Write-FinalSummary -Job $job -TerminalReason 'terminal_status'
+      if ($job.status -ne 'passed') { exit 1 }
+      break
+    }
+
+    if (($stopwatch.ElapsedMilliseconds + $pollIntervalMs) -gt $pollTimeoutMs) {
+      Write-FinalSummary -Job $job -TerminalReason 'POLLING_TIMEOUT'
+      exit 1
+    }
+    Start-Sleep -Milliseconds $pollIntervalMs
+  }
+} catch {
   $httpResponse = $_.Exception.Response
   if ($httpResponse) {
     $status = [int]$httpResponse.StatusCode
     $body = $null
     try { $body = Read-JsonResponse -Response $httpResponse } catch { $body = $null }
-    [ordered]@{
-      http_status = $status
-      mode = $null
-      preview_result = 'BLOCKED'
-      failure = Safe-Failure $body.failure
-      ready_to_create_frozen_manifest = 'NO'
-      production_writes = if ($body -and $body.PSObject.Properties.Name -contains 'production_writes') { $body.production_writes } else { 0 }
-    } | ConvertTo-Json -Depth 12
+    Write-CreateSummary -HttpStatus $status -Body $body
   } elseif ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) {
-    [ordered]@{ error = 'local_token_input_error'; preview_result = 'BLOCKED'; reason = Safe-Value $_.Exception.Message; production_writes = 0 } | ConvertTo-Json -Compress
+    Write-SafeJson ([ordered]@{ error = 'local_token_input_error'; preview_result = 'BLOCKED'; reason = Safe-Value $_.Exception.Message; business_production_writes = 0 })
   } else {
     # Never serialize exception text: it can contain request headers on some hosts.
-    [ordered]@{ error = 'request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; preview_result = 'BLOCKED'; production_writes = 0 } | ConvertTo-Json -Compress
+    Write-SafeJson ([ordered]@{ error = 'request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; preview_result = 'BLOCKED'; business_production_writes = 0 })
   }
   exit 1
-}
-finally {
+} finally {
   if ($tokenBstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr) }
   $token = $null
 }
