@@ -9,7 +9,7 @@ import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
-import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, PHASE3C1_PREVIEW_TIME_BUDGET_MS, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_CANDIDATE_COOLDOWN_MS, PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, PHASE3C1_PREVIEW_TIME_BUDGET_MS, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
 import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -38,6 +38,7 @@ function fakeFetch(url) {
   return Promise.resolve(new Response(html(index), { status: 200, headers: { 'content-type': 'text/html' } }));
 }
 const poolRankFor = (url) => PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL.find((item) => item.official_url === String(url))?.original_rank || 0;
+const noWait = async () => {};
 async function request(handler, pathname, { method = 'GET', token = '', body: input } = {}) {
   const response = await handler(new Request(`https://taxkb.example${pathname}`, {
     method,
@@ -52,7 +53,7 @@ test('Phase 3C-1 服务端固定 preview 冻结 10 条，浏览器不能指定�
   const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
   process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-test-token';
   try {
-    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: noWait });
     assert.equal(preview.items.length, 10);
     assert.deepEqual(preview.items.map((item) => item.official_url), PHASE3C1_FIXED_IMPORT_URLS);
     assert.ok(preview.items.every((item) => item.risk_assessment.risk_level === 'low' && item.risk_assessment.risk_score === 0));
@@ -143,9 +144,11 @@ test('Phase 3C transient retry only recovers a strictly incomplete 200 page and 
   };
   const preview = await preparePhase3C1ImportPreview({ fetchImpl: retryFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: async (milliseconds) => { waits.push(milliseconds); } });
   assert.equal(calls.length, 11); assert.equal(calls[0], PHASE3C1_FIXED_IMPORT_URLS[0]); assert.equal(calls[1], PHASE3C1_FIXED_IMPORT_URLS[0]);
-  assert.deepEqual(waits, [5000]);
+  assert.deepEqual(waits, [PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, ...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS)]);
   assert.equal(preview.items[0].upstream_attempts.length, 2);
-  assert.deepEqual(preview.items[0].upstream_attempts.map((item) => [item.attempt_number, item.retry_eligible, item.wait_before_next_ms, item.parser_error_code]), [[1, true, 5000, 'POLICY_BODY_CONTAINER_MISSING'], [2, false, 0, null]]);
+  assert.deepEqual(preview.items[0].upstream_attempts.map((item) => [item.attempt_number, item.retry_eligible, item.wait_before_next_ms, item.parser_error_code, item.candidate_cooldown_before_ms]), [[1, true, PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, 'POLICY_BODY_CONTAINER_MISSING', 0], [2, false, 0, null, 0]]);
+  assert.equal(preview.items[0].upstream_attempts[0].title_present, false);
+  assert.equal(preview.items[0].upstream_attempts[0].body_text_length, 'temporary shell'.length);
   assert.match(preview.items[0].body_hash, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(preview).includes(incomplete), false);
 });
@@ -165,7 +168,7 @@ test('Phase 3C fallback keeps original rank 10 when its transient incomplete pag
   assert.deepEqual(preview.skip_audit, []);
   assert.equal(calls.includes(11), false);
   assert.equal(calls.filter((rank) => rank === 10).length, 2);
-  assert.deepEqual(waits, [5000]);
+  assert.deepEqual(waits, [...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS), PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS]);
 });
 
 test('Phase 3C fallback skips exhausted rank 10 and naturally selects original rank 11', async () => {
@@ -187,7 +190,7 @@ test('Phase 3C fallback skips exhausted rank 10 and naturally selects original r
   assert.equal(preview.skip_audit[0].attempts.length, 2);
   assert.equal(JSON.stringify(preview).includes(incomplete), false);
   assert.deepEqual(calls, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11]);
-  assert.deepEqual(waits, [5000]);
+  assert.deepEqual(waits, [...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS), PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, PHASE3C1_CANDIDATE_COOLDOWN_MS]);
   assert.deepEqual(validatePhase3C1FallbackSelection(preview), { valid: true, issues: [] });
   const repeated = await preparePhase3C1ImportPreview({
     fetchImpl: async (url) => {
@@ -207,14 +210,17 @@ test('Phase 3C fallback preview exposes only safe skip audit metadata and stays 
   const secret = 'FALLBACK_UPSTREAM_HTML_MUST_NOT_LEAK';
   let repositoryFactoryCalls = 0;
   try {
-    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
-      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('Preview must not open repository'); },
+    const preview = await preparePhase3C1ImportPreview({
       fetchImpl: async (url) => {
         const rank = poolRankFor(url);
         return rank === 10
           ? new Response(`<html><body>${secret}</body></html>`, { status: 200, headers: { 'content-type': 'text/html' } })
           : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
-      }
+      }, waitImpl: noWait
+    });
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      repositoryFactory: () => { repositoryFactoryCalls += 1; throw new Error('Preview must not open repository'); },
+      phase3c1PreviewFactory: async () => preview
     }) });
     const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
     assert.equal(result.response.status, 200);
@@ -229,25 +235,26 @@ test('Phase 3C fallback preview exposes only safe skip audit metadata and stays 
   }
 });
 
-test('Phase 3C fallback continues through multiple exhausted upstream candidates but fails closed when pool is insufficient', async () => {
+test('Phase 3C upstream incomplete circuit breaker blocks after two distinct exhausted candidates and does not consume later ranks', async () => {
   const incomplete = '<html><body>temporary shell</body></html>';
   const multipleCalls = [];
-  const multiple = await preparePhase3C1ImportPreview({
+  await assert.rejects(() => preparePhase3C1ImportPreview({
     fetchImpl: async (url) => {
       const rank = poolRankFor(url); multipleCalls.push(rank);
       return [10, 11].includes(rank)
         ? new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } })
         : new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
-    }, waitImpl: async () => {}, now: '2026-09-07T00:00:00.000Z'
-  });
-  assert.deepEqual(multiple.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 12]);
-  assert.deepEqual(multiple.skip_audit.map((item) => item.original_rank), [10, 11]);
-  assert.deepEqual(multipleCalls.slice(-5), [9, 10, 10, 11, 11, 12].slice(-5));
+    }, waitImpl: noWait, now: '2026-09-07T00:00:00.000Z'
+  }), (error) => error instanceof Phase3C1PreviewFailure
+    && error.safe_diagnostic.failure_code === 'UPSTREAM_INCOMPLETE_RESPONSE_STREAK'
+    && error.safe_diagnostic.successfully_processed_count === 9
+    && error.safe_diagnostic.selection_skip_audit.length === 2);
+  assert.deepEqual(multipleCalls, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 11, 11]);
 
   await assert.rejects(
     () => preparePhase3C1ImportPreview({
-      fetchImpl: async () => new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } }),
-      waitImpl: async () => {}
+      fetchImpl: async () => new Response('retryable upstream status', { status: 429, headers: { 'retry-after': '1' } }),
+      waitImpl: noWait
     }),
     (error) => error instanceof Phase3C1PreviewFailure
       && error.safe_diagnostic.failure_stage === 'selection'
@@ -304,7 +311,7 @@ test('Phase 3C retry classifier caps transient HTTP and network failures, but ne
 });
 
 test('Phase 3C retry does not weaken frozen body-hash comparison', async () => {
-  const frozen = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+  const frozen = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: noWait });
   const calls = [];
   const changed = await preparePhase3C1ImportPreview({
     fetchImpl: async (url) => {
@@ -344,15 +351,19 @@ test('Phase 3C Preview stays read-only and never retries a downstream risk/eligi
 
 test('Phase 3C Preview 在总预算内完成，并且不会改变既有 deterministic fallback 选择', async () => {
   let monotonicNow = 0;
+  const candidateCooldowns = [];
   const preview = await preparePhase3C1ImportPreview({
     fetchImpl: fakeFetch,
     now: '2026-09-07T00:00:00.000Z',
     clock: () => monotonicNow,
-    time_budget_ms: PHASE3C1_PREVIEW_TIME_BUDGET_MS
+    time_budget_ms: PHASE3C1_PREVIEW_TIME_BUDGET_MS,
+    waitImpl: async (milliseconds) => { candidateCooldowns.push(milliseconds); }
   });
   assert.equal(preview.items.length, 10);
   assert.deepEqual(preview.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   assert.equal(preview.skip_audit.length, 0);
+  assert.deepEqual(candidateCooldowns, Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS));
+  assert.deepEqual(preview.items.map((item) => item.upstream_attempts[0].candidate_cooldown_before_ms), [0, ...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS)]);
 });
 
 test('Phase 3C Preview 在下一条 fetch 前总预算不足时 fail-closed，且不请求后续 URL', async () => {
@@ -366,7 +377,8 @@ test('Phase 3C Preview 在下一条 fetch 前总预算不足时 fail-closed，�
         return new Response(html(rank), { status: 200, headers: { 'content-type': 'text/html' } });
       },
       clock: () => monotonicNow,
-      time_budget_ms: 45_000
+      time_budget_ms: 45_000,
+      waitImpl: noWait
     }),
     (error) => error instanceof Phase3C1PreviewFailure
       && error.safe_diagnostic.failure_stage === 'time-budget'
@@ -420,12 +432,12 @@ test('Phase 3C Preview 在 retry 前或 retry wait 会耗尽总预算时停止�
     },
     waitImpl: async (milliseconds) => { recoveredWaits.push(milliseconds); monotonicNow += milliseconds; },
     clock: () => monotonicNow,
-    time_budget_ms: 45_000
+    time_budget_ms: 150_000
   });
   assert.equal(recovered.items.length, 10);
   assert.deepEqual(recoveredCalls.slice(0, 2), [1, 1]);
-  assert.deepEqual(recoveredWaits, [5000]);
-  assert.equal(monotonicNow, 38_000, 'retry wait must leave the response reserve and must not exceed the total budget');
+  assert.deepEqual(recoveredWaits, [PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, ...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS)]);
+  assert.equal(monotonicNow, 108_000, 'retry and candidate cooldowns must leave the response reserve and must not exceed the total budget');
 });
 
 test('Phase 3C Preview 时间预算保留 retry wait 与安全返回窗口，且 422 只返回安全字段并保持只读', async () => {
@@ -471,7 +483,7 @@ test('Phase 3C Preview 时间预算保留 retry wait 与安全返回窗口，且
 test('Phase 3C preflight blocks any selection rule, pool hash, provenance, or body change', async () => {
   const value = await fixture();
   try {
-    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: noWait });
     const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview, created_by: 'test-admin' });
     for (const [mutate, expected] of [
       [(current) => { current.selection_criteria.selection_version = 'unexpected-rule'; }, 'SELECTION_RULE_VERSION_CHANGED'],
@@ -494,7 +506,7 @@ test('Phase 3C preflight blocks any selection rule, pool hash, provenance, or bo
 test('Phase 3C-1 预检只读识别 URL、可信文号、正文 hash、Candidate、Review、Policy 和公开投影', async () => {
   const value = await fixture();
   try {
-    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const preview = await preparePhase3C1ImportPreview({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: noWait });
     const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview });
     const first = preview.items[0];
     const snapshot = await value.repository.recordRawSnapshot({ source_id: value.source.source_id, collection_run_id: value.run.collection_run_id, official_url: first.official_url, canonical_url: first.official_url, http_status: 200, content_type: 'text/html', raw_content: '<article>stored</article>', normalized_text: 'not the preview body', parser_version: first.parser_version, parse_result: { title: first.title } });

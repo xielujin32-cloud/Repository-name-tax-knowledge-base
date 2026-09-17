@@ -23,6 +23,12 @@ const PHASE3C1_PREVIEW_MIN_FETCH_WINDOW_MS = 1_000;
 const PHASE3C1_SHORT_CADENCE_DELAY_MS = 2_000;
 const PHASE3C1_TRANSIENT_MAX_ATTEMPTS = 2;
 const PHASE3C1_TRANSIENT_RETRY_DELAY_MS = 5_000;
+// Background Preview Jobs fetch a server-owned pool sequentially. A fixed
+// inter-candidate pause makes the upstream request cadence auditable and keeps
+// a normal ten-item run well within the 12 minute application budget.
+export const PHASE3C1_CANDIDATE_COOLDOWN_MS = 5_000;
+export const PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS = 30_000;
+export const PHASE3C1_INCOMPLETE_RESPONSE_STREAK_LIMIT = 2;
 const PHASE3C1_RATE_LIMIT_MAX_DELAY_MS = 15_000;
 export const PHASE3C1_FALLBACK_SELECTION_RULE_VERSION = 'phase3c1-production-preview-fallback-v2';
 export const PHASE3C1_ORIGINAL_CANDIDATE_POOL_VERSION = 'phase3c0-eligible-ranked-v1';
@@ -396,18 +402,33 @@ function allSupportedContainersMissing(selectors) {
   return Object.values(selectors || {}).every((value) => Number(value?.count) === 0);
 }
 
-function safeRetryAttempt({ attempt_number, response = null, raw_html = null, requested_url = null, fetch_error = null, diagnostic = null, retry_eligible = false, wait_before_next_ms = 0 } = {}) {
+function safeBodyTextLength(html) {
+  return String(html || '')
+    .replace(/<script\b[\s\S]*?<\/script\s*>/gi, ' ')
+    .replace(/<style\b[\s\S]*?<\/style\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim().length;
+}
+
+function safeRetryAttempt({ attempt_number, response = null, raw_html = null, requested_url = null, fetch_error = null, diagnostic = null, retry_eligible = false, wait_before_next_ms = 0, candidate_cooldown_before_ms = 0 } = {}) {
   const value = diagnostic || (typeof raw_html === 'string' && response ? diagnosticItem({ ordinal: null, requested_url, response, raw_html }) : null);
   return Object.freeze({
     attempt_number,
     retry_eligible,
     wait_before_next_ms,
+    candidate_cooldown_before_ms,
+    official_url: requested_url,
     http_status: value?.http_status ?? null,
     content_type: value?.content_type ?? null,
     final_url: value?.final_url ?? requested_url,
+    redirect_occurred: value ? Boolean(response?.redirected) : null,
+    final_url_changed: value ? String(value.final_url || requested_url) !== String(requested_url || '') : null,
     html_length: value?.html_character_length ?? null,
     html_sha256: value?.html_sha256 ?? null,
     page_title: value?.page_title ?? null,
+    title_present: value ? Boolean(value.page_title) : null,
+    body_text_length: typeof raw_html === 'string' ? safeBodyTextLength(raw_html) : null,
     selector_counts: value?.selectors ?? null,
     parser_result: value?.parse?.result ?? 'FAIL',
     parser_error_code: value?.parse?.error_code ?? (fetch_error ? 'UPSTREAM_FETCH_FAILED' : null)
@@ -424,7 +445,7 @@ function retryDecision({ response = null, diagnostic = null, error = null } = {}
     && !diagnostic?.page_title
     && allSupportedContainersMissing(diagnostic?.selectors)
     && diagnostic?.parse?.error_code === 'POLICY_BODY_CONTAINER_MISSING';
-  return { retry_eligible: incomplete200, delay_ms: PHASE3C1_TRANSIENT_RETRY_DELAY_MS, code: incomplete200 ? 'INCOMPLETE_HTML_200' : null };
+  return { retry_eligible: incomplete200, delay_ms: PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, code: incomplete200 ? 'INCOMPLETE_HTML_200' : null };
 }
 
 /**
@@ -432,7 +453,7 @@ function retryDecision({ response = null, diagnostic = null, error = null } = {}
  * material collection. Diagnostics deliberately continue to call the raw
  * one-shot fetch helper so they expose upstream behavior without recovery.
  */
-export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl = fetch, waitImpl = waitFor, ordinal = null, processed_count = 0, preview_time_budget = null } = {}) {
+export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { fetchImpl = fetch, waitImpl = waitFor, ordinal = null, processed_count = 0, preview_time_budget = null, candidate_cooldown_before_ms = 0 } = {}) {
   const requestedUrl = canonical(officialUrl);
   const upstreamAttempts = [];
   for (let attempt = 1; attempt <= PHASE3C1_TRANSIENT_MAX_ATTEMPTS; attempt += 1) {
@@ -445,7 +466,7 @@ export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { f
       const decision = retryDecision({ error });
       const retryBudgetAllowsWait = canWaitAndRetryWithinPreviewBudget(preview_time_budget, decision.delay_ms);
       const canRetry = decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && retryBudgetAllowsWait;
-      upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: requestedUrl, fetch_error: error, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
+      upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: requestedUrl, fetch_error: error, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0, candidate_cooldown_before_ms: attempt === 1 ? candidate_cooldown_before_ms : 0 }));
       if (canRetry) { await waitImpl(decision.delay_ms); continue; }
       if (decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && !retryBudgetAllowsWait) {
         throw timeBudgetFailure({ budget: preview_time_budget, ordinal, processed_count, requested_url: requestedUrl, upstream_attempts: upstreamAttempts });
@@ -457,7 +478,7 @@ export async function fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, { f
     const success = fetched.response.ok && diagnostic.parse.result === 'PASS';
     const retryBudgetAllowsWait = canWaitAndRetryWithinPreviewBudget(preview_time_budget, decision.delay_ms);
     const canRetry = !success && decision.retry_eligible && attempt < PHASE3C1_TRANSIENT_MAX_ATTEMPTS && retryBudgetAllowsWait;
-    upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, diagnostic, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0 }));
+    upstreamAttempts.push(safeRetryAttempt({ attempt_number: attempt, requested_url: fetched.requested_url, response: fetched.response, raw_html: fetched.raw_html, diagnostic, retry_eligible: canRetry, wait_before_next_ms: canRetry ? decision.delay_ms : 0, candidate_cooldown_before_ms: attempt === 1 ? candidate_cooldown_before_ms : 0 }));
     if (success) {
       let parsed;
       try { parsed = parseChinaTaxPolicyEvidence(fetched.raw_html); }
@@ -727,6 +748,33 @@ function safeFallbackSkipRecord(candidate, failure) {
   });
 }
 
+function isIncompleteHtml200BodyContainerFailure(error) {
+  if (!(error instanceof Phase3C1PreviewFailure)) return false;
+  const diagnostic = error.safe_diagnostic || {};
+  const attempts = diagnostic.upstream_attempts || [];
+  return diagnostic.failure_code === 'INCOMPLETE_HTML_200'
+    && diagnostic.failure_stage === 'body-container'
+    && diagnostic.parser_error_code === 'POLICY_BODY_CONTAINER_MISSING'
+    && attempts.length === PHASE3C1_TRANSIENT_MAX_ATTEMPTS
+    && attempts.every((attempt) => attempt.http_status === 200
+      && attempt.parser_error_code === 'POLICY_BODY_CONTAINER_MISSING');
+}
+
+function incompleteResponseStreakFailure({ candidate, processed_count, failure, skipAudit, streak } = {}) {
+  const diagnostic = failure.safe_diagnostic || {};
+  const circuitFailure = phase3c1PreviewFailure({
+    ordinal: candidate.original_rank,
+    stage: 'upstream-circuit-breaker',
+    processed_count,
+    requested_url: candidate.official_url,
+    parser_error_code: diagnostic.parser_error_code,
+    code: 'UPSTREAM_INCOMPLETE_RESPONSE_STREAK',
+    upstream_attempts: diagnostic.upstream_attempts || []
+  });
+  circuitFailure.safe_diagnostic = Object.freeze({ ...circuitFailure.safe_diagnostic, incomplete_response_streak: streak });
+  return attachSkipAudit(circuitFailure, skipAudit);
+}
+
 function exhaustedTransientUpstreamFailure(error) {
   if (!(error instanceof Phase3C1PreviewFailure)) return false;
   const diagnostic = error.safe_diagnostic || {};
@@ -785,19 +833,38 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
   // synchronous Preview remains bound to the compiled server-owned pool.
   const frozenSelection = frozen_selection_input ? validatePhase3C1PreviewJobSelectionInput(frozen_selection_input) : null;
   const candidatePool = frozenSelection?.frozen_candidate_pool || PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL;
+  let previousCandidateAttempted = false;
+  let incompleteResponseStreak = 0;
   for (const candidate of candidatePool) {
     if (items.length === PHASE3C1_FIXED_IMPORT_URLS.length) break;
     const ordinal = items.length + 1;
     const officialUrl = canonical(candidate.official_url);
+    const candidateCooldownBeforeMs = previousCandidateAttempted ? PHASE3C1_CANDIDATE_COOLDOWN_MS : 0;
+    if (candidateCooldownBeforeMs) {
+      if (!canWaitAndRetryWithinPreviewBudget(preview_time_budget, candidateCooldownBeforeMs)) {
+        throw timeBudgetFailure({ budget: preview_time_budget, ordinal: candidate.original_rank, processed_count: items.length, requested_url: officialUrl });
+      }
+      await waitImpl(candidateCooldownBeforeMs);
+    }
+    previousCandidateAttempted = true;
     let fetched;
     try {
       fetched = await fetchParsePhase3C1OfficialDetailWithRetry(officialUrl, {
-        fetchImpl, waitImpl, ordinal: candidate.original_rank, processed_count: items.length, preview_time_budget
+        fetchImpl, waitImpl, ordinal: candidate.original_rank, processed_count: items.length, preview_time_budget,
+        candidate_cooldown_before_ms: candidateCooldownBeforeMs
       });
     } catch (error) {
       if (exhaustedTransientUpstreamFailure(error)) {
         skipAudit.push(safeFallbackSkipRecord(candidate, error));
         if (onProgress) await onProgress(Object.freeze({ current_ordinal: candidate.original_rank, completed_count: items.length, total_count: PHASE3C1_FIXED_IMPORT_URLS.length, selected_items: selectionCriteriaFor(items, [], frozenSelection).selected, skip_audit: Object.freeze([...skipAudit]) }));
+        if (isIncompleteHtml200BodyContainerFailure(error)) {
+          incompleteResponseStreak += 1;
+          if (incompleteResponseStreak >= PHASE3C1_INCOMPLETE_RESPONSE_STREAK_LIMIT) {
+            throw incompleteResponseStreakFailure({ candidate, processed_count: items.length, failure: error, skipAudit, streak: incompleteResponseStreak });
+          }
+        } else {
+          incompleteResponseStreak = 0;
+        }
         continue;
       }
       throw attachSkipAudit(error, skipAudit);
@@ -880,6 +947,7 @@ export async function collectPhase3C1ApplyMaterial({ fetchImpl = fetch, now = ne
       throw attachSkipAudit(phase3c1PreviewFailure({ ordinal: candidate.original_rank, stage, processed_count: items.length, requested_url: fetched.requested_url, response, raw_html: rawHtml, code: issues[0], upstream_attempts: upstreamAttempts }), skipAudit);
     }
     items.push(Object.freeze(item));
+    incompleteResponseStreak = 0;
     materials.push(Object.freeze({
       ordinal,
       original_rank: candidate.original_rank,

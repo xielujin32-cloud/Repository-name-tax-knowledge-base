@@ -71,8 +71,7 @@ test('缺失或篡改 frozen selection 时 Worker fail-closed，绝不调用 col
 
 test('fallback strictly stops at a frozen pool boundary and cannot reach the global pool', async () => {
   const frozen = tenOnlyFrozenInput(); const calls = [];
-  const incomplete = '<html><body>short</body></html>';
-  await assert.rejects(() => collectPhase3C1ApplyMaterial({ frozen_selection_input: frozen, waitImpl: async () => {}, fetchImpl: async (url) => { calls.push(String(url)); return new Response(incomplete, { status: 200, headers: { 'content-type': 'text/html' } }); } }), (error) => error instanceof Phase3C1PreviewFailure && error.safe_diagnostic.failure_code === 'CANDIDATE_POOL_EXHAUSTED');
+  await assert.rejects(() => collectPhase3C1ApplyMaterial({ frozen_selection_input: frozen, waitImpl: async () => {}, fetchImpl: async (url) => { calls.push(String(url)); return new Response('rate limited', { status: 429, headers: { 'retry-after': '1' } }); } }), (error) => error instanceof Phase3C1PreviewFailure && error.safe_diagnostic.failure_code === 'CANDIDATE_POOL_EXHAUSTED');
   assert.equal(calls.length, 20, 'each frozen candidate gets only two transient attempts');
   assert.equal(new Set(calls).size, 10); assert.deepEqual([...new Set(calls)], frozen.frozen_candidate_pool.map((item) => item.official_url));
   assert.equal(calls.includes(PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL[10].official_url), false);
@@ -96,9 +95,22 @@ test('Preview Job 持久化输入幂等、进度可审计、stale 可恢复且�
     assert.equal((await repository.beginPhase3C1PreviewJob(first.job.job_id)).claimed, true);
     await repository.updatePhase3C1PreviewJobProgress(first.job.job_id, { current_ordinal: 3, completed_count: 2, total_count: 10, selected_items: [{ ordinal: 1, original_rank: 1, original_index: 4, official_url: 'https://fgk.chinatax.gov.cn/fixed' }], skip_audit: [] });
     assert.equal((await repository.getPhase3C1PreviewJob(first.job.job_id)).completed_count, 2);
-    timestamp = '2026-09-08T00:21:00.000Z'; const stale = await repository.getPhase3C1PreviewJob(first.job.job_id); assert.equal(stale.is_stale, true);
+    const selected = [{ ordinal: 1, original_rank: 1, original_index: 4, official_url: 'https://fgk.chinatax.gov.cn/fixed' }];
+    await repository.blockPhase3C1PreviewJob(first.job.job_id, { failure_code: 'UPSTREAM_INCOMPLETE_RESPONSE_STREAK', failure_stage: 'upstream-circuit-breaker', successfully_processed_count: 2, selection_skip_audit: [{ original_rank: 3 }] });
+    const blocked = await repository.getPhase3C1PreviewJob(first.job.job_id);
+    assert.deepEqual(blocked.selected_items, selected, 'BLOCKED terminal update must preserve the already-audited successes');
+
+    const failedJob = (await repository.createPhase3C1PreviewJob()).job;
+    assert.equal((await repository.beginPhase3C1PreviewJob(failedJob.job_id)).claimed, true);
+    await repository.updatePhase3C1PreviewJobProgress(failedJob.job_id, { current_ordinal: 2, completed_count: 1, total_count: 10, selected_items: selected, skip_audit: [] });
+    await repository.failPhase3C1PreviewJob(failedJob.job_id, { failure_code: 'PREVIEW_JOB_WORKER_FAILED', successfully_processed_count: 1 });
+    assert.deepEqual((await repository.getPhase3C1PreviewJob(failedJob.job_id)).selected_items, selected, 'FAILED terminal update must preserve the already-audited successes');
+
+    const runningJob = (await repository.createPhase3C1PreviewJob()).job;
+    assert.equal((await repository.beginPhase3C1PreviewJob(runningJob.job_id)).claimed, true);
+    timestamp = '2026-09-08T00:21:00.000Z'; const stale = await repository.getPhase3C1PreviewJob(runningJob.job_id); assert.equal(stale.is_stale, true);
     const replacement = await repository.createPhase3C1PreviewJob(); assert.equal(replacement.created, true); assert.notEqual(replacement.job.job_id, first.job.job_id);
-    const old = await repository.getPhase3C1PreviewJob(first.job.job_id); assert.equal(old.job_state, 'failed'); assert.equal(old.failure_code, 'PREVIEW_JOB_STALE');
+    const old = await repository.getPhase3C1PreviewJob(runningJob.job_id); assert.equal(old.job_state, 'failed'); assert.equal(old.failure_code, 'PREVIEW_JOB_STALE');
     const counts = await repository.counts(); assert.equal(counts.raw_snapshots, 0); assert.equal(counts.candidates, 0); assert.equal(counts.policies, 0); assert.equal((await database.query('SELECT COUNT(*)::int AS count FROM controlled_import_manifests')).rows[0].count, 0);
   } finally { await database.stop(); await rm(root, { recursive: true, force: true }); }
 });

@@ -61,7 +61,7 @@ test('Phase 3C diagnostic and official preview share the same upstream request a
     calls.push({ url: String(url), userAgent: options.headers['user-agent'], hasAccept: Object.hasOwn(options.headers, 'accept'), hasCookie: Object.hasOwn(options.headers, 'cookie') });
     return fakeFetch(url, options);
   };
-  const preview = await preparePhase3C1ImportPreview({ fetchImpl: fetchWithCapture, now: '2026-09-07T00:00:00.000Z' });
+  const preview = await preparePhase3C1ImportPreview({ fetchImpl: fetchWithCapture, now: '2026-09-07T00:00:00.000Z', waitImpl: async () => {} });
   const diagnostic = await diagnosePhase3C1ImportPreview({ fetchImpl: fetchWithCapture });
   assert.equal(preview.items.length, 10); assert.equal(diagnostic.items.length, 10);
   assert.deepEqual(calls.slice(0, 10), calls.slice(10), 'both paths must make identical upstream requests');

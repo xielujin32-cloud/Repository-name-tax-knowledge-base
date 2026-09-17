@@ -34,7 +34,7 @@ async function fixture({ objectStoreFactory = createLocalEvidenceObjectStore } =
 }
 async function close(value) { await value.database.stop(); await rm(value.root, { recursive: true, force: true }); }
 async function createFrozenReady(value) {
-  const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+  const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: async () => {} });
   const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview: collected.preview, created_by: 'test-admin' });
   const checked = await value.repository.createPhase3C2ControlledPreflight({ controlled_manifest_id: frozen.manifest.controlled_manifest_id, manifest_hash: frozen.manifest.manifest_hash, current_preview: collected.preview, checked_by: 'test-admin' });
   assert.equal(checked.preflight.preflight_state, 'ready', JSON.stringify(checked.evidence.validation));
@@ -49,7 +49,7 @@ test('Phase 3C-2 Apply 在一个数据库事务内创建待审 Evidence，并发
   const value = await fixture();
   try {
     const { collected, frozen, checked } = await createFrozenReady(value);
-    const sameContentLater = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-08T00:00:00.000Z' });
+    const sameContentLater = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-08T00:00:00.000Z', waitImpl: async () => {} });
     assert.equal(sameContentLater.preview.manifest_hash, collected.preview.manifest_hash, 'metadata generated_at must not invalidate an otherwise identical frozen body');
     const input = { controlled_manifest_id: frozen.manifest.controlled_manifest_id, manifest_hash: frozen.manifest.manifest_hash, preflight_id: checked.preflight.preflight_id, current_preview: collected.preview, materials: collected.materials, operator_id: 'test-admin' };
     const concurrent = await Promise.allSettled([value.repository.applyPhase3C2ControlledImport(input), value.repository.applyPhase3C2ControlledImport(input)]);
@@ -99,7 +99,7 @@ test('Phase 3C-2 admin API 只能消费服务器 material，拒绝未授权、�
   const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
   process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c2-test-token';
   try {
-    const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: async () => {} });
     const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview: collected.preview });
     const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({ repositoryFactory: () => value.repository, fetchImpl: fakeFetch, phase3c1PreviewFactory: async () => collected.preview, phase3c1ApplyMaterialFactory: async () => collected }) });
     const base = `/api/admin/evidence/phase3c1/import-manifests/${frozen.manifest.controlled_manifest_id}`;
@@ -125,7 +125,7 @@ test('Phase 3C-2 admin API 只能消费服务器 material，拒绝未授权、�
 test('Phase 3C-2 拒绝 blocked、过期或不再 frozen 的 preflight，且不创建 Evidence', async () => {
   const value = await fixture();
   try {
-    const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z' });
+    const collected = await collectPhase3C1ApplyMaterial({ fetchImpl: fakeFetch, now: '2026-09-07T00:00:00.000Z', waitImpl: async () => {} });
     const frozen = await value.repository.createPhase3C1FrozenImportManifest({ preview: collected.preview });
     const changed = clone(collected.preview);
     changed.items[0].body_hash = 'a'.repeat(64);
