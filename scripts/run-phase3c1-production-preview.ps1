@@ -32,12 +32,13 @@ function Read-GuiSecureString {
   $label.Location = New-Object System.Drawing.Point(18, 20)
   $form.Controls.Add($label)
 
-  $input = New-Object System.Windows.Forms.TextBox
-  $input.Location = New-Object System.Drawing.Point(20, 50)
-  $input.Size = New-Object System.Drawing.Size(505, 26)
-  $input.UseSystemPasswordChar = $true
-  $input.ShortcutsEnabled = $true
-  $form.Controls.Add($input)
+  $tokenTextBox = New-Object System.Windows.Forms.TextBox
+  $tokenTextBox.Name = 'tokenTextBox'
+  $tokenTextBox.Location = New-Object System.Drawing.Point(20, 50)
+  $tokenTextBox.Size = New-Object System.Drawing.Size(505, 26)
+  $tokenTextBox.UseSystemPasswordChar = $true
+  $tokenTextBox.ShortcutsEnabled = $true
+  $form.Controls.Add($tokenTextBox)
 
   $ok = New-Object System.Windows.Forms.Button
   $ok.Text = '创建只读 Preview Job'
@@ -53,10 +54,14 @@ function Read-GuiSecureString {
 
   $form.AcceptButton = $ok
   $form.CancelButton = $cancel
-  $form.Add_Shown({ $input.Select() })
+  $form.Add_Shown({
+    param($sender, $eventArgs)
+    $sender.Activate()
+    $sender.Controls['tokenTextBox'].Focus()
+  })
   $result = $form.ShowDialog()
-  $plainValue = $input.Text
-  $input.Clear()
+  $plainValue = $tokenTextBox.Text
+  $tokenTextBox.Clear()
   $form.Dispose()
   if ($result -ne [System.Windows.Forms.DialogResult]::OK) { throw [System.OperationCanceledException]::new('token_input_cancelled') }
   if ([string]::IsNullOrWhiteSpace($plainValue)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }

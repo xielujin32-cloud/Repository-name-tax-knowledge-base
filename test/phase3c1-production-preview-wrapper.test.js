@@ -46,6 +46,10 @@ test('Phase 3C Production wrapper 使用隐藏 GUI Token 输入，且不使用�
   const wrapper = await readFile(wrapperPath, 'utf8');
   assert.match(wrapper, /function Read-GuiSecureString/);
   assert.match(wrapper, /System\.Windows\.Forms\.TextBox/);
+  assert.match(wrapper, /\$tokenTextBox\.Name = 'tokenTextBox'/);
+  assert.match(wrapper, /\$form\.Add_Shown\(\{\s*param\(\$sender, \$eventArgs\)\s*\$sender\.Activate\(\)\s*\$sender\.Controls\['tokenTextBox'\]\.Focus\(\)\s*\}\)/s);
+  assert.doesNotMatch(wrapper, /\$input\s*=\s*New-Object\s+System\.Windows\.Forms\.TextBox/);
+  assert.doesNotMatch(wrapper, /Add_Shown\(\{\s*\$input\.Select\(\)\s*\}\)/s);
   assert.match(wrapper, /UseSystemPasswordChar\s*=\s*\$true/);
   assert.match(wrapper, /SecureStringToBSTR/);
   assert.match(wrapper, /ZeroFreeBSTR/);
