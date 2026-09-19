@@ -40,7 +40,8 @@ const controlledImportManifestItemRow = (row) => row && ({
 });
 const controlledImportPreflightRow = (row) => row && ({ ...row, validation: jsonObject(row.validation) });
 const controlledImportApplyRow = (row) => row && ({ ...row, result: jsonObject(row.result) });
-const phase3c1PreviewJobRow = (row) => row && ({ ...row, selection_input: jsonObject(row.selection_input), selected_items: jsonObject(row.selected_items, []), skip_audit: jsonObject(row.skip_audit, []), safe_failure: jsonObject(row.safe_failure) });
+const phase3c1PreviewJobRow = (row) => row && ({ ...row, selection_input: jsonObject(row.selection_input), preview_selection_criteria: row.preview_selection_criteria == null ? null : jsonObject(row.preview_selection_criteria), selected_items: jsonObject(row.selected_items, []), skip_audit: jsonObject(row.skip_audit, []), safe_failure: jsonObject(row.safe_failure) });
+const phase3c1PreviewJobMaterialRow = (row) => row && ({ ...row, item: jsonObject(row.item), material_provenance: jsonObject(row.material_provenance) });
 const PHASE3C1_PREVIEW_JOB_STALE_AFTER_MS = 20 * 60_000;
 const phase3c1PreviewJobIsStale = (row, timestamp) => {
   if (!row || !['queued', 'running'].includes(row.job_state)) return false;
@@ -796,6 +797,17 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const expectedHash = phase3c1ManifestFingerprint({ items: preview.items, selection_criteria: preview.selection_criteria });
     if (preview.manifest_hash !== expectedHash) throw new Error('Phase 3C-1 preview manifest hash 不一致。');
   }
+  function validateFrozenPhase3C1Preview(preview) {
+    if (!preview || preview.manifest_key !== PHASE3C1_IMPORT_MANIFEST_KEY || !Array.isArray(preview.items) || preview.items.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('frozen manifest 内容无效。');
+    const selected = new Map((preview.selection_criteria?.selected || []).map((item) => [Number(item.ordinal), item]));
+    if (selected.size !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('frozen manifest selection provenance 无效。');
+    for (const [offset, item] of preview.items.entries()) {
+      if (Number(item.ordinal) !== offset + 1 || !selected.has(Number(item.ordinal))) throw new Error('frozen manifest ordinal 无效。');
+      if (!/^[a-f0-9]{64}$/.test(String(item.body_hash || '')) || !/^[a-f0-9]{64}$/.test(String(item.item_fingerprint || ''))) throw new Error('frozen manifest hash 无效。');
+      if (!item.document_no || item.document_no_provenance?.confidence !== 'high') throw new Error('frozen manifest 文号 provenance 无效。');
+      if (item.risk_assessment?.risk_level !== 'low' || Number(item.risk_assessment?.risk_score) !== 0 || Number(item.relation_proposals?.proposed_count) !== 0) throw new Error('frozen manifest 审核条件无效。');
+    }
+  }
   function phase3c1UpstreamAttemptAudit(preview) {
     return (preview?.items || []).map((item) => ({
       ordinal: item.ordinal,
@@ -821,6 +833,50 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const items = (await pool.query('SELECT * FROM controlled_import_manifest_items WHERE controlled_manifest_id=$1 ORDER BY ordinal ASC', [manifest.controlled_manifest_id])).rows.map(controlledImportManifestItemRow);
     return { manifest: controlledImportManifestRow(manifest), items };
   }
+  function previewFromFrozenManifest(frozen) {
+    const selected = new Map((frozen.manifest.selection_criteria?.selected || []).map((value) => [Number(value.ordinal), value]));
+    const items = frozen.items.map((item) => ({
+      ...item,
+      original_rank: selected.get(Number(item.ordinal))?.original_rank,
+      original_index: selected.get(Number(item.ordinal))?.original_index
+    }));
+    return {
+      manifest_key: frozen.manifest.manifest_key,
+      selection_criteria: frozen.manifest.selection_criteria,
+      items,
+      manifest_hash: frozen.manifest.manifest_hash
+    };
+  }
+  async function frozenPreviewJobMaterialSet(jobId) {
+    const job = await getPhase3C1PreviewJob(jobId);
+    if (job.is_stale || job.job_state !== 'passed' || Number(job.completed_count) !== Number(job.total_count) || !Array.isArray(job.selected_items) || job.selected_items.length !== Number(job.total_count) || !job.result_hash || !job.preview_selection_criteria || !job.material_set_hash) throw new Error('只有完整 PASSED Preview Job 可以冻结 manifest。');
+    const rows = (await pool.query('SELECT * FROM phase3c1_preview_job_materials WHERE job_id=$1 ORDER BY ordinal ASC', [job.job_id])).rows.map(phase3c1PreviewJobMaterialRow);
+    if (rows.length !== PHASE3C1_FIXED_IMPORT_URLS.length) throw new Error('PASSED Preview Job 缺少完整冻结材料，拒绝创建 manifest。');
+    const preview = {
+      manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY,
+      selection_criteria: job.preview_selection_criteria,
+      skip_audit: job.skip_audit,
+      items: rows.map((row) => row.item),
+      manifest_hash: job.result_hash
+    };
+    validatePhase3C1Preview(preview, job.selection_input);
+    const materialSetHash = sha256(stable(rows.map((row) => ({ ordinal: row.ordinal, material_hash: row.material_hash }))));
+    if (materialSetHash !== job.material_set_hash) throw new Error('PASSED Preview Job material hash 不一致，拒绝创建 manifest。');
+    return { job, rows, preview };
+  }
+  async function insertPhase3C1FrozenImportManifest({ preview, source_preview_job_id = null, created_by = 'netlify-admin' } = {}) {
+    const manifestId = id('controlled-import-manifest');
+    const timestamp = clock();
+    await transaction(async (client) => {
+      await client.query(`INSERT INTO controlled_import_manifests (controlled_manifest_id,manifest_key,source_preview_job_id,selection_criteria,manifest_hash,manifest_state,created_by,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,'frozen',$6,$7,$7)`, [manifestId, PHASE3C1_IMPORT_MANIFEST_KEY, source_preview_job_id, JSON.stringify(preview.selection_criteria), preview.manifest_hash, required(created_by, 'created_by'), timestamp]);
+      for (const item of preview.items) await client.query(
+        `INSERT INTO controlled_import_manifest_items (controlled_manifest_item_id,controlled_manifest_id,ordinal,official_url,canonical_url,title,document_no,document_no_provenance,issuing_authority,publish_date,effective_date,body_hash,parser_version,risk_assessment,metadata_suggestion,relation_proposals,item_fingerprint,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        [id('controlled-import-manifest-item'), manifestId, item.ordinal, canonical(item.official_url), canonical(item.canonical_url || item.official_url), required(item.title, 'title'), required(item.document_no, 'document_no'), JSON.stringify(item.document_no_provenance), JSON.stringify(item.issuing_authority || []), required(item.publish_date, 'publish_date'), item.effective_date || null, required(item.body_hash, 'body_hash'), required(item.parser_version, 'parser_version'), JSON.stringify(item.risk_assessment), JSON.stringify(item.metadata_suggestion), JSON.stringify(item.relation_proposals), required(item.item_fingerprint, 'item_fingerprint'), timestamp]
+      );
+      await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, source_preview_job_id, manifest_hash: preview.manifest_hash, item_count: preview.items.length, selection_criteria: preview.selection_criteria, skip_audit: preview.selection_criteria?.skip_audit || [], upstream_attempts: phase3c1UpstreamAttemptAudit(preview) }), timestamp]);
+    });
+    return { created: true, ...(await getControlledImportManifest(manifestId)) };
+  }
   async function createPhase3C1FrozenImportManifest({ preview, created_by = 'netlify-admin' } = {}) {
     validatePhase3C1Preview(preview);
     const locked = await withExclusiveLock(`taxkb:controlled-import:${PHASE3C1_IMPORT_MANIFEST_KEY}`, async () => {
@@ -829,24 +885,31 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         if (existing.manifest_hash !== preview.manifest_hash) throw new Error('已冻结的 Phase 3C-1 manifest 与当前官方正文或规则不一致，必须人工处理。');
         return { created: false, ...(await getControlledImportManifest(existing.controlled_manifest_id)) };
       }
-      const manifestId = id('controlled-import-manifest');
-      const timestamp = clock();
-      await transaction(async (client) => {
-        await client.query(`INSERT INTO controlled_import_manifests (controlled_manifest_id,manifest_key,selection_criteria,manifest_hash,manifest_state,created_by,created_at,updated_at) VALUES ($1,$2,$3,$4,'frozen',$5,$6,$6)`, [manifestId, PHASE3C1_IMPORT_MANIFEST_KEY, JSON.stringify(preview.selection_criteria), preview.manifest_hash, required(created_by, 'created_by'), timestamp]);
-        for (const item of preview.items) await client.query(
-          `INSERT INTO controlled_import_manifest_items (controlled_manifest_item_id,controlled_manifest_id,ordinal,official_url,canonical_url,title,document_no,document_no_provenance,issuing_authority,publish_date,effective_date,body_hash,parser_version,risk_assessment,metadata_suggestion,relation_proposals,item_fingerprint,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
-          [id('controlled-import-manifest-item'), manifestId, item.ordinal, canonical(item.official_url), canonical(item.canonical_url || item.official_url), required(item.title, 'title'), required(item.document_no, 'document_no'), JSON.stringify(item.document_no_provenance), JSON.stringify(item.issuing_authority || []), required(item.publish_date, 'publish_date'), item.effective_date || null, required(item.body_hash, 'body_hash'), required(item.parser_version, 'parser_version'), JSON.stringify(item.risk_assessment), JSON.stringify(item.metadata_suggestion), JSON.stringify(item.relation_proposals), required(item.item_fingerprint, 'item_fingerprint'), timestamp]
-        );
-        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'controlled_import_manifest', manifestId, 'phase3c1_manifest_frozen', JSON.stringify({ manifest_key: PHASE3C1_IMPORT_MANIFEST_KEY, manifest_hash: preview.manifest_hash, item_count: preview.items.length, selection_criteria: preview.selection_criteria, skip_audit: preview.selection_criteria?.skip_audit || [], upstream_attempts: phase3c1UpstreamAttemptAudit(preview) }), timestamp]);
-      });
-      return { created: true, ...(await getControlledImportManifest(manifestId)) };
+      return insertPhase3C1FrozenImportManifest({ preview, created_by });
+    });
+    if (!locked.acquired) throw new Error('Phase 3C-1 manifest 正在冻结，请稍后重试。');
+    return locked.result;
+  }
+  async function createPhase3C1FrozenImportManifestFromPreviewJob({ source_preview_job_id, created_by = 'netlify-admin' } = {}) {
+    const jobId = required(source_preview_job_id, 'source_preview_job_id');
+    const locked = await withExclusiveLock(`taxkb:controlled-import-preview-job:${jobId}`, async () => {
+      const existing = (await pool.query('SELECT * FROM controlled_import_manifests WHERE source_preview_job_id=$1', [jobId])).rows[0];
+      if (existing) return { created: false, ...(await getControlledImportManifest(existing.controlled_manifest_id)) };
+      const { preview } = await frozenPreviewJobMaterialSet(jobId);
+      const global = (await pool.query('SELECT * FROM controlled_import_manifests WHERE manifest_key=$1', [PHASE3C1_IMPORT_MANIFEST_KEY])).rows[0];
+      if (global) throw new Error('已有不同来源的 Phase 3C-1 frozen manifest，拒绝混用 Preview Job。');
+      return insertPhase3C1FrozenImportManifest({ preview, source_preview_job_id: jobId, created_by });
     });
     if (!locked.acquired) throw new Error('Phase 3C-1 manifest 正在冻结，请稍后重试。');
     return locked.result;
   }
   async function preflightControlledImportManifest(controlledManifestId, { current_preview } = {}) {
-    if (!current_preview || typeof current_preview !== 'object') throw new Error('preflight 需要服务端当前 preview。');
     const frozen = await getControlledImportManifest(controlledManifestId);
+    // From a frozen manifest onward we must never collect or parse an official
+    // page again. The optional argument is retained only for legacy internal
+    // tests; production callers use this immutable reconstruction.
+    current_preview = current_preview || previewFromFrozenManifest(frozen);
+    if (!current_preview || typeof current_preview !== 'object') throw new Error('preflight 需要 frozen manifest。');
     const current = current_preview.items || [];
     const currentByOrdinal = new Map(current.map((item) => [Number(item.ordinal), item]));
     const changes = frozen.manifest.manifest_state === 'frozen' ? [] : [{ code: 'MANIFEST_NOT_FROZEN' }];
@@ -910,8 +973,8 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const date = new Date(value || 0);
     return !Number.isFinite(date.getTime()) || date.getTime() <= Date.now();
   }
-  function validatePhase3C2Material(preview, materials) {
-    validatePhase3C1Preview(preview);
+  function validatePhase3C2Material(preview, materials, { frozen = false } = {}) {
+    if (frozen) validateFrozenPhase3C1Preview(preview); else validatePhase3C1Preview(preview);
     if (!Array.isArray(materials) || materials.length !== preview.items.length) throw new Error('Apply 必须使用服务器刚读取的完整 10 条正文。');
     const byOrdinal = new Map(materials.map((item) => [Number(item.ordinal), item]));
     for (const item of preview.items) {
@@ -925,11 +988,13 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
   async function createPhase3C2ControlledPreflight({ controlled_manifest_id, manifest_hash, current_preview, checked_by = 'netlify-admin', ttl_ms = 15 * 60 * 1000 } = {}) {
     const manifestId = required(controlled_manifest_id, 'controlled_manifest_id');
     const manifestHashValue = required(manifest_hash, 'manifest_hash');
-    validatePhase3C1Preview(current_preview);
     const locked = await withExclusiveLock(`taxkb:controlled-import-preflight:${manifestId}`, async () => {
       const frozen = await getControlledImportManifest(manifestId);
       if (frozen.manifest.manifest_state !== 'frozen') throw new Error('controlled import manifest 不再是 frozen，拒绝 preflight。');
       if (frozen.manifest.manifest_hash !== manifestHashValue) throw new Error('manifest hash 不匹配，拒绝 preflight。');
+      const previewFromManifest = !current_preview;
+      current_preview = current_preview || previewFromFrozenManifest(frozen);
+      if (previewFromManifest) validateFrozenPhase3C1Preview(current_preview); else validatePhase3C1Preview(current_preview);
       const evidence = await preflightControlledImportManifest(manifestId, { current_preview });
       const timestamp = clock();
       const currentPreviewHash = previewHash(current_preview);
@@ -985,14 +1050,33 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     });
     return controlledImportApplyRow((await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_apply_id=$1', [applyId])).rows[0]);
   }
+  async function materialsForFrozenManifest(frozen) {
+    const jobId = required(frozen.manifest.source_preview_job_id, 'source_preview_job_id');
+    const rows = (await pool.query('SELECT * FROM phase3c1_preview_job_materials WHERE job_id=$1 ORDER BY ordinal ASC', [jobId])).rows.map(phase3c1PreviewJobMaterialRow);
+    if (rows.length !== frozen.items.length) throw new Error('frozen manifest 缺少对应 Preview Job materials，拒绝 Apply。');
+    const byOrdinal = new Map(rows.map((row) => [Number(row.ordinal), row]));
+    const materials = [];
+    for (const item of frozen.items) {
+      const row = byOrdinal.get(Number(item.ordinal));
+      if (!row || row.body_hash !== item.body_hash || canonical(row.official_url) !== canonical(item.official_url) || row.item_fingerprint !== item.item_fingerprint) throw new Error(`frozen manifest 与 Preview Job material 不一致（${item.ordinal}）。`);
+      const raw_html = String(await objectStore.read(row.raw_object_key) || '');
+      const normalized_text = String(await objectStore.read(row.normalized_text_object_key) || '');
+      if (sha256(raw_html) !== row.raw_sha256 || sha256(normalized_text) !== row.normalized_text_sha256) throw new Error(`Preview Job material integrity 失败（${item.ordinal}）。`);
+      materials.push({ ...row.material_provenance, raw_html, normalized_text });
+    }
+    return materials;
+  }
   async function applyPhase3C2ControlledImport({ controlled_manifest_id, manifest_hash, preflight_id, current_preview, materials, operator_id = 'netlify-admin' } = {}) {
     const manifestId = required(controlled_manifest_id, 'controlled_manifest_id');
     const manifestHashValue = required(manifest_hash, 'manifest_hash');
     const preflightId = required(preflight_id, 'preflight_id');
-    validatePhase3C2Material(current_preview, materials);
     const locked = await withExclusiveLock(`taxkb:controlled-import-apply:${manifestId}`, async () => {
       const frozen = await getControlledImportManifest(manifestId);
       if (frozen.manifest.manifest_hash !== manifestHashValue) throw new Error('manifest hash 不匹配，拒绝 Apply。');
+      const previewFromManifest = !current_preview;
+      current_preview = current_preview || previewFromFrozenManifest(frozen);
+      materials = materials || await materialsForFrozenManifest(frozen);
+      validatePhase3C2Material(current_preview, materials, { frozen: previewFromManifest });
       const completed = (await pool.query("SELECT * FROM controlled_import_apply_attempts WHERE controlled_manifest_id=$1 AND apply_state='completed' ORDER BY completed_at DESC LIMIT 1", [manifestId])).rows[0];
       if (completed) return { execution: 'already_completed', apply: controlledImportApplyRow(completed) };
       const existing = (await pool.query('SELECT * FROM controlled_import_apply_attempts WHERE controlled_manifest_id=$1 AND preflight_id=$2', [manifestId, preflightId])).rows[0];
@@ -1132,6 +1216,46 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     const timestamp = clock(); const result = await pool.query(`UPDATE phase3c1_preview_jobs SET completed_count=$2,current_ordinal=$3,selected_items=$4,skip_audit=$5,heartbeat_at=$6,updated_at=$6,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='running' RETURNING *`, [required(jobId, 'job_id'), Number(progress.completed_count || 0), progress.current_ordinal ?? null, JSON.stringify(progress.selected_items || []), JSON.stringify(progress.skip_audit || []), timestamp]);
     if (!result.rows[0]) throw new Error('Phase 3C1 Preview Job 不再处于 running 状态。'); return phase3c1PreviewJobRow(result.rows[0]);
   }
+  async function persistPhase3C1PreviewJobMaterials(jobId, { preview, materials, frozen_selection_input = null } = {}) {
+    const key = required(jobId, 'job_id');
+    validatePhase3C1Preview(preview, frozen_selection_input);
+    validatePhase3C2Material(preview, materials);
+    const job = await getPhase3C1PreviewJob(key);
+    if (job.job_state !== 'running') throw new Error('只有 running Preview Job 可以保存冻结材料。');
+    if (stable(job.selection_input) !== stable(frozen_selection_input || job.selection_input)) throw new Error('Preview Job 冻结选择输入不一致。');
+    const timestamp = clock();
+    const rows = preview.items.map((item) => {
+      const material = materials.find((value) => Number(value.ordinal) === Number(item.ordinal));
+      const raw_object_key = `phase3c1-preview-jobs/${key}/materials/${item.ordinal}/raw`;
+      const normalized_text_object_key = `phase3c1-preview-jobs/${key}/materials/${item.ordinal}/normalized-text`;
+      const material_provenance = { ordinal: item.ordinal, original_rank: item.original_rank, original_index: item.original_index, official_url: item.official_url, http_status: Number(material.http_status), response_headers_subset: material.response_headers_subset || {}, upstream_attempts: material.upstream_attempts || [] };
+      const raw_sha256 = sha256(String(material.raw_html));
+      const normalized_text_sha256 = sha256(String(material.normalized_text));
+      return { item, material, raw_object_key, normalized_text_object_key, material_provenance, raw_sha256, normalized_text_sha256, material_hash: sha256(stable({ item, material_provenance, raw_sha256, normalized_text_sha256 })) };
+    });
+    const material_set_hash = sha256(stable(rows.map((row) => ({ ordinal: row.item.ordinal, material_hash: row.material_hash }))));
+    const written = [];
+    try {
+      for (const row of rows) {
+        await objectStore.putImmutable(row.raw_object_key, String(row.material.raw_html)); written.push(row.raw_object_key);
+        await objectStore.putImmutable(row.normalized_text_object_key, String(row.material.normalized_text)); written.push(row.normalized_text_object_key);
+      }
+      await transaction(async (client) => {
+        const existing = await client.query('SELECT 1 FROM phase3c1_preview_job_materials WHERE job_id=$1 LIMIT 1', [key]);
+        if (existing.rows.length) throw new Error('Preview Job 冻结材料已存在，拒绝覆盖。');
+        for (const row of rows) await client.query(
+          `INSERT INTO phase3c1_preview_job_materials (job_id,ordinal,original_rank,original_index,official_url,body_hash,item_fingerprint,item,material_provenance,raw_object_key,normalized_text_object_key,raw_sha256,normalized_text_sha256,material_hash,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [key, row.item.ordinal, row.item.original_rank, row.item.original_index, canonical(row.item.official_url), row.item.body_hash, row.item.item_fingerprint, JSON.stringify(row.item), JSON.stringify(row.material_provenance), row.raw_object_key, row.normalized_text_object_key, row.raw_sha256, row.normalized_text_sha256, row.material_hash, timestamp]
+        );
+        await client.query(`UPDATE phase3c1_preview_jobs SET preview_selection_criteria=$2,material_set_hash=$3,heartbeat_at=$4,updated_at=$4,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='running'`, [key, JSON.stringify(preview.selection_criteria), material_set_hash, timestamp]);
+        await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'phase3c1_preview_job', key, 'phase3c1_preview_job_materials_frozen', JSON.stringify({ item_count: rows.length, material_set_hash, business_production_writes: 0 }), timestamp]);
+      });
+    } catch (error) {
+      if (typeof objectStore.deleteUnreferenced === 'function') await Promise.allSettled(written.map((objectKey) => objectStore.deleteUnreferenced(objectKey)));
+      throw error;
+    }
+    return { material_set_hash, item_count: rows.length, business_production_writes: 0 };
+  }
   async function finishPhase3C1PreviewJob(jobId, { preview, state, failure = null, frozen_selection_input = null } = {}) {
     const timestamp = clock(); const isPassed = state === 'passed';
     if (isPassed) validatePhase3C1Preview(preview, frozen_selection_input);
@@ -1184,5 +1308,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

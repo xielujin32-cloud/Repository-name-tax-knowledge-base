@@ -734,12 +734,11 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/phase3c1/import-manifests') {
       const input = await requestBody(request);
-      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 2 || input.freeze !== true || input.confirmation !== PHASE3C1_IMPORT_MANIFEST_CONFIRMATION) {
-        return json({ error: 'Phase 3C-1 manifest 只接受固定 freeze 与确认短语，不接受 URL、Candidate、正文、Policy 字段或 legal_status。' }, 400);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 3 || input.freeze !== true || input.confirmation !== PHASE3C1_IMPORT_MANIFEST_CONFIRMATION || !String(input.source_preview_job_id || '').trim()) {
+        return json({ error: 'Phase 3C-1 manifest 只接受 PASSED Preview Job ID、固定 freeze 与确认短语，不接受 URL、Candidate、正文、Policy 字段或 legal_status。' }, 400);
       }
-      const preview = await phase3c1PreviewFactory({ fetchImpl });
-      const frozen = await repositoryFactory().createPhase3C1FrozenImportManifest({ preview });
-      return json({ mode: 'frozen_manifest', created: frozen.created, manifest: frozen.manifest, items: safePhase3C1Preview(preview).items });
+      const frozen = await repositoryFactory().createPhase3C1FrozenImportManifestFromPreviewJob({ source_preview_job_id: input.source_preview_job_id });
+      return json({ mode: 'frozen_manifest', created: frozen.created, manifest: frozen.manifest, items: frozen.items, business_production_writes: 0 });
     }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+$/.test(pathname)) {
       const manifestId = decodeURIComponent(pathname.split('/').pop());
@@ -748,8 +747,7 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/preflight$/.test(pathname)) {
       const manifestId = decodeURIComponent(pathname.split('/')[6]);
-      const preview = await phase3c1PreviewFactory({ fetchImpl });
-      const value = await repositoryFactory().preflightControlledImportManifest(manifestId, { current_preview: preview });
+      const value = await repositoryFactory().preflightControlledImportManifest(manifestId);
       const projection = await publicProjectionPreflight(value.items, { listPublicPolicies, readPublicPolicy });
       return json(safePhase3C1Preflight(value, projection));
     }
@@ -759,7 +757,7 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
         return json({ error: 'Phase 3C-2 preflight 只接受固定 check 与 frozen manifest hash，不接受 URL、正文、Candidate、Policy 字段或 legal_status。' }, 400);
       }
       const manifestId = decodeURIComponent(pathname.split('/')[6]);
-      const value = await repositoryFactory().createPhase3C2ControlledPreflight({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash, current_preview: await phase3c1PreviewFactory({ fetchImpl }) });
+      const value = await repositoryFactory().createPhase3C2ControlledPreflight({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash });
       return json(safePhase3C2Preflight(value));
     }
     if (request.method === 'POST' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/apply$/.test(pathname)) {
@@ -768,8 +766,7 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
         return json({ error: 'Phase 3C-2 Apply 只接受 frozen manifest hash、服务器 preflight ID、固定 apply 与确认短语，不接受 URL、正文、Candidate、Policy 字段或 legal_status。' }, 400);
       }
       const manifestId = decodeURIComponent(pathname.split('/')[6]);
-      const collected = await phase3c1ApplyMaterialFactory({ fetchImpl });
-      return json(safePhase3C2Apply(await repositoryFactory().applyPhase3C2ControlledImport({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash, preflight_id: input.preflight_id, current_preview: collected.preview, materials: collected.materials })));
+      return json(safePhase3C2Apply(await repositoryFactory().applyPhase3C2ControlledImport({ controlled_manifest_id: manifestId, manifest_hash: input.manifest_hash, preflight_id: input.preflight_id })));
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/risk-queue/manifests') {
       const input = await requestBody(request);

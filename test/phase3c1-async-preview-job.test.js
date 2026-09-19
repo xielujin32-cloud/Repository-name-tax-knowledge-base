@@ -39,19 +39,23 @@ test('异步 Preview Job API 必须管理员认证、拒绝目标注入且只调
   } finally { if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous; }
 });
 
-test('异步 Worker 只消费 Job frozen snapshot，PASS 不创建 manifest 或业务对象', async () => {
-  const calls = []; let finishedWithSelection; const repository = {
+test('异步 Worker 只消费 Job frozen snapshot，PASS 冻结材料但不创建 manifest 或业务对象', async () => {
+  const calls = []; let finishedWithSelection; let persisted;
+  const repository = {
     beginPhase3C1PreviewJob: async () => ({ claimed: true, job: fakeJob('running') }),
     updatePhase3C1PreviewJobProgress: async (_, progress) => calls.push(progress),
+    persistPhase3C1PreviewJobMaterials: async (_, value) => { persisted = value; return { item_count: 10, business_production_writes: 0 }; },
     finishPhase3C1PreviewJob: async (_, { preview, frozen_selection_input }) => { finishedWithSelection = frozen_selection_input; return { ...fakeJob('passed'), completed_count: 10, result_hash: preview.manifest_hash }; },
     blockPhase3C1PreviewJob: async () => assert.fail('must not block'), failPhase3C1PreviewJob: async () => assert.fail('must not fail')
   };
   const preview = { manifest_hash: 'c'.repeat(64), selection_criteria: { selected: [{ ordinal: 1, original_rank: 1, original_index: 4, official_url: 'https://fgk.chinatax.gov.cn/fixed' }] }, skip_audit: [], items: Array.from({ length: 10 }, (_, index) => ({ ordinal: index + 1, body_hash: 'd'.repeat(64), document_no: `国税发〔2020〕${index + 1}号`, document_no_provenance: { confidence: 'high', source: 'structured_field' }, risk_assessment: { risk_level: 'low', risk_score: 0 }, relation_proposals: { proposed_count: 0 } })) };
   let receivedSelection;
-  const result = await runPhase3C1PreviewJob({ job_id: 'job', repository, collectPreview: async ({ onProgress, frozen_selection_input }) => { receivedSelection = frozen_selection_input; await onProgress({ current_ordinal: 1, completed_count: 1, total_count: 10, selected_items: [{ ordinal: 1 }], skip_audit: [] }); return { preview }; } });
+  const materials = Array.from({ length: 10 }, (_, index) => ({ ordinal: index + 1, raw_html: `<html>${index + 1}</html>`, normalized_text: `policy ${index + 1}`, http_status: 200 }));
+  const result = await runPhase3C1PreviewJob({ job_id: 'job', repository, collectPreview: async ({ onProgress, frozen_selection_input }) => { receivedSelection = frozen_selection_input; await onProgress({ current_ordinal: 1, completed_count: 1, total_count: 10, selected_items: [{ ordinal: 1 }], skip_audit: [] }); return { preview, materials }; } });
   assert.equal(result.job_state, 'passed'); assert.equal(calls.length, 1); assert.equal(JSON.stringify(calls).includes('raw_html'), false);
   assert.deepEqual(receivedSelection.frozen_candidate_pool, phase3c1PreviewJobSelectionInput().frozen_candidate_pool);
   assert.deepEqual(finishedWithSelection.frozen_candidate_pool, receivedSelection.frozen_candidate_pool);
+  assert.equal(persisted.materials.length, 10); assert.equal(JSON.stringify(persisted).includes('DO_NOT_PERSIST_SECRET_HTML'), false);
 });
 
 test('Worker 对 PreviewFailure block，对未知异常 failed，且不泄露异常文本', async () => {
