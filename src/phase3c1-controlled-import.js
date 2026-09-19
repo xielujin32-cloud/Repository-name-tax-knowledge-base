@@ -26,7 +26,7 @@ const PHASE3C1_TRANSIENT_RETRY_DELAY_MS = 5_000;
 // Background Preview Jobs fetch a server-owned pool sequentially. A fixed
 // inter-candidate pause makes the upstream request cadence auditable and keeps
 // a normal ten-item run well within the 12 minute application budget.
-export const PHASE3C1_CANDIDATE_COOLDOWN_MS = 5_000;
+export const PHASE3C1_CANDIDATE_COOLDOWN_MS = 30_000;
 export const PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS = 30_000;
 export const PHASE3C1_INCOMPLETE_RESPONSE_STREAK_LIMIT = 2;
 const PHASE3C1_RATE_LIMIT_MAX_DELAY_MS = 15_000;

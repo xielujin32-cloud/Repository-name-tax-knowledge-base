@@ -9,7 +9,7 @@ import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
-import { PHASE3C1_CANDIDATE_COOLDOWN_MS, PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, PHASE3C1_PREVIEW_TIME_BUDGET_MS, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
+import { PHASE3C1_ASYNC_PREVIEW_TIME_BUDGET_MS, PHASE3C1_CANDIDATE_COOLDOWN_MS, PHASE3C1_FIXED_IMPORT_URLS, PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, PHASE3C1_ORIGINAL_ELIGIBLE_CANDIDATE_POOL, PHASE3C1_PREVIEW_TIME_BUDGET_MS, Phase3C1PreviewFailure, comparePhase3C1FrozenManifest, fetchParsePhase3C1OfficialDetailWithRetry, preparePhase3C1ImportPreview, validatePhase3C1FallbackSelection } from '../src/phase3c1-controlled-import.js';
 import { parseChinaTaxPolicyEvidence } from '../src/chinatax-evidence-collection.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -102,7 +102,9 @@ test('Phase 3C-1 Preview fail-closed 返回安全的失败 ordinal 和阶段，�
     return new Response(html(ordinal), { status: 200, headers: { 'content-type': 'text/html' } });
   };
   try {
-    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({ fetchImpl: failingFetch }) });
+    const handler = createApiHandler({ evidenceAdminHandler: createEvidenceAdminHandler({
+      phase3c1PreviewFactory: async () => preparePhase3C1ImportPreview({ fetchImpl: failingFetch, waitImpl: noWait })
+    }) });
     const result = await request(handler, '/api/admin/evidence/phase3c1/import-preview', { token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN });
     assert.equal(result.response.status, 422);
     assert.deepEqual(calls, [1, 2, 3, 4], 'first failure must stop the remaining fixed URLs');
@@ -352,18 +354,20 @@ test('Phase 3C Preview stays read-only and never retries a downstream risk/eligi
 test('Phase 3C Preview 在总预算内完成，并且不会改变既有 deterministic fallback 选择', async () => {
   let monotonicNow = 0;
   const candidateCooldowns = [];
+  assert.equal(PHASE3C1_CANDIDATE_COOLDOWN_MS, 30_000, 'candidate cooldown must remain the audited 30 seconds');
   const preview = await preparePhase3C1ImportPreview({
-    fetchImpl: fakeFetch,
+    fetchImpl: async (url) => { monotonicNow += 20_000; return fakeFetch(url); },
     now: '2026-09-07T00:00:00.000Z',
     clock: () => monotonicNow,
-    time_budget_ms: PHASE3C1_PREVIEW_TIME_BUDGET_MS,
-    waitImpl: async (milliseconds) => { candidateCooldowns.push(milliseconds); }
+    time_budget_ms: PHASE3C1_ASYNC_PREVIEW_TIME_BUDGET_MS,
+    waitImpl: async (milliseconds) => { candidateCooldowns.push(milliseconds); monotonicNow += milliseconds; }
   });
   assert.equal(preview.items.length, 10);
   assert.deepEqual(preview.items.map((item) => item.original_rank), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
   assert.equal(preview.skip_audit.length, 0);
   assert.deepEqual(candidateCooldowns, Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS));
   assert.deepEqual(preview.items.map((item) => item.upstream_attempts[0].candidate_cooldown_before_ms), [0, ...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS)]);
+  assert.equal(monotonicNow, 470_000, 'ten 20-second fetches plus nine 30-second cooldowns remain within the 12-minute async budget');
 });
 
 test('Phase 3C Preview 在下一条 fetch 前总预算不足时 fail-closed，且不请求后续 URL', async () => {
@@ -432,12 +436,12 @@ test('Phase 3C Preview 在 retry 前或 retry wait 会耗尽总预算时停止�
     },
     waitImpl: async (milliseconds) => { recoveredWaits.push(milliseconds); monotonicNow += milliseconds; },
     clock: () => monotonicNow,
-    time_budget_ms: 150_000
+    time_budget_ms: 400_000
   });
   assert.equal(recovered.items.length, 10);
   assert.deepEqual(recoveredCalls.slice(0, 2), [1, 1]);
   assert.deepEqual(recoveredWaits, [PHASE3C1_INCOMPLETE_HTML_RETRY_DELAY_MS, ...Array(9).fill(PHASE3C1_CANDIDATE_COOLDOWN_MS)]);
-  assert.equal(monotonicNow, 108_000, 'retry and candidate cooldowns must leave the response reserve and must not exceed the total budget');
+  assert.equal(monotonicNow, 333_000, 'retry and candidate cooldowns must leave the response reserve and must not exceed the total budget');
 });
 
 test('Phase 3C Preview 时间预算保留 retry wait 与安全返回窗口，且 422 只返回安全字段并保持只读', async () => {
