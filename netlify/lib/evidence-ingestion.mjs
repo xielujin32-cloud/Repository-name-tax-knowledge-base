@@ -752,8 +752,11 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+$/.test(pathname)) {
       const manifestId = decodeURIComponent(pathname.split('/').pop());
-      const value = await repositoryFactory().getControlledImportManifest(manifestId);
-      return json({ manifest: value.manifest, items: value.items });
+      const repository = repositoryFactory();
+      const value = typeof repository.getPhase3C1FrozenManifestIntegrity === 'function'
+        ? await repository.getPhase3C1FrozenManifestIntegrity(manifestId)
+        : { ...(await repository.getControlledImportManifest(manifestId)), integrity: {} };
+      return json({ manifest: value.manifest, items: value.items, integrity: value.integrity, business_production_writes: 0 });
     }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-manifests\/[^/]+\/preflight$/.test(pathname)) {
       const manifestId = decodeURIComponent(pathname.split('/')[6]);

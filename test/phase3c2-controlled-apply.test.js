@@ -8,7 +8,7 @@ import { NetlifyDB } from '@netlify/database-dev';
 import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
-import { createPostgresEvidenceRepository, phase3c1PreviewJobMaterialReadiness } from '../src/postgres-evidence-repository.js';
+import { createPostgresEvidenceRepository, phase3c1FrozenManifestIntegrity, phase3c1PreviewJobMaterialReadiness } from '../src/postgres-evidence-repository.js';
 import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, collectPhase3C1ApplyMaterial, phase3c1ManifestFingerprint, phase3c1PreviewJobSelectionInput } from '../src/phase3c1-controlled-import.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -86,6 +86,61 @@ test('PASSED Preview Job 冻结完整 material 后可幂等创建 manifest，且
     assert.equal(rows.length, 10); assert.equal(JSON.stringify(rows).includes(body(1)), false, 'no full policy body may be persisted in job audit rows');
     assert.equal((await value.repository.counts()).raw_snapshots, 0); assert.equal((await value.repository.counts()).candidates, 0); assert.equal((await value.repository.counts()).policies, 0);
   } finally { await close(value); }
+});
+
+test('Frozen Manifest GET integrity 逐条核验来源 Job material，不读取正文或对象存储', async () => {
+  const value = await fixture();
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-manifest-integrity-token';
+  try {
+    const { job, frozen } = await createFrozenReady(value);
+    const detail = await value.repository.getPhase3C1PreviewJobReadiness(job.job_id);
+    const stored = await value.repository.getPhase3C1FrozenManifestIntegrity(frozen.manifest.controlled_manifest_id);
+    const rows = (await value.database.query('SELECT * FROM phase3c1_preview_job_materials WHERE job_id=$1 ORDER BY ordinal', [job.job_id])).rows.map((row) => ({
+      ...row,
+      item: typeof row.item === 'string' ? JSON.parse(row.item) : row.item,
+      material_provenance: typeof row.material_provenance === 'string' ? JSON.parse(row.material_provenance) : row.material_provenance
+    }));
+    assert.equal(frozen.manifest.manifest_hash, phase3c1ManifestFingerprint({ items: rows.map((row) => row.item), selection_criteria: detail.job.preview_selection_criteria }));
+    assert.equal(stored.integrity.source_job_passed, true);
+    assert.equal(stored.integrity.material_set_hash, detail.material_readiness.material_set_hash);
+    assert.equal(stored.integrity.material_set_hash_matches_rows, true);
+    assert.equal(stored.integrity.manifest_items_match_source_materials, true);
+    assert.equal(stored.integrity.material_count, 10);
+    assert.equal(stored.integrity.complete_material_count, 10);
+    assert.equal(stored.integrity.ordinal_complete, true);
+    assert.equal(stored.integrity.selection_provenance_complete, true);
+    assert.equal(stored.integrity.manifest_hash_matches_frozen_items, true, JSON.stringify({ stored: stored.manifest.manifest_hash, computed: stored.integrity.computed_manifest_hash }));
+    assert.equal(stored.integrity.ready_for_preflight_validation, true);
+
+    const notPassed = clone(detail.job); notPassed.job_state = 'blocked';
+    assert.equal(phase3c1FrozenManifestIntegrity(stored.manifest, stored.items, notPassed, rows).source_job_passed, false);
+    const hashMismatch = clone(rows); hashMismatch[0].material_hash = 'f'.repeat(64);
+    assert.equal(phase3c1FrozenManifestIntegrity(stored.manifest, stored.items, detail.job, hashMismatch).material_set_hash_matches_rows, false);
+    const manifestMismatch = clone(stored.items); manifestMismatch[0].title = 'unexpected title';
+    assert.equal(phase3c1FrozenManifestIntegrity(stored.manifest, manifestMismatch, detail.job, rows).manifest_items_match_source_materials, false);
+    const provenanceMismatch = clone(rows); provenanceMismatch[0].original_rank = 99;
+    assert.equal(phase3c1FrozenManifestIntegrity(stored.manifest, stored.items, detail.job, provenanceMismatch).selection_provenance_complete, false);
+
+    const handler = createEvidenceAdminHandler({ repositoryFactory: () => value.repository, fetchImpl: async () => { throw new Error('manifest integrity must not fetch official URLs'); } });
+    const pathname = `/api/admin/evidence/phase3c1/import-manifests/${frozen.manifest.controlled_manifest_id}`;
+    const response = await handler(new Request(`https://taxkb.example${pathname}`, { headers: { authorization: 'Bearer phase3c1-manifest-integrity-token' } }), pathname, new URL(`https://taxkb.example${pathname}`));
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.manifest.source_preview_job_id, job.job_id);
+    assert.equal(payload.items.length, 10);
+    assert.equal(payload.integrity.manifest_items_match_source_materials, true);
+    assert.equal(payload.integrity.ready_for_preflight_validation, true);
+    assert.equal(payload.business_production_writes, 0);
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes(body(1)), false, 'Manifest GET must never expose raw or normalized policy body');
+    assert.equal(serialized.includes('raw_object_key'), false, 'Manifest GET must never expose protected object keys');
+    assert.equal(serialized.includes('normalized_text_object_key'), false, 'Manifest GET must never expose protected object keys');
+    assert.equal(serialized.includes('phase3c1-manifest-integrity-token'), false, 'Manifest GET must never expose credentials');
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+    await close(value);
+  }
 });
 
 test('Preview Job status 安全验证逐条 material 完整性，不返回正文或对象存储路径', async () => {
