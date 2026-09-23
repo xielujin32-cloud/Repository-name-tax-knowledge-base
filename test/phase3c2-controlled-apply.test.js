@@ -8,7 +8,7 @@ import { NetlifyDB } from '@netlify/database-dev';
 import { createApiHandler } from '../netlify/functions/api.mjs';
 import { createEvidenceAdminHandler } from '../netlify/lib/evidence-ingestion.mjs';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
-import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
+import { createPostgresEvidenceRepository, phase3c1PreviewJobMaterialReadiness } from '../src/postgres-evidence-repository.js';
 import { PHASE3C1_FIXED_IMPORT_URLS, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, collectPhase3C1ApplyMaterial, phase3c1ManifestFingerprint, phase3c1PreviewJobSelectionInput } from '../src/phase3c1-controlled-import.js';
 
 const body = (index) => `为明确个人所得税征管事项，现将第${index}项安排公告如下。纳税人应当按照规定办理申报并保留资料，税务机关应当依法提供征管服务。${'本公告明确适用对象、申报要求、资料留存和监督管理安排。'.repeat(20)}`;
@@ -86,6 +86,44 @@ test('PASSED Preview Job 冻结完整 material 后可幂等创建 manifest，且
     assert.equal(rows.length, 10); assert.equal(JSON.stringify(rows).includes(body(1)), false, 'no full policy body may be persisted in job audit rows');
     assert.equal((await value.repository.counts()).raw_snapshots, 0); assert.equal((await value.repository.counts()).candidates, 0); assert.equal((await value.repository.counts()).policies, 0);
   } finally { await close(value); }
+});
+
+test('Preview Job status 安全验证逐条 material 完整性，不返回正文或对象存储路径', async () => {
+  const value = await fixture();
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase3c1-readiness-token';
+  try {
+    const { job } = await createFrozenReady(value);
+    const detail = await value.repository.getPhase3C1PreviewJobReadiness(job.job_id);
+    assert.equal(detail.material_readiness.material_count, 10);
+    assert.equal(detail.material_readiness.complete_material_count, 10);
+    assert.equal(detail.material_readiness.material_ordinals_complete, true);
+    assert.equal(detail.material_readiness.selection_provenance_complete, true);
+    assert.equal(detail.material_readiness.material_set_hash_matches_rows, true);
+    assert.equal(detail.material_readiness.protected_object_integrity_metadata_present, true);
+    assert.equal(detail.material_readiness.ready_to_create_frozen_manifest, 'YES');
+
+    const rows = (await value.database.query('SELECT * FROM phase3c1_preview_job_materials WHERE job_id=$1 ORDER BY ordinal', [job.job_id])).rows.map((row) => ({
+      ...row,
+      item: typeof row.item === 'string' ? JSON.parse(row.item) : row.item,
+      material_provenance: typeof row.material_provenance === 'string' ? JSON.parse(row.material_provenance) : row.material_provenance
+    }));
+    const incomplete = clone(rows); incomplete[0].item.title = '';
+    assert.equal(phase3c1PreviewJobMaterialReadiness(detail.job, incomplete).complete_material_count, 9, 'complete count must validate each material payload, not only row count');
+
+    const handler = createEvidenceAdminHandler({ repositoryFactory: () => value.repository, fetchImpl: async () => { throw new Error('status must not fetch official URLs'); } });
+    const pathname = `/api/admin/evidence/phase3c1/import-preview-jobs/${job.job_id}`;
+    const response = await handler(new Request(`https://taxkb.example${pathname}`, { headers: { authorization: 'Bearer phase3c1-readiness-token' } }), pathname, new URL(`https://taxkb.example${pathname}`));
+    const payload = await response.json();
+    assert.equal(response.status, 200); assert.equal(payload.job.job_state, 'passed'); assert.equal(payload.job.preview_result, 'PASS'); assert.equal(payload.job.complete_material_count, 10); assert.equal(payload.job.material_set_hash_matches_rows, true);
+    assert.equal(payload.job.selection_provenance_complete, true); assert.equal(payload.job.protected_object_integrity_metadata_present, true); assert.equal(payload.job.ready_to_create_frozen_manifest, 'YES');
+    assert.equal(JSON.stringify(payload).includes(body(1)), false, 'status API must never expose raw or normalized policy body');
+    assert.equal(JSON.stringify(payload).includes('normalized_text_object_key'), false, 'status API must not expose protected object keys');
+    assert.equal(payload.business_production_writes, 0);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+    await close(value);
+  }
 });
 
 test('blocked 或不完整 Preview Job 不能创建 frozen manifest', async () => {

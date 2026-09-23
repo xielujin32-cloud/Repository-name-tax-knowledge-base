@@ -45,18 +45,24 @@ async function defaultPhase3C1PreviewJobDispatcher({ job_id }) {
   if (!response.ok && response.status !== 202) throw new Error('Phase 3C1 Preview Job 未能调度。');
 }
 
-function safePhase3C1PreviewJob(job) {
+function safePhase3C1PreviewJob(job, materialReadiness = {}) {
   const stale = Boolean(job?.is_stale);
   const status = stale ? 'failed' : (job?.job_state || 'failed');
+  const previewResult = status === 'passed' ? 'PASS' : (status === 'blocked' || status === 'failed' ? 'BLOCKED' : 'IN_PROGRESS');
+  const selectedItems = Array.isArray(job?.selected_items) ? job.selected_items : [];
+  const readiness = materialReadiness && typeof materialReadiness === 'object' ? materialReadiness : {};
   return {
-    job_id: job?.job_id || null, phase: 'phase3c1', mode: 'production_preview', status,
+    job_id: job?.job_id || null, phase: 'phase3c1', mode: 'production_preview', job_state: job?.job_state || status, status, preview_result: previewResult,
     completed_count: Number(job?.completed_count || 0), total_count: Number(job?.total_count || 10), current_ordinal: job?.current_ordinal ?? null,
     selection_rule_version: job?.selection_rule_version || null, candidate_pool_version: job?.candidate_pool_version || null,
     candidate_pool_hash: job?.candidate_pool_hash || null, selection_hash: job?.selection_hash || null,
-    selected_items: Array.isArray(job?.selected_items) ? job.selected_items : [], skip_audit: Array.isArray(job?.skip_audit) ? job.skip_audit : [],
+    selected_items: selectedItems, selected_items_count: Number(readiness.selected_items_count ?? selectedItems.length), skip_audit: Array.isArray(job?.skip_audit) ? job.skip_audit : [],
     failure_code: stale ? 'PREVIEW_JOB_STALE' : (job?.failure_code || null), failure: stale ? { failure_stage: 'worker-liveness', failure_code: 'PREVIEW_JOB_STALE' } : (job?.safe_failure || null), result_hash: job?.result_hash || null,
+    material_count: Number(readiness.material_count || 0), complete_material_count: Number(readiness.complete_material_count || 0),
+    material_set_hash: readiness.material_set_hash || null, material_set_hash_matches_rows: Boolean(readiness.material_set_hash_matches_rows),
+    material_ordinals_complete: Boolean(readiness.material_ordinals_complete), selection_provenance_complete: Boolean(readiness.selection_provenance_complete), protected_object_integrity_metadata_present: Boolean(readiness.protected_object_integrity_metadata_present),
     preview_job_audit_writes: Number(job?.preview_job_audit_writes || 0), business_production_writes: 0,
-    ready_to_create_frozen_manifest: status === 'passed' ? 'YES' : 'NO'
+    ready_to_create_frozen_manifest: status === 'passed' && readiness.ready_to_create_frozen_manifest === 'YES' ? 'YES' : 'NO'
   };
 }
 
@@ -718,7 +724,11 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       return json({ created: result.created, dispatch: 'scheduled', job: safePhase3C1PreviewJob(result.job), business_production_writes: 0 }, result.created ? 202 : 200);
     }
     if (request.method === 'GET' && /^\/api\/admin\/evidence\/phase3c1\/import-preview-jobs\/[^/]+$/.test(pathname)) {
-      return json({ job: safePhase3C1PreviewJob(await repositoryFactory().getPhase3C1PreviewJob(decodeURIComponent(pathname.split('/').pop()))), business_production_writes: 0 });
+      const repository = repositoryFactory(); const jobId = decodeURIComponent(pathname.split('/').pop());
+      const detail = typeof repository.getPhase3C1PreviewJobReadiness === 'function'
+        ? await repository.getPhase3C1PreviewJobReadiness(jobId)
+        : { job: await repository.getPhase3C1PreviewJob(jobId), material_readiness: {} };
+      return json({ job: safePhase3C1PreviewJob(detail.job, detail.material_readiness), business_production_writes: 0 });
     }
     if (request.method === 'GET' && pathname === '/api/admin/evidence/phase3c1/import-preview-diagnostics') {
       return json(await diagnosePhase3C1ImportPreview({ fetchImpl }));

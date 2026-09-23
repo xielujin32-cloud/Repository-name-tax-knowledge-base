@@ -48,6 +48,75 @@ const phase3c1PreviewJobIsStale = (row, timestamp) => {
   const observed = Date.parse(row.heartbeat_at || row.started_at || row.created_at || ''); const current = Date.parse(timestamp || '');
   return Number.isFinite(observed) && Number.isFinite(current) && current - observed > PHASE3C1_PREVIEW_JOB_STALE_AFTER_MS;
 };
+const hasOwn = (value, key) => Boolean(value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, key));
+const isObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const isSha256 = (value) => /^[a-f0-9]{64}$/.test(String(value || ''));
+const hasText = (value) => Boolean(String(value || '').trim());
+
+// This is deliberately metadata-only: it verifies the persisted audit record
+// structure and integrity hashes without reading raw HTML or normalized text
+// from the protected object store.
+export function phase3c1PreviewJobMaterialReadiness(job, materialRows = []) {
+  const total = PHASE3C1_FIXED_IMPORT_URLS.length;
+  const rows = Array.isArray(materialRows) ? materialRows : [];
+  const selected = Array.isArray(job?.preview_selection_criteria?.selected) ? job.preview_selection_criteria.selected : [];
+  const selectionByOrdinal = new Map(selected.map((item) => [Number(item?.ordinal), item]));
+  const selectionProvenanceValid = (row) => {
+    const selection = selectionByOrdinal.get(Number(row?.ordinal));
+    return Boolean(selection && Number(selection.original_rank) === Number(row?.original_rank)
+      && Number(selection.original_index) === Number(row?.original_index)
+      && String(selection.official_url) === String(row?.official_url));
+  };
+  const materialIsComplete = (row) => {
+    const item = isObject(row?.item) ? row.item : {};
+    const provenance = isObject(row?.material_provenance) ? row.material_provenance : {};
+    const itemFieldsPresent = ['title', 'document_no', 'document_no_provenance', 'publish_date', 'body_hash', 'parser_version', 'risk_assessment', 'metadata_suggestion', 'relation_proposals', 'item_fingerprint']
+      .every((key) => hasOwn(item, key));
+    const itemValuesValid = hasText(item.title) && hasText(item.document_no) && isObject(item.document_no_provenance)
+      && item.document_no_provenance.confidence === 'high' && ['structured_field', 'title_nearby', 'body_lead'].includes(item.document_no_provenance.source)
+      && hasText(item.publish_date) && isSha256(item.body_hash) && hasText(item.parser_version) && isObject(item.risk_assessment)
+      && item.risk_assessment.risk_level === 'low' && Number(item.risk_assessment.risk_score) === 0
+      && isObject(item.metadata_suggestion) && isObject(item.relation_proposals)
+      && Number(item.relation_proposals.proposed_count) === 0 && isSha256(item.item_fingerprint);
+    const provenanceValid = Number(provenance.ordinal) === Number(row?.ordinal)
+      && Number(provenance.original_rank) === Number(row?.original_rank)
+      && Number(provenance.original_index) === Number(row?.original_index)
+      && hasText(provenance.official_url) && String(provenance.official_url) === String(row?.official_url)
+      && hasText(row?.official_url) && Number(item.ordinal) === Number(row?.ordinal);
+    const materialHashMatchesMetadata = isSha256(row?.material_hash)
+      && row.material_hash === sha256(stable({ item, material_provenance: provenance, raw_sha256: row?.raw_sha256, normalized_text_sha256: row?.normalized_text_sha256 }));
+    return itemFieldsPresent && itemValuesValid && provenanceValid && selectionProvenanceValid(row) && isSha256(row?.body_hash)
+      && row.body_hash === item.body_hash && isSha256(row?.item_fingerprint) && row.item_fingerprint === item.item_fingerprint && materialHashMatchesMetadata;
+  };
+  const integrityMetadataPresent = rows.length === total && rows.every((row) => hasText(row?.raw_object_key)
+    && hasText(row?.normalized_text_object_key) && isSha256(row?.raw_sha256)
+    && isSha256(row?.normalized_text_sha256) && isSha256(row?.material_hash)
+    && row.material_hash === sha256(stable({ item: row?.item, material_provenance: row?.material_provenance, raw_sha256: row?.raw_sha256, normalized_text_sha256: row?.normalized_text_sha256 })));
+  const ordinals = new Set(rows.map((row) => Number(row?.ordinal)));
+  const materialOrdinalsComplete = rows.length === total && [...Array(total)].every((_, index) => ordinals.has(index + 1));
+  const completeMaterialCount = rows.filter(materialIsComplete).length;
+  const computedMaterialSetHash = materialOrdinalsComplete
+    ? sha256(stable([...rows].sort((left, right) => Number(left.ordinal) - Number(right.ordinal)).map((row) => ({ ordinal: Number(row.ordinal), material_hash: row.material_hash }))))
+    : null;
+  const materialSetHash = isSha256(job?.material_set_hash) ? job.material_set_hash : null;
+  const materialSetHashMatchesRows = Boolean(materialSetHash && computedMaterialSetHash && materialSetHash === computedMaterialSetHash);
+  const selectionProvenanceComplete = selected.length === total && materialOrdinalsComplete && rows.every(selectionProvenanceValid);
+  const selectedItemsCount = Array.isArray(job?.selected_items) ? job.selected_items.length : 0;
+  const previewComplete = !job?.is_stale && job?.job_state === 'passed'
+    && Number(job?.completed_count) === total && Number(job?.total_count) === total
+    && selectedItemsCount === total && isSha256(job?.result_hash) && isObject(job?.preview_selection_criteria);
+  return {
+    selected_items_count: selectedItemsCount,
+    material_count: rows.length,
+    complete_material_count: completeMaterialCount,
+    material_set_hash: materialSetHash,
+    material_set_hash_matches_rows: materialSetHashMatchesRows,
+    material_ordinals_complete: materialOrdinalsComplete,
+    selection_provenance_complete: selectionProvenanceComplete,
+    protected_object_integrity_metadata_present: integrityMetadataPresent,
+    ready_to_create_frozen_manifest: previewComplete && completeMaterialCount === total && materialSetHashMatchesRows && selectionProvenanceComplete && integrityMetadataPresent ? 'YES' : 'NO'
+  };
+}
 
 export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
@@ -1207,6 +1276,11 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     if (!locked.acquired) throw new Error('Phase 3C1 Preview Job 正在创建，请稍后重试。'); return locked.result;
   }
   async function getPhase3C1PreviewJob(jobId) { const row = (await pool.query('SELECT * FROM phase3c1_preview_jobs WHERE job_id=$1', [required(jobId, 'job_id')])).rows[0]; if (!row) throw new Error('Phase 3C1 Preview Job 不存在。'); return { ...phase3c1PreviewJobRow(row), is_stale: phase3c1PreviewJobIsStale(row, clock()) }; }
+  async function getPhase3C1PreviewJobReadiness(jobId) {
+    const job = await getPhase3C1PreviewJob(jobId);
+    const rows = (await pool.query('SELECT * FROM phase3c1_preview_job_materials WHERE job_id=$1 ORDER BY ordinal ASC', [job.job_id])).rows.map(phase3c1PreviewJobMaterialRow);
+    return { job, material_readiness: phase3c1PreviewJobMaterialReadiness(job, rows) };
+  }
   async function beginPhase3C1PreviewJob(jobId) {
     const timestamp = clock(); const result = await pool.query("UPDATE phase3c1_preview_jobs SET job_state='running',started_at=COALESCE(started_at,$2),heartbeat_at=$2,updated_at=$2,preview_job_audit_writes=preview_job_audit_writes+1 WHERE job_id=$1 AND job_state='queued' RETURNING *", [required(jobId, 'job_id'), timestamp]);
     if (!result.rows[0]) return { claimed: false, job: await getPhase3C1PreviewJob(jobId) };
@@ -1308,5 +1382,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }
