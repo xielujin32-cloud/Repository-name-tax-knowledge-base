@@ -1,10 +1,14 @@
-import { createPostgresEvidenceRepository } from '../../src/postgres-evidence-repository.js';
+import { createRecoverablePostgresEvidenceRepositoryFactory } from '../../src/postgres-evidence-repository.js';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { runPhase3C1PreviewJob } from '../lib/phase3c1-preview-job.mjs';
 
 export const config = { background: true };
 
-export function createPhase3C1PreviewJobBackgroundHandler({ repositoryFactory = () => createPostgresEvidenceRepository({ objectStore: createNetlifyBlobsEvidenceObjectStore() }), previewJobRunner = runPhase3C1PreviewJob, dispatchToken = () => process.env.NETLIFY_PHASE3C1_PREVIEW_JOB_DISPATCH_TOKEN } = {}) {
+const defaultRepositoryFactory = createRecoverablePostgresEvidenceRepositoryFactory({
+  objectStoreFactory: () => createNetlifyBlobsEvidenceObjectStore()
+});
+
+export function createPhase3C1PreviewJobBackgroundHandler({ repositoryFactory = defaultRepositoryFactory, previewJobRunner = runPhase3C1PreviewJob, dispatchToken = () => process.env.NETLIFY_PHASE3C1_PREVIEW_JOB_DISPATCH_TOKEN } = {}) {
   return async (request) => {
     if (request.method !== 'POST') return new Response(null, { status: 405 });
     const expected = String(dispatchToken() || '');

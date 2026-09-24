@@ -53,6 +53,63 @@ const isObject = (value) => Boolean(value && typeof value === 'object' && !Array
 const isSha256 = (value) => /^[a-f0-9]{64}$/.test(String(value || ''));
 const hasText = (value) => Boolean(String(value || '').trim());
 
+// A Neon Pool emits `error` when an idle WebSocket connection is terminated.
+// Without a listener Node treats that event as an uncaught exception.  The
+// listener intentionally records only health state: error objects may include
+// connection details and must never be logged or persisted here.
+const poolConnectionHealth = new WeakMap();
+
+export function monitorPostgresPoolConnection(pool, { onInvalidated } = {}) {
+  if (!pool || typeof pool !== 'object') return { invalidated: false };
+  let health = poolConnectionHealth.get(pool);
+  if (!health) {
+    health = { invalidated: false, listeners: new Set() };
+    if (typeof pool.on === 'function') {
+      pool.on('error', () => {
+        health.invalidated = true;
+        for (const listener of health.listeners) {
+          try { listener(); } catch { /* Health reporting must not crash a Function. */ }
+        }
+      });
+    }
+    poolConnectionHealth.set(pool, health);
+  }
+  if (typeof onInvalidated === 'function') health.listeners.add(onInvalidated);
+  return health;
+}
+
+function closePoolSilently(pool) {
+  if (!pool || typeof pool.end !== 'function') return;
+  try {
+    const closing = pool.end();
+    if (closing && typeof closing.catch === 'function') closing.catch(() => {});
+  } catch { /* The failed pool is being discarded; never log connection data. */ }
+}
+
+// The factory is module-safe for Netlify Functions: warm invocations reuse one
+// healthy Pool, while an idle-connection error invalidates it and the next
+// request gets a newly created Pool/repository.  It is intentionally generic
+// so the background worker can use the same lifecycle policy.
+export function createRecoverablePostgresEvidenceRepositoryFactory({ poolFactory = () => getDatabase().pool, objectStoreFactory, repositoryFactory = createPostgresEvidenceRepository } = {}) {
+  if (typeof poolFactory !== 'function') throw new Error('poolFactory 必须是函数。');
+  if (typeof objectStoreFactory !== 'function') throw new Error('objectStoreFactory 必须是函数。');
+  let cached = null;
+  return () => {
+    if (cached?.health?.invalidated) {
+      closePoolSilently(cached.pool);
+      cached = null;
+    }
+    if (!cached) {
+      const pool = poolFactory();
+      const entry = { pool, health: null, repository: null };
+      entry.health = monitorPostgresPoolConnection(pool, { onInvalidated: () => { entry.invalidated = true; } });
+      entry.repository = repositoryFactory({ pool, objectStore: objectStoreFactory(), onPoolInvalidated: () => { entry.invalidated = true; } });
+      cached = entry;
+    }
+    return cached.repository;
+  };
+}
+
 // This is deliberately metadata-only: it verifies the persisted audit record
 // structure and integrity hashes without reading raw HTML or normalized text
 // from the protected object store.
@@ -216,8 +273,9 @@ export function phase3c1FrozenManifestIntegrity(manifest, manifestItems = [], jo
   };
 }
 
-export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now } = {}) {
+export function createPostgresEvidenceRepository({ pool = getDatabase().pool, objectStore, id = (prefix) => `${prefix}-${randomUUID()}`, clock = now, onPoolInvalidated } = {}) {
   if (!objectStore) throw new Error('持久化 Evidence Repository 必须提供独立 objectStore。');
+  monitorPostgresPoolConnection(pool, { onInvalidated: onPoolInvalidated });
   async function transaction(work) {
     if (typeof pool.transaction === 'function') return pool.transaction(work);
     const client = await pool.connect();

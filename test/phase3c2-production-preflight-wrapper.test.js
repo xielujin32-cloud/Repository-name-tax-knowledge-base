@@ -44,6 +44,9 @@ test('Phase 3C2 Production Preflight wrapper fixes check/hash and does not leak 
   assert.doesNotMatch(wrapper, /Write-\(Host|Output\).*\$token/i);
   assert.doesNotMatch(wrapper, /ConvertTo-Json.*\$token/i);
   assert.doesNotMatch(wrapper, /raw_html|normalized_text|raw_object_key|normalized_text_object_key|cookie/i);
+  assert.match(wrapper, /function Safe-RequestId/);
+  assert.match(wrapper, /x-nf-request-id/);
+  assert.doesNotMatch(wrapper, /Response\.GetResponseStream|ReadToEnd/);
   for (const field of ['preflight_id', 'preflight_state', 'evidence_duplicate_free', 'expires_at', 'ready_for_apply', 'preflight_audit_writes', 'business_production_writes']) assert.match(wrapper, new RegExp(`${field}\\s*=`));
 });
 

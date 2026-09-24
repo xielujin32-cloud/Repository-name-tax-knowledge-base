@@ -1,4 +1,4 @@
-import { createPostgresEvidenceRepository } from '../../src/postgres-evidence-repository.js';
+import { createRecoverablePostgresEvidenceRepositoryFactory } from '../../src/postgres-evidence-repository.js';
 import { createHash } from 'node:crypto';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js';
@@ -31,9 +31,9 @@ async function requestBody(request) {
   try { return JSON.parse(text); } catch { throw new SyntaxError('请求正文必须是 JSON。'); }
 }
 
-function defaultRepositoryFactory() {
-  return createPostgresEvidenceRepository({ objectStore: createNetlifyBlobsEvidenceObjectStore() });
-}
+const defaultRepositoryFactory = createRecoverablePostgresEvidenceRepositoryFactory({
+  objectStoreFactory: () => createNetlifyBlobsEvidenceObjectStore()
+});
 
 async function defaultPhase3C1PreviewJobDispatcher({ job_id }) {
   const baseUrl = String(process.env.URL || '').replace(/\/$/, '');

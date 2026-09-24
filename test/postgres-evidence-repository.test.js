@@ -1,11 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
-import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
+import { createPostgresEvidenceRepository, createRecoverablePostgresEvidenceRepositoryFactory } from '../src/postgres-evidence-repository.js';
+
+test('Neon idle Pool error is contained and the next repository request receives a replacement Pool', () => {
+  class FakePool extends EventEmitter {
+    constructor() { super(); this.endCalls = 0; }
+    end() { this.endCalls += 1; return Promise.resolve(); }
+  }
+  const pools = [];
+  const factory = createRecoverablePostgresEvidenceRepositoryFactory({
+    poolFactory: () => { const pool = new FakePool(); pools.push(pool); return pool; },
+    objectStoreFactory: () => ({})
+  });
+  const first = factory();
+  assert.equal(pools.length, 1);
+  assert.doesNotThrow(() => pools[0].emit('error', new Error('Connection terminated unexpectedly')),
+    'an idle driver error must not become an uncaught Function exception');
+  const second = factory();
+  assert.equal(pools.length, 2, 'the next request must not reuse the invalidated pool');
+  assert.notStrictEqual(second, first);
+  assert.equal(pools[0].endCalls, 1, 'the invalidated pool is closed without logging its error object');
+});
 
 test('持久化 raw snapshot 在数据库层只能追加，不能更新或删除', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-postgres-evidence-'));

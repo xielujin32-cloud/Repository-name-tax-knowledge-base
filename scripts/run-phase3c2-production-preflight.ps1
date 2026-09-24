@@ -87,6 +87,18 @@ function Safe-Number {
   try { return [int]$Value } catch { return $null }
 }
 
+function Safe-RequestId {
+  param($Response)
+  if ($null -eq $Response) { return $null }
+  try {
+    $requestId = [string]$Response.Headers['x-nf-request-id']
+    if ([string]::IsNullOrWhiteSpace($requestId)) { $requestId = [string]$Response.Headers['x-request-id'] }
+    $requestId = $requestId.Trim()
+    if ($requestId -match '^[A-Za-z0-9._:-]{1,200}$') { return $requestId }
+  } catch { }
+  return $null
+}
+
 function Safe-IntegritySummary {
   param([Parameter(Mandatory = $true)]$Integrity)
   return [ordered]@{
@@ -184,7 +196,7 @@ try {
 } catch {
   $httpResponse = $_.Exception.Response
   if ($httpResponse) {
-    Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; http_status = [int]$httpResponse.StatusCode; error = 'preflight_http_error'; stage = $stage; business_production_writes = 0 })
+    Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; http_status = [int]$httpResponse.StatusCode; netlify_request_id = Safe-RequestId $httpResponse; error = 'preflight_http_error'; stage = $stage; business_production_writes = 0 })
   } elseif ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) {
     Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; error = 'local_token_input_error'; reason = $_.Exception.Message; business_production_writes = 0 })
   } else {

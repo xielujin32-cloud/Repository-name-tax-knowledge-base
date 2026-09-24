@@ -20,13 +20,13 @@ function fakeFetch(url) {
   return Promise.resolve(index ? new Response(html(index), { status: 200, headers: { 'content-type': 'text/html' } }) : new Response('not found', { status: 404 }));
 }
 
-async function fixture({ objectStoreFactory = createLocalEvidenceObjectStore } = {}) {
+async function fixture({ objectStoreFactory = createLocalEvidenceObjectStore, poolFactory = (database) => database } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-phase3c2-'));
   const database = new NetlifyDB({ directory: path.join(root, 'database'), logger: () => {} });
   await database.start(); await database.reset();
   await database.applyMigrations(path.join(process.cwd(), 'netlify', 'database', 'migrations'));
   const repository = createPostgresEvidenceRepository({
-    pool: database,
+    pool: poolFactory(database),
     objectStore: objectStoreFactory({ rootDirectory: path.join(root, 'objects') }),
     id: (prefix) => `${prefix}-${randomUUID()}`
   });
@@ -259,5 +259,35 @@ test('Phase 3C-2 拒绝 blocked、过期或不再 frozen 的 preflight，且不�
     const expired = await value.repository.applyPhase3C2ControlledImport({ controlled_manifest_id: frozen.manifest.controlled_manifest_id, manifest_hash: frozen.manifest.manifest_hash, preflight_id: expiring.preflight.preflight_id, current_preview: collected.preview, materials: collected.materials });
     assert.equal(expired.execution, 'rejected'); assert.equal(expired.apply.failure_reason, 'PREFLIGHT_EXPIRED');
     assert.equal((await value.repository.counts()).candidates, 0);
+  } finally { await close(value); }
+});
+
+test('Preflight database connection failure creates no additional preflight/audit half-record and no business Evidence', async () => {
+  let failDuplicateRead = false;
+  const value = await fixture({ poolFactory: (database) => ({
+    query: async (...args) => {
+      if (failDuplicateRead && String(args[0]).includes('SELECT snapshot_id')) throw new Error('Connection terminated unexpectedly');
+      return database.query(...args);
+    },
+    transaction: database.transaction.bind(database)
+  }) });
+  try {
+    const { frozen } = await createFrozenReady(value);
+    const before = await Promise.all([
+      value.database.query('SELECT COUNT(*)::int AS count FROM controlled_import_preflights'),
+      value.database.query("SELECT COUNT(*)::int AS count FROM audit_events WHERE entity_type='controlled_import_preflight'")
+    ]);
+    failDuplicateRead = true;
+    await assert.rejects(
+      () => value.repository.createPhase3C2ControlledPreflight({ controlled_manifest_id: frozen.manifest.controlled_manifest_id, manifest_hash: frozen.manifest.manifest_hash }),
+      /Connection terminated unexpectedly/
+    );
+    const after = await Promise.all([
+      value.database.query('SELECT COUNT(*)::int AS count FROM controlled_import_preflights'),
+      value.database.query("SELECT COUNT(*)::int AS count FROM audit_events WHERE entity_type='controlled_import_preflight'")
+    ]);
+    assert.deepEqual(after.map((result) => result.rows), before.map((result) => result.rows), 'failed duplicate validation must not leave a new preflight or audit record');
+    const counts = await value.repository.counts();
+    assert.equal(counts.raw_snapshots, 0); assert.equal(counts.candidates, 0); assert.equal(counts.policies, 0); assert.equal(counts.policy_versions, 0);
   } finally { await close(value); }
 });
