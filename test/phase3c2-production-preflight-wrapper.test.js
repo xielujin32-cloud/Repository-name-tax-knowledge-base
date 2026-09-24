@@ -14,7 +14,7 @@ test('Phase 3C2 Production Preflight wrapper has no client target input and fixe
   const wrapper = await readFile(wrapperPath, 'utf8');
   assert.match(wrapper, new RegExp(`\\$manifestId = '${manifestId}'`));
   assert.match(wrapper, new RegExp(`\\$manifestHash = '${manifestHash}'`));
-  assert.match(wrapper, /param\(\)/);
+  assert.match(wrapper, /param\(\s*\[switch\]\$SelfTest\s*\)/);
   assert.match(wrapper, /Invoke-WebRequest -Method Get -Uri \$manifestUrl/);
   assert.match(wrapper, /Invoke-WebRequest -Method Post -Uri \$preflightUrl/);
   assert.equal((wrapper.match(/Invoke-WebRequest -Method Post/g) || []).length, 1, 'normal path permits exactly one Preflight POST');
@@ -48,6 +48,38 @@ test('Phase 3C2 Production Preflight wrapper fixes check/hash and does not leak 
   assert.match(wrapper, /x-nf-request-id/);
   assert.doesNotMatch(wrapper, /Response\.GetResponseStream|ReadToEnd/);
   for (const field of ['preflight_id', 'preflight_state', 'evidence_duplicate_free', 'expires_at', 'ready_for_apply', 'preflight_audit_writes', 'business_production_writes']) assert.match(wrapper, new RegExp(`${field}\\s*=`));
+});
+
+test('Phase 3C2 Production Preflight wrapper has a local-only self-test that reaches its real Token GUI before all HTTP paths', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const selfTestBranch = wrapper.indexOf('if ($SelfTest)');
+  const productionGet = wrapper.indexOf('Invoke-WebRequest -Method Get -Uri $manifestUrl');
+  const productionPost = wrapper.indexOf('Invoke-WebRequest -Method Post -Uri $preflightUrl');
+
+  assert.match(wrapper, /function Invoke-Phase3C2GuiSelfTest/);
+  assert.match(wrapper, /Invoke-Phase3C2GuiSelfTest\r?\n\s*return/);
+  assert.match(wrapper, /event = 'phase3c2_preflight_wrapper_self_test'/);
+  assert.match(wrapper, /production_request_sent = \$false/);
+  assert.match(wrapper, /business_production_writes = 0/);
+  assert.match(wrapper, /if \(\$SelfTest\) \{\r?\n\s*Invoke-Phase3C2GuiSelfTest\r?\n\s*return\r?\n\}\r?\n\r?\ntry \{\r?\n\s*\$secureToken = Read-GuiSecureString/);
+  assert.ok(productionGet > selfTestBranch && productionPost > selfTestBranch, 'self-test must stop before every HTTP request');
+});
+
+test('Phase 3C2 Production Preflight wrapper default entry reaches the Token GUI call before HTTP in a zero-network probe', async (t) => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const tokenGuiCall = "  $secureToken = Read-GuiSecureString -Prompt 'Enter administrator Token (runs one Preflight only after Frozen Manifest integrity verification):'";
+  const marker = 'PHASE3C2_DEFAULT_ENTRY_REACHED_TOKEN_GUI';
+  assert.equal((wrapper.match(/\$secureToken = Read-GuiSecureString -Prompt/g) || []).length, 1, 'default entry must contain exactly one Token GUI call');
+  const probe = wrapper.replace(tokenGuiCall, `  Write-Output '${marker}'\n  return`);
+  assert.notEqual(probe, wrapper, 'probe must intercept the unique Token GUI call');
+  const encoded = Buffer.from(probe, 'utf16le').toString('base64');
+  try {
+    const { stdout } = await execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded]);
+    assert.match(stdout, new RegExp(marker));
+  } catch (error) {
+    if (error?.code === 'EPERM') t.skip('当前测试沙箱禁止 Node 启动 powershell.exe。');
+    else throw error;
+  }
 });
 
 test('Windows PowerShell 5.1 can parse Phase 3C2 Production Preflight wrapper', async (t) => {

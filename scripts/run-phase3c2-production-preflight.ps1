@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+  [switch]$SelfTest
+)
 
 # This wrapper is intentionally fixed to the verified Phase 3C1 Frozen Manifest.
 # It reads that Manifest once, then can send one fixed Preflight POST. It cannot
@@ -143,6 +145,42 @@ function Safe-ReadinessSummary {
     integrity_passed = (Test-ManifestPreflightReady -Manifest $Manifest -Integrity $Integrity -ResponseBody $ResponseBody)
     business_production_writes = if ($null -eq $ResponseBody.business_production_writes) { $null } else { $ResponseBody.business_production_writes }
   }
+}
+
+function Invoke-Phase3C2GuiSelfTest {
+  $secureValue = $null
+  try {
+    $secureValue = Read-GuiSecureString -Prompt 'Self-test only: enter non-sensitive test text. No Production request will be sent.'
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_self_test'
+      dialog_result = 'OK'
+      secure_string_returned = ($secureValue -is [System.Security.SecureString])
+      test_text_entered = ($secureValue.Length -gt 0)
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  } catch [System.OperationCanceledException] {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_self_test'
+      dialog_result = 'CANCELLED'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  } catch [System.InvalidOperationException] {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_self_test'
+      dialog_result = 'EMPTY'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  } finally {
+    if ($secureValue) { $secureValue.Dispose() }
+  }
+}
+
+if ($SelfTest) {
+  Invoke-Phase3C2GuiSelfTest
+  return
 }
 
 try {
