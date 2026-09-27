@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-  [switch]$SelfTest
+  [switch]$SelfTest,
+  [switch]$DiagnosticDefaultEntry,
+  [switch]$TraceDefaultEntryNoHttp,
+  [switch]$MockManifestGetFailureNoHttp
 )
 
 # This wrapper is intentionally fixed to the verified Phase 3C1 Frozen Manifest.
@@ -184,15 +187,102 @@ if ($SelfTest) {
 }
 
 try {
-  $secureToken = Read-GuiSecureString -Prompt 'Enter administrator Token (runs one Preflight only after Frozen Manifest integrity verification):'
+  if ($DiagnosticDefaultEntry) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_diagnostic'
+      stage = 'before_token_gui'
+      self_test = $false
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'before_token_gui'
+      self_test = $false
+      diagnostic_default_entry = $false
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
+  $tokenPrompt = if ($DiagnosticDefaultEntry) {
+    'Diagnostic only: enter non-sensitive test text. No Production request will be sent.'
+  } else {
+    'Enter administrator Token (runs one Preflight only after Frozen Manifest integrity verification):'
+  }
+  $secureToken = Read-GuiSecureString -Prompt $tokenPrompt
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'after_token_gui'
+      secure_string_returned = ($secureToken -is [System.Security.SecureString])
+      test_text_entered = ($secureToken.Length -gt 0)
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
+  if ($DiagnosticDefaultEntry) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_diagnostic'
+      stage = 'after_token_gui_before_http'
+      secure_string_returned = ($secureToken -is [System.Security.SecureString])
+      test_text_entered = ($secureToken.Length -gt 0)
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+    return
+  }
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'before_securestring_to_bstr'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
   $tokenBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'after_securestring_to_bstr'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
   $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenBstr).Trim()
   if ([string]::IsNullOrWhiteSpace($token)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
   if ($token.ToCharArray() | Where-Object { ([int][char]$_) -lt 32 -or ([int][char]$_) -eq 127 }) { throw [System.InvalidOperationException]::new('token_contains_control_character') }
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'after_token_validation'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+  }
 
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $headers = @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' }
+  if ($TraceDefaultEntryNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_default_entry_trace'
+      stage = 'before_manifest_get'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+    return
+  }
   $stage = 'read_frozen_manifest_integrity'
+  if ($MockManifestGetFailureNoHttp) {
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_preflight_wrapper_manifest_get_mock'
+      stage = 'before_manifest_get_mock_failure'
+      production_request_sent = $false
+      business_production_writes = 0
+    })
+    throw [System.InvalidOperationException]::new('local_manifest_get_mock_failure')
+  }
   $manifestResponse = Invoke-WebRequest -Method Get -Uri $manifestUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
   $manifestBody = $manifestResponse.Content | ConvertFrom-Json
   if ($null -eq $manifestBody.manifest -or $null -eq $manifestBody.integrity) { throw [System.InvalidOperationException]::new('manifest_integrity_response_incomplete') }
@@ -233,9 +323,10 @@ try {
   })
 } catch {
   $httpResponse = $_.Exception.Response
+  $tokenInputErrorCodes = @('token_input_cancelled', 'token_empty_after_secure_input', 'token_contains_control_character')
   if ($httpResponse) {
     Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; http_status = [int]$httpResponse.StatusCode; netlify_request_id = Safe-RequestId $httpResponse; error = 'preflight_http_error'; stage = $stage; business_production_writes = 0 })
-  } elseif ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) {
+  } elseif ($stage -eq 'token_input' -and ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) -and $tokenInputErrorCodes -contains $_.Exception.Message) {
     Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; error = 'local_token_input_error'; reason = $_.Exception.Message; business_production_writes = 0 })
   } else {
     # Never serialize exception text: it can contain request headers on some hosts.
