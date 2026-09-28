@@ -1,84 +1,89 @@
 [CmdletBinding()]
 param(
-  [switch]$SelfTest,
-  [switch]$DiagnosticDefaultEntry,
-  [switch]$TraceDefaultEntryNoHttp,
-  [switch]$MockManifestGetFailureNoHttp
+  [switch]$SelfTest
 )
 
 # This wrapper is intentionally fixed to the verified Phase 3C1 Frozen Manifest.
-# It reads that Manifest once, then can send one fixed Preflight POST. It cannot
-# fetch official URLs, create a Preview Job/Manifest, or invoke Apply.
+# Its only network operations are one protected Manifest GET and, after every
+# local/integrity gate passes, one protected Preflight POST. It cannot fetch
+# official URLs, create a Preview Job or Manifest, or invoke Apply.
 $ErrorActionPreference = 'Stop'
 $manifestId = 'controlled-import-manifest-429737d3-f068-4620-acc2-9031f1d938df'
 $manifestHash = '0c028eed96110e993abe23e089f442e0654eaa5b95d52aec1d3ce2c7e5285cd4'
 $manifestUrl = "https://xielujin-tax-knowledge-base.netlify.app/api/admin/evidence/phase3c1/import-manifests/$([uri]::EscapeDataString($manifestId))"
 $preflightUrl = "$manifestUrl/preflights"
-$token = $null
-$tokenBstr = [IntPtr]::Zero
-$stage = 'token_input'
 
 function Read-GuiSecureString {
   param([Parameter(Mandatory = $true)][string]$Prompt)
 
-  Add-Type -AssemblyName System.Windows.Forms
-  Add-Type -AssemblyName System.Drawing
-  $form = New-Object System.Windows.Forms.Form
-  $form.Text = 'Phase 3C2 Production Preflight'
-  $form.StartPosition = 'CenterScreen'
-  $form.Size = New-Object System.Drawing.Size(560, 190)
-  $form.FormBorderStyle = 'FixedDialog'
-  $form.MaximizeBox = $false
-  $form.MinimizeBox = $false
-
-  $label = New-Object System.Windows.Forms.Label
-  $label.Text = $Prompt
-  $label.AutoSize = $true
-  $label.Location = New-Object System.Drawing.Point(18, 20)
-  $form.Controls.Add($label)
-
-  $tokenTextBox = New-Object System.Windows.Forms.TextBox
-  $tokenTextBox.Name = 'tokenTextBox'
-  $tokenTextBox.Location = New-Object System.Drawing.Point(20, 50)
-  $tokenTextBox.Size = New-Object System.Drawing.Size(505, 26)
-  $tokenTextBox.UseSystemPasswordChar = $true
-  $tokenTextBox.ShortcutsEnabled = $true
-  $form.Controls.Add($tokenTextBox)
-
-  $ok = New-Object System.Windows.Forms.Button
-  $ok.Text = 'Run Preflight only'
-  $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-  $ok.Location = New-Object System.Drawing.Point(285, 95)
-  $form.Controls.Add($ok)
-
-  $cancel = New-Object System.Windows.Forms.Button
-  $cancel.Text = '取消'
-  $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-  $cancel.Location = New-Object System.Drawing.Point(425, 95)
-  $form.Controls.Add($cancel)
-
-  $form.AcceptButton = $ok
-  $form.CancelButton = $cancel
-  $form.Add_Shown({
-    param($sender, $eventArgs)
-    $sender.Activate()
-    $sender.Controls['tokenTextBox'].Focus()
-  })
-  try {
-    $result = $form.ShowDialog()
-    $plainValue = $tokenTextBox.Text
-    $tokenTextBox.Clear()
-  } finally {
-    $form.Dispose()
-  }
-  if ($result -ne [System.Windows.Forms.DialogResult]::OK) { throw [System.OperationCanceledException]::new('token_input_cancelled') }
-  if ([string]::IsNullOrWhiteSpace($plainValue)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
-
-  $secureValue = New-Object System.Security.SecureString
-  foreach ($character in $plainValue.ToCharArray()) { $secureValue.AppendChar($character) }
-  $secureValue.MakeReadOnly()
+  $form = $null
+  $tokenTextBox = $null
   $plainValue = $null
-  return $secureValue
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Phase 3C2 Production Preflight'
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(560, 190)
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = $Prompt
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(18, 20)
+    $form.Controls.Add($label)
+
+    # Never use $input here: it is a PowerShell automatic variable.
+    $tokenTextBox = New-Object System.Windows.Forms.TextBox
+    $tokenTextBox.Name = 'tokenTextBox'
+    $tokenTextBox.Location = New-Object System.Drawing.Point(20, 50)
+    $tokenTextBox.Size = New-Object System.Drawing.Size(505, 26)
+    $tokenTextBox.UseSystemPasswordChar = $true
+    $tokenTextBox.ShortcutsEnabled = $true
+    $form.Controls.Add($tokenTextBox)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Run Preflight only'
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $ok.Location = New-Object System.Drawing.Point(285, 95)
+    $form.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = '取消'
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $cancel.Location = New-Object System.Drawing.Point(425, 95)
+    $form.Controls.Add($cancel)
+
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    $form.Add_Shown({
+      param($sender, $eventArgs)
+      $sender.Activate()
+      $sender.Controls['tokenTextBox'].Focus()
+    })
+
+    $result = $form.ShowDialog()
+    $plainValue = [string]$tokenTextBox.Text
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+      throw [System.OperationCanceledException]::new('token_input_cancelled')
+    }
+    if ([string]::IsNullOrWhiteSpace($plainValue)) {
+      throw [System.InvalidOperationException]::new('token_empty_after_secure_input')
+    }
+
+    $secureValue = New-Object System.Security.SecureString
+    foreach ($character in $plainValue.ToCharArray()) { $secureValue.AppendChar($character) }
+    $secureValue.MakeReadOnly()
+    return $secureValue
+  } finally {
+    if ($tokenTextBox) { $tokenTextBox.Clear() }
+    if ($form) { $form.Dispose() }
+    $plainValue = $null
+  }
 }
 
 function Write-SafeJson {
@@ -121,7 +126,11 @@ function Safe-IntegritySummary {
 }
 
 function Test-ManifestPreflightReady {
-  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)]$Integrity, [Parameter(Mandatory = $true)]$ResponseBody)
+  param(
+    [Parameter(Mandatory = $true)]$Manifest,
+    [Parameter(Mandatory = $true)]$Integrity,
+    [Parameter(Mandatory = $true)]$ResponseBody
+  )
   return $Manifest.controlled_manifest_id -eq $manifestId `
     -and $Manifest.manifest_state -eq 'frozen' `
     -and $Manifest.manifest_hash -eq $manifestHash `
@@ -139,7 +148,11 @@ function Test-ManifestPreflightReady {
 }
 
 function Safe-ReadinessSummary {
-  param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)]$Integrity, [Parameter(Mandatory = $true)]$ResponseBody)
+  param(
+    [Parameter(Mandatory = $true)]$Manifest,
+    [Parameter(Mandatory = $true)]$Integrity,
+    [Parameter(Mandatory = $true)]$ResponseBody
+  )
   return [ordered]@{
     manifest_id = $Manifest.controlled_manifest_id
     manifest_state = $Manifest.manifest_state
@@ -181,158 +194,118 @@ function Invoke-Phase3C2GuiSelfTest {
   }
 }
 
+function Invoke-Phase3C2ProductionPreflight {
+  $secureToken = $null
+  $token = $null
+  $tokenBstr = [IntPtr]::Zero
+  $stage = 'token_input'
+  try {
+    # Do not write to the Host before the dialog. This avoids relying on the
+    # Windows PowerShell 5.1 Host/WinForms timing observed during diagnosis.
+    $secureToken = Read-GuiSecureString -Prompt 'Enter administrator Token (runs one Preflight only after Frozen Manifest integrity verification):'
+
+    $tokenBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenBstr).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) {
+      throw [System.InvalidOperationException]::new('token_empty_after_secure_input')
+    }
+    if ($token.ToCharArray() | Where-Object { ([int][char]$_) -lt 32 -or ([int][char]$_) -eq 127 }) {
+      throw [System.InvalidOperationException]::new('token_contains_control_character')
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' }
+
+    $stage = 'read_frozen_manifest_integrity'
+    $manifestResponse = Invoke-WebRequest -Method Get -Uri $manifestUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
+    $manifestBody = $manifestResponse.Content | ConvertFrom-Json
+    if ($null -eq $manifestBody.manifest -or $null -eq $manifestBody.integrity) {
+      throw [System.InvalidOperationException]::new('manifest_integrity_response_incomplete')
+    }
+    $manifest = $manifestBody.manifest
+    $integrity = Safe-IntegritySummary $manifestBody.integrity
+    if (-not (Test-ManifestPreflightReady -Manifest $manifest -Integrity $integrity -ResponseBody $manifestBody)) {
+      Write-SafeJson ([ordered]@{
+        event = 'phase3c2_production_preflight'
+        http_status = $manifestResponse.StatusCode
+        error = 'frozen_manifest_not_ready_for_preflight'
+        readiness = Safe-ReadinessSummary -Manifest $manifest -Integrity $integrity -ResponseBody $manifestBody
+        business_production_writes = 0
+      })
+      return
+    }
+
+    $stage = 'create_preflight'
+    $requestBody = @{ check = $true; manifest_hash = $manifestHash } | ConvertTo-Json -Compress
+    $preflightResponse = Invoke-WebRequest -Method Post -Uri $preflightUrl -Headers $headers -ContentType 'application/json' -Body $requestBody -UseBasicParsing -ErrorAction Stop
+    $preflightBody = $preflightResponse.Content | ConvertFrom-Json
+    if ($null -eq $preflightBody.preflight) {
+      throw [System.InvalidOperationException]::new('preflight_response_missing_preflight')
+    }
+    $preflight = $preflightBody.preflight
+    $readyForApply = $preflight.preflight_state -eq 'ready' -and $preflightBody.evidence_duplicate_free -eq $true
+    Write-SafeJson ([ordered]@{
+      event = 'phase3c2_production_preflight'
+      http_status = $preflightResponse.StatusCode
+      manifest_id = $manifestId
+      manifest_hash = $manifestHash
+      preflight_id = $preflight.preflight_id
+      preflight_state = $preflight.preflight_state
+      created = ($preflightBody.created -eq $true)
+      validation = $preflightBody.validation
+      evidence_duplicate_free = ($preflightBody.evidence_duplicate_free -eq $true)
+      expires_at = $preflight.expires_at
+      ready_for_apply = if ($readyForApply) { 'YES' } else { 'NO' }
+      preflight_audit_writes = if ($preflightBody.created -eq $true) { 1 } else { 0 }
+      business_production_writes = 0
+    })
+  } catch {
+    $httpResponse = $_.Exception.Response
+    $tokenInputErrorCodes = @('token_input_cancelled', 'token_empty_after_secure_input', 'token_contains_control_character')
+    if ($httpResponse) {
+      Write-SafeJson ([ordered]@{
+        event = 'phase3c2_production_preflight'
+        manifest_id = $manifestId
+        manifest_hash = $manifestHash
+        http_status = [int]$httpResponse.StatusCode
+        netlify_request_id = Safe-RequestId $httpResponse
+        error = 'preflight_http_error'
+        stage = $stage
+        business_production_writes = 0
+      })
+    } elseif ($stage -eq 'token_input' -and ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) -and $tokenInputErrorCodes -contains $_.Exception.Message) {
+      Write-SafeJson ([ordered]@{
+        event = 'phase3c2_production_preflight'
+        manifest_id = $manifestId
+        manifest_hash = $manifestHash
+        error = 'local_token_input_error'
+        reason = $_.Exception.Message
+        business_production_writes = 0
+      })
+    } else {
+      # Never serialize exception text: some hosts include request headers in it.
+      Write-SafeJson ([ordered]@{
+        event = 'phase3c2_production_preflight'
+        manifest_id = $manifestId
+        manifest_hash = $manifestHash
+        error = 'preflight_request_failed'
+        stage = $stage
+        exception_type = $_.Exception.GetType().Name
+        business_production_writes = 0
+      })
+    }
+  } finally {
+    if ($tokenBstr -ne [IntPtr]::Zero) {
+      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr)
+    }
+    if ($secureToken) { $secureToken.Dispose() }
+    $token = $null
+  }
+}
+
 if ($SelfTest) {
   Invoke-Phase3C2GuiSelfTest
   return
 }
 
-try {
-  if ($DiagnosticDefaultEntry) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_diagnostic'
-      stage = 'before_token_gui'
-      self_test = $false
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'before_token_gui'
-      self_test = $false
-      diagnostic_default_entry = $false
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-  $tokenPrompt = if ($DiagnosticDefaultEntry) {
-    'Diagnostic only: enter non-sensitive test text. No Production request will be sent.'
-  } else {
-    'Enter administrator Token (runs one Preflight only after Frozen Manifest integrity verification):'
-  }
-  $secureToken = Read-GuiSecureString -Prompt $tokenPrompt
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'after_token_gui'
-      secure_string_returned = ($secureToken -is [System.Security.SecureString])
-      test_text_entered = ($secureToken.Length -gt 0)
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-  if ($DiagnosticDefaultEntry) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_diagnostic'
-      stage = 'after_token_gui_before_http'
-      secure_string_returned = ($secureToken -is [System.Security.SecureString])
-      test_text_entered = ($secureToken.Length -gt 0)
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-    return
-  }
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'before_securestring_to_bstr'
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-  $tokenBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'after_securestring_to_bstr'
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-  $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenBstr).Trim()
-  if ([string]::IsNullOrWhiteSpace($token)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
-  if ($token.ToCharArray() | Where-Object { ([int][char]$_) -lt 32 -or ([int][char]$_) -eq 127 }) { throw [System.InvalidOperationException]::new('token_contains_control_character') }
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'after_token_validation'
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-  }
-
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  $headers = @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' }
-  if ($TraceDefaultEntryNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_default_entry_trace'
-      stage = 'before_manifest_get'
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-    return
-  }
-  $stage = 'read_frozen_manifest_integrity'
-  if ($MockManifestGetFailureNoHttp) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_preflight_wrapper_manifest_get_mock'
-      stage = 'before_manifest_get_mock_failure'
-      production_request_sent = $false
-      business_production_writes = 0
-    })
-    throw [System.InvalidOperationException]::new('local_manifest_get_mock_failure')
-  }
-  $manifestResponse = Invoke-WebRequest -Method Get -Uri $manifestUrl -Headers $headers -UseBasicParsing -ErrorAction Stop
-  $manifestBody = $manifestResponse.Content | ConvertFrom-Json
-  if ($null -eq $manifestBody.manifest -or $null -eq $manifestBody.integrity) { throw [System.InvalidOperationException]::new('manifest_integrity_response_incomplete') }
-  $manifest = $manifestBody.manifest
-  $integrity = Safe-IntegritySummary $manifestBody.integrity
-  if (-not (Test-ManifestPreflightReady -Manifest $manifest -Integrity $integrity -ResponseBody $manifestBody)) {
-    Write-SafeJson ([ordered]@{
-      event = 'phase3c2_production_preflight'
-      http_status = $manifestResponse.StatusCode
-      error = 'frozen_manifest_not_ready_for_preflight'
-      readiness = Safe-ReadinessSummary -Manifest $manifest -Integrity $integrity -ResponseBody $manifestBody
-      business_production_writes = 0
-    })
-    return
-  }
-
-  $stage = 'create_preflight'
-  $requestBody = @{ check = $true; manifest_hash = $manifestHash } | ConvertTo-Json -Compress
-  $preflightResponse = Invoke-WebRequest -Method Post -Uri $preflightUrl -Headers $headers -ContentType 'application/json' -Body $requestBody -UseBasicParsing -ErrorAction Stop
-  $preflightBody = $preflightResponse.Content | ConvertFrom-Json
-  if ($null -eq $preflightBody.preflight) { throw [System.InvalidOperationException]::new('preflight_response_missing_preflight') }
-  $preflight = $preflightBody.preflight
-  $readyForApply = $preflight.preflight_state -eq 'ready' -and $preflightBody.evidence_duplicate_free -eq $true
-  Write-SafeJson ([ordered]@{
-    event = 'phase3c2_production_preflight'
-    http_status = $preflightResponse.StatusCode
-    manifest_id = $manifestId
-    manifest_hash = $manifestHash
-    preflight_id = $preflight.preflight_id
-    preflight_state = $preflight.preflight_state
-    created = ($preflightBody.created -eq $true)
-    validation = $preflightBody.validation
-    evidence_duplicate_free = ($preflightBody.evidence_duplicate_free -eq $true)
-    expires_at = $preflight.expires_at
-    ready_for_apply = if ($readyForApply) { 'YES' } else { 'NO' }
-    preflight_audit_writes = if ($preflightBody.created -eq $true) { 1 } else { 0 }
-    business_production_writes = 0
-  })
-} catch {
-  $httpResponse = $_.Exception.Response
-  $tokenInputErrorCodes = @('token_input_cancelled', 'token_empty_after_secure_input', 'token_contains_control_character')
-  if ($httpResponse) {
-    Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; http_status = [int]$httpResponse.StatusCode; netlify_request_id = Safe-RequestId $httpResponse; error = 'preflight_http_error'; stage = $stage; business_production_writes = 0 })
-  } elseif ($stage -eq 'token_input' -and ($_.Exception -is [System.InvalidOperationException] -or $_.Exception -is [System.OperationCanceledException]) -and $tokenInputErrorCodes -contains $_.Exception.Message) {
-    Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; error = 'local_token_input_error'; reason = $_.Exception.Message; business_production_writes = 0 })
-  } else {
-    # Never serialize exception text: it can contain request headers on some hosts.
-    Write-SafeJson ([ordered]@{ event = 'phase3c2_production_preflight'; manifest_id = $manifestId; manifest_hash = $manifestHash; error = 'preflight_request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; business_production_writes = 0 })
-  }
-} finally {
-  if ($tokenBstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr) }
-  $token = $null
-}
+Invoke-Phase3C2ProductionPreflight
