@@ -42,9 +42,15 @@
             </div>
             <label>效力状态<select name="legal_status"><option value="effective">现行有效</option><option value="partially_effective">部分有效</option><option value="repealed">已废止</option><option value="expired">已到期</option><option value="pending">待核验</option></select></label>
             <label>税种（每行一个，可留空）<textarea name="tax_categories" rows="2"></textarea></label>
+            <label>政策主题/类别（每行一个，可留空）<textarea name="topics" rows="2"></textarea></label>
+            <label>适用地区（每行一个；全国政策可填“全国”）<textarea name="region" rows="2"></textarea></label>
             <label>关键词（每行一个，可留空）<textarea name="keywords" rows="2"></textarea></label>
             <label>政策摘要（可留空）<textarea name="summary" rows="3"></textarea></label>
             <p id="suggestion-message" class="message" aria-live="polite"></p>
+            <section aria-label="Evidence、风险与版本关系">
+              <h3>Evidence、风险与版本关系（均待人工确认）</h3>
+              <p id="evidence-context" class="metadata"></p>
+            </section>
             <label>审核备注<textarea name="note" rows="3"></textarea></label>
             <label>解析后的官方正文<textarea id="normalized-text" rows="14" readonly></textarea></label>
             <details><summary>查看原始 HTML 证据</summary><textarea id="raw-html" rows="12" readonly></textarea></details>

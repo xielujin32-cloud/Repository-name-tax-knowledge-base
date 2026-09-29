@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { htmlToText } from './collector.js';
 import { CHINA_TAX_POLICY_SOURCE, normalizeChinaTaxPolicyUrl } from './chinatax-evidence-adapter.js';
 import { suggestEvidenceMetadata } from './evidence-metadata-suggestion.js';
+import { proposeCandidateRelations } from './candidate-relation-proposal.js';
 
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2b-evidence-collection)';
 
@@ -12,6 +14,27 @@ export const PHASE_2B_ALLOWED_DETAIL_URLS = Object.freeze([
 ]);
 
 const AUTHORITY_NAMES = Object.freeze(['国家税务总局', '财政部', '税务总局', '中国证监会', '海关总署', '国务院']);
+
+// This is a deliberately small, review-oriented first batch. Every URL is a
+// State Taxation Administration policy-library detail page found through its
+// official index/search surface. The dry-run below reads only these pages; it
+// cannot create Evidence, Candidate, Policy, or public projections.
+export const PHASE4_P1_PILOT_OFFICIAL_URLS = Object.freeze([
+  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5246538/content.html', // VAT general-taxpayer registration, 2026 No. 2
+  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5247426/content.html', // VAT threshold / small-scale taxpayer, 2026 No. 4
+  'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5252024/content.html', // VAT non-taxable transactions, 2026 No. 25
+  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5196798/content.html', // repealed small-scale taxpayer rules, 2023 No. 1
+  'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5210453/content.html', // small and micro enterprise policy, 2023 No. 12
+  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5238152/content.html', // cross-border e-commerce overseas warehouse, 2025 No. 3
+  'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247663/content.html', // cross-border e-commerce returned exports, 2026 No. 16
+  'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5196771/content.html', // export-tax-refund administration, 2022 No. 9
+  'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5202404/content.html', // cross-border e-commerce retail export, 2018 No. 103
+  'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247077/content.html' // enterprise-income-tax and VAT policy, 2026 No. 5
+]);
+
+export const PHASE4_P1_PILOT_TOPIC_LABELS = Object.freeze([
+  '增值税', '小规模纳税人', '一般纳税人', '小型微利企业', '企业所得税', '出口退税', '出口免税', '跨境电商出口'
+]);
 
 function clean(value) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
@@ -302,6 +325,157 @@ async function fetchOfficialDetail(fetchImpl, officialUrl) {
   };
 }
 
+function sha256(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function topicMatches(title, normalizedText) {
+  const corpus = `${title || ''}\n${normalizedText || ''}`;
+  const rules = [
+    ['增值税', /增值税/],
+    ['小规模纳税人', /小规模纳税人/],
+    ['一般纳税人', /一般纳税人/],
+    ['小型微利企业', /小型微利企业/],
+    ['企业所得税', /企业所得税/],
+    ['出口退税', /出口退\s*[（(]?免[）)]?税|出口退税/],
+    ['出口免税', /出口[^。；\n]{0,18}免税|免税[^。；\n]{0,18}出口/],
+    ['跨境电商出口', /跨境电子商务|跨境电商|出口海外仓/]
+  ];
+  return rules.filter(([, pattern]) => pattern.test(corpus)).map(([label]) => label);
+}
+
+function officialStatusHint(html) {
+  const value = htmlToText(documentDetailHtml(html));
+  if (/全文(?:废止|失效)|全文无效/.test(value)) return 'official_page_marks_repealed_or_expired';
+  if (/已修改|部分废止|部分失效/.test(value)) return 'official_page_marks_partially_changed';
+  if (/全文有效/.test(value)) return 'official_page_marks_effective';
+  return 'official_page_status_not_structurally_found';
+}
+
+function preliminaryRisk(parsed, { duplicateUrls, duplicateDocumentNumbers, duplicateTitles }) {
+  const reasons = [];
+  if (!parsed.title) reasons.push('TITLE_MISSING');
+  if (!parsed.document_no) reasons.push('DOCUMENT_NO_MISSING');
+  if (!parsed.publish_date) reasons.push('PUBLISH_DATE_MISSING');
+  if (!parsed.effective_date) reasons.push('EFFECTIVE_DATE_NOT_EXPLICIT');
+  if (!parsed.normalized_text || parsed.normalized_text.length < 80) reasons.push('BODY_TOO_SHORT');
+  if (duplicateUrls) reasons.push('DUPLICATE_OFFICIAL_URL_IN_PILOT');
+  if (duplicateDocumentNumbers) reasons.push('DUPLICATE_DOCUMENT_NUMBER_IN_PILOT');
+  if (duplicateTitles) reasons.push('DUPLICATE_TITLE_IN_PILOT');
+  return reasons;
+}
+
+/**
+ * Inspects a bounded State Taxation Administration pilot batch without
+ * persisting any data. It is intentionally not an importer: legal status is
+ * always pending_verification and all relation clues remain proposals.
+ */
+export async function dryRunChinaTaxPolicyPilot({
+  urls = PHASE4_P1_PILOT_OFFICIAL_URLS,
+  fetchImpl = fetch,
+  source = CHINA_TAX_POLICY_SOURCE,
+  maxCandidates = 20
+} = {}) {
+  const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
+  if (!Array.isArray(urls) || urls.length < 1 || urls.length > cap) {
+    throw new Error(`Phase 4 P1 试运行只接受 1 至 ${cap} 条官方详情 URL。`);
+  }
+  const selectedUrls = urls.map((value) => normalizeChinaTaxPolicyUrl(value));
+  if (selectedUrls.some((value) => !value) || new Set(selectedUrls).size !== selectedUrls.length) {
+    throw new Error('Phase 4 P1 试运行只接受互不重复的国家税务总局法规库详情 URL。');
+  }
+
+  const staged = [];
+  for (const officialUrl of selectedUrls) {
+    try {
+      const response = await fetchOfficialDetail(fetchImpl, officialUrl);
+      const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      const metadata = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
+      staged.push({ officialUrl, response, parsed, metadata, statusHint: officialStatusHint(response.raw_html) });
+    } catch (error) {
+      // Do not include upstream response bodies in a dry-run report.
+      staged.push({ officialUrl, error: String(error?.message || 'OFFICIAL_DETAIL_READ_FAILED') });
+    }
+  }
+
+  const countBy = (selector) => {
+    const counts = new Map();
+    for (const item of staged) {
+      const value = selector(item);
+      if (!value) continue;
+      counts.set(value, (counts.get(value) || 0) + 1);
+    }
+    return counts;
+  };
+  const urlCounts = countBy((item) => item.officialUrl);
+  const documentNoCounts = countBy((item) => item.parsed?.document_no || '');
+  const titleCounts = countBy((item) => item.parsed?.title || '');
+
+  const candidates = staged.map((item, index) => {
+    if (item.error) return Object.freeze({
+      ordinal: index + 1,
+      official_url: item.officialUrl,
+      source_id: source.source_id,
+      source_name: source.source_name,
+      source_agency: '国家税务总局',
+      dry_run_error: 'OFFICIAL_DETAIL_READ_FAILED',
+      suggested_validity_status: 'pending_verification',
+      risk_flags: ['OFFICIAL_DETAIL_READ_FAILED'],
+      relation_proposals: [],
+      intake_ready: false
+    });
+    const { parsed, metadata } = item;
+    const relations = proposeCandidateRelations({ normalized_text: parsed.normalized_text });
+    const risks = preliminaryRisk(parsed, {
+      duplicateUrls: (urlCounts.get(item.officialUrl) || 0) > 1,
+      duplicateDocumentNumbers: parsed.document_no && (documentNoCounts.get(parsed.document_no) || 0) > 1,
+      duplicateTitles: parsed.title && (titleCounts.get(parsed.title) || 0) > 1
+    });
+    const topics = topicMatches(parsed.title, parsed.normalized_text);
+    return Object.freeze({
+      ordinal: index + 1,
+      official_url: item.officialUrl,
+      source_id: source.source_id,
+      source_name: source.source_name,
+      source_agency: '国家税务总局',
+      source_domain: source.official_domain,
+      policy_title: parsed.title,
+      document_number: parsed.document_no,
+      document_number_provenance: parsed.document_no_source,
+      issuer: parsed.issuing_authority,
+      publication_date: parsed.publish_date,
+      effective_date: parsed.effective_date,
+      expiry_date: parsed.expiry_date,
+      suggested_validity_status: 'pending_verification',
+      official_status_hint: item.statusHint,
+      suggested_tax_categories: metadata.tax_categories.values,
+      pilot_topics: topics,
+      policy_category: 'tax_policy',
+      region: ['全国'],
+      keywords: metadata.keywords.values,
+      summary: metadata.summary.value,
+      body_hash: sha256(parsed.normalized_text),
+      parser_version: 'chinatax-evidence-3.0.0-mvp',
+      risk_flags: preliminaryRisk(parsed, {
+        duplicateUrls: (urlCounts.get(item.officialUrl) || 0) > 1,
+        duplicateDocumentNumbers: parsed.document_no && (documentNoCounts.get(parsed.document_no) || 0) > 1,
+        duplicateTitles: parsed.title && (titleCounts.get(parsed.title) || 0) > 1
+      }),
+      relation_proposals: relations.map((relation) => ({ relation_type: relation.relation_type, target_reference: relation.target_reference, confidence: relation.confidence })),
+      intake_ready: !risks.includes('TITLE_MISSING') && !risks.includes('BODY_TOO_SHORT')
+    });
+  });
+  const covered = new Set(candidates.flatMap((item) => item.pilot_topics || []));
+  return Object.freeze({
+    mode: 'dry-run',
+    source: Object.freeze({ source_id: source.source_id, source_name: source.source_name, source_domain: source.official_domain, trust_level: source.trust_level }),
+    candidate_count: candidates.length,
+    coverage: Object.freeze({ requested_topics: PHASE4_P1_PILOT_TOPIC_LABELS, covered_topics: [...covered], missing_topics: PHASE4_P1_PILOT_TOPIC_LABELS.filter((item) => !covered.has(item)) }),
+    candidates: Object.freeze(candidates),
+    writes: Object.freeze({ raw_snapshots: 0, evidence: 0, candidates: 0, reviews: 0, policies: 0, policy_versions: 0, public_projections: 0, business_production_writes: 0 })
+  });
+}
+
 export function addChinaTaxPolicySource(repository) {
   return repository.addSource({
     source_id: CHINA_TAX_POLICY_SOURCE.source_id,
@@ -335,6 +509,9 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
     for (const officialUrl of selectedUrls) {
       const response = await fetchOfficialDetail(fetchImpl, officialUrl);
       const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      const metadataSuggestion = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
+      const pilotTopics = topicMatches(parsed.title, parsed.normalized_text);
+      const sourceStatusHint = officialStatusHint(response.raw_html);
       const snapshot = await repository.recordRawSnapshot({
         source_id: sourceRecord.source_id,
         collection_run_id: run.collection_run_id,
@@ -356,7 +533,13 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
           publish_date: parsed.publish_date,
           effective_date: parsed.effective_date,
           expiry_date: parsed.expiry_date,
-          legal_status: 'pending'
+          legal_status: 'pending',
+          validity_status_suggestion: 'pending_verification',
+          official_status_hint: sourceStatusHint,
+          tax_categories: metadataSuggestion.tax_categories.values,
+          topics: pilotTopics,
+          region: ['全国'],
+          policy_category: 'tax_policy'
         }
       });
       const created = await repository.createCandidate({
@@ -373,16 +556,23 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
           expiry_date: parsed.expiry_date,
           official_url: snapshot.official_url,
           source_id: snapshot.source_id,
-          snapshot_id: snapshot.snapshot_id
+          snapshot_id: snapshot.snapshot_id,
+          // All of these are suggestions/provenance for the existing review
+          // workflow. They are never a legal-effect determination.
+          tax_categories: metadataSuggestion.tax_categories.values,
+          topics: pilotTopics,
+          region: ['全国'],
+          policy_category: 'tax_policy',
+          validity_status_suggestion: 'pending_verification',
+          official_status_hint: sourceStatusHint,
+          metadata_suggestion: metadataSuggestion
         },
         verification_state: 'pending_review',
         legal_status: 'pending'
       });
-      let metadataSuggestion = null;
       let riskAssessment = null;
       let relationProposals = [];
       if (created.created) {
-        metadataSuggestion = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
         await repository.saveMetadataSuggestion(created.candidate.candidate_id, metadataSuggestion);
         riskAssessment = await repository.assessCandidateRisk(created.candidate.candidate_id);
         relationProposals = (await repository.generateCandidateRelationProposals(created.candidate.candidate_id)).created;
@@ -395,7 +585,7 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
         legal_status: created.candidate.legal_status,
         title_present: Boolean(parsed.title),
         document_no_present: Boolean(parsed.document_no),
-        metadata_suggestion_created: Boolean(metadataSuggestion),
+        metadata_suggestion_created: true,
         risk_level: riskAssessment?.assessment?.risk_level || null,
         risk_score: riskAssessment?.assessment?.risk_score ?? null,
         relation_proposals_created: relationProposals.length

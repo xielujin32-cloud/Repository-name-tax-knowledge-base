@@ -46,7 +46,12 @@ async function loadCandidates() {
 }
 
 async function loadDetail(candidateId) {
-  const { detail } = await api(`/api/admin/evidence/candidates/${encodeURIComponent(candidateId)}`);
+  const encodedId = encodeURIComponent(candidateId);
+  const [{ detail }, riskResponse, relationResponse] = await Promise.all([
+    api(`/api/admin/evidence/candidates/${encodedId}`),
+    api(`/api/admin/evidence/candidates/${encodedId}/risk-assessments`),
+    api(`/api/admin/evidence/candidates/${encodedId}/relation-proposals`)
+  ]);
   selectedCandidateId = candidateId;
   const fields = detail.candidate.parsed_fields || {};
   $('#detail-panel').hidden = false;
@@ -57,12 +62,22 @@ async function loadDetail(candidateId) {
   inputValue('issuing_authority', arrayText(fields.issuing_authority)); inputValue('publish_date', fields.publish_date);
   inputValue('effective_date', fields.effective_date); inputValue('expiry_date', fields.expiry_date);
   inputValue('tax_categories', arrayText(preferredSuggestion(fields, 'tax_categories')));
+  inputValue('topics', arrayText(fields.topics)); inputValue('region', arrayText(fields.region));
   inputValue('keywords', arrayText(preferredSuggestion(fields, 'keywords'))); inputValue('summary', preferredSuggestion(fields, 'summary'));
   const suggestion = fields.metadata_suggestion;
   message('#suggestion-message', suggestion
     ? `系统建议 / 待人工确认：规则 ${suggestion.rule_version}；可直接修改、删除或清空后再发布。`
     : '尚未生成系统建议；税种、关键词和摘要可由管理员手动填写。');
   $('[name="legal_status"]').value = detail.candidate.legal_status || 'pending';
+  const latestRisk = (riskResponse.assessments || []).find((item) => item.is_current) || (riskResponse.assessments || [])[0];
+  const relations = relationResponse.proposals || [];
+  const riskText = latestRisk ? `风险：${latestRisk.risk_level || '未分级'}（${latestRisk.risk_score ?? '-'}）${latestRisk.risk_reasons?.length ? `；${latestRisk.risk_reasons.map((item) => item.code || item).join('、')}` : ''}` : '风险：尚未生成';
+  const relationText = relations.length ? `版本/关系提案：${relations.map((item) => {
+    const target = item.target_reference?.document_no || item.target_reference?.title || '待确认';
+    return `${item.relation_type || '关系'} → ${target}（${item.proposal_state || 'proposed'}）`;
+  }).join('；')}` : '版本/关系提案：无';
+  const provenanceText = `来源：${detail.candidate.official_url || '待确认'}；正文哈希：${detail.raw_snapshot.normalized_text_hash || detail.raw_snapshot.body_hash || '受保护 Evidence 中可核验'}；状态建议：${fields.validity_status_suggestion || 'pending_verification'}。`;
+  $('#evidence-context').textContent = `${provenanceText} ${riskText}。${relationText}。`;
   $('#normalized-text').value = detail.raw_snapshot.normalized_text || '';
   $('#raw-html').value = detail.raw_snapshot.raw_html || '';
   message('#review-message');
@@ -83,6 +98,8 @@ function reviewPayload(action) {
       effective_date: form.effective_date.value || null,
       expiry_date: form.expiry_date.value || null,
       tax_categories: textArray(form.tax_categories.value),
+      topics: textArray(form.topics.value),
+      region: textArray(form.region.value),
       keywords: textArray(form.keywords.value),
       summary: form.summary.value
     }

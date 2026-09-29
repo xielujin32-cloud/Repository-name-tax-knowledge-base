@@ -49,6 +49,13 @@ test('Phase 4 官方 STA intake 只创建 Evidence、Candidate、Risk 和关系�
     assert.equal(result.created.public_projections, 0);
     const candidates = await value.repository.listCandidatesForReview({ limit: 10 });
     assert.ok(candidates.every((candidate) => candidate.verification_state === 'pending_review' && candidate.legal_status === 'pending'));
+    const detail = await value.repository.getCandidateForReview(result.results[0].candidate_id);
+    assert.deepEqual(detail.candidate.parsed_fields.tax_categories, ['增值税']);
+    assert.deepEqual(detail.candidate.parsed_fields.region, ['全国']);
+    assert.ok(detail.candidate.parsed_fields.topics.includes('增值税'));
+    assert.equal(detail.candidate.parsed_fields.policy_category, 'tax_policy');
+    assert.equal(detail.candidate.parsed_fields.validity_status_suggestion, 'pending_verification');
+    assert.ok(detail.candidate.parsed_fields.metadata_suggestion);
     assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM policies')).rows[0].count, 0);
     assert.equal((await value.database.query('SELECT trust_level FROM sources WHERE source_id=$1', ['source-sta-policy-regulations'])).rows[0].trust_level, 'official_primary');
     await assert.rejects(

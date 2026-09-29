@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { publicPolicyAvailability } from '../../src/policy-schema.js';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE, discoverChinaTaxPolicyDryRun } from '../../src/chinatax-evidence-adapter.js';
-import { collectChinaTaxPolicyCandidates, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
+import { collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
@@ -684,18 +684,22 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, suppressPublicPolicies = suppressPublicPoliciesForRelation, chinaTaxDiscoveryFactory = discoverChinaTaxPolicyDryRun, chinaTaxCandidateCollector = collectChinaTaxPolicyCandidates, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1PreviewJobDispatcher = defaultPhase3C1PreviewJobDispatcher, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, suppressPublicPolicies = suppressPublicPoliciesForRelation, chinaTaxDiscoveryFactory = discoverChinaTaxPolicyDryRun, chinaTaxPilotDryRunFactory = dryRunChinaTaxPolicyPilot, chinaTaxCandidateCollector = collectChinaTaxPolicyCandidates, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1PreviewJobDispatcher = defaultPhase3C1PreviewJobDispatcher, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
     const isStaDiscoveryRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/discovery';
-    if (url.search && !isRiskQueueRead && !isStaDiscoveryRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
+    const isStaPilotDryRunRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/pilot-dry-run';
+    if (url.search && !isRiskQueueRead && !isStaDiscoveryRead && !isStaPilotDryRunRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
     if (isRiskQueueRead) return json(safeRiskQueue(await repositoryFactory().listRiskQueue(riskQueueFilters(url))));
     if (isStaDiscoveryRead) {
       const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 20, 1), 100);
       const pageSize = Math.min(Math.max(Number(url.searchParams.get('page_size')) || 10, 1), 20);
       const maxPages = Math.min(Math.max(Number(url.searchParams.get('max_pages')) || 3, 1), 5);
       return json(await chinaTaxDiscoveryFactory({ fetchImpl, limit, pageSize, maxPages }));
+    }
+    if (isStaPilotDryRunRead) {
+      return json(await chinaTaxPilotDryRunFactory({ fetchImpl }));
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/sources/chinatax/candidates') {
       const input = await requestBody(request);

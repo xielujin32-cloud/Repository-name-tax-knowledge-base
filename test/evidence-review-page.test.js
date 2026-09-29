@@ -14,6 +14,14 @@ test('Evidence 审核页面使用运行时密码输入，不持久化管理员 T
   assert.match(script, /SUGGEST_PHASE2B_TWO_CANDIDATES/);
   assert.match(script, /系统建议 \/ 待人工确认/);
   assert.match(script, /URLSearchParams\(window\.location\.search\)/);
+  assert.match(html, /name="topics"/);
+  assert.match(html, /name="region"/);
+  assert.match(html, /id="evidence-context"/);
+  assert.match(script, /risk-assessments/);
+  assert.match(script, /relation-proposals/);
+  assert.match(script, /risk_reasons/);
+  assert.match(script, /target_reference\?\.document_no/);
+  assert.match(script, /validity_status_suggestion/);
   assert.doesNotMatch(script, /localStorage|sessionStorage|NETLIFY_TAXKB_ADMIN_TOKEN/);
 });
 
