@@ -17,14 +17,56 @@
     </header>
     <main>
       <section class="hero">
-        <p>已审核 · 官方依据 · 持续更新</p>
-        <h1>一搜就懂税种规则</h1>
-        <span>查公式、税率、适用条件和官方依据</span>
+        <p>已核验政策 · 官方依据 · 持续更新</p>
+        <h1>查政策，也查实务规则</h1>
+        <span>优先展示已完成官方 Evidence 与 Level 3 审核的政策</span>
         <form id="search-form" class="search-box" role="search">
           <label for="search-input" class="sr-only">搜索税种或业务场景</label>
           <input id="search-input" type="search" autocomplete="off" placeholder="例如：个人所得税、工资、经营所得" />
           <button type="submit">查询</button>
         </form>
+      </section>
+
+      <section class="content-section policy-search-section" aria-labelledby="policy-search-heading">
+        <div class="section-title"><div><h2 id="policy-search-heading">可信政策检索</h2><p id="policy-result-note">默认只显示已核验的现行有效或部分有效政策。</p></div></div>
+        <form id="policy-search-form" class="policy-search-form" role="search">
+          <label class="policy-field policy-field-wide">关键词或文号
+            <input id="policy-query" type="search" autocomplete="off" placeholder="例如：增值税、国家税务总局公告〔2026〕1号" />
+          </label>
+          <label class="policy-field">精确文号
+            <input id="policy-document-no" type="search" autocomplete="off" placeholder="例如：国家税务总局公告2026年第1号" />
+          </label>
+          <label class="policy-field">税种
+            <input id="policy-tax-category" list="policy-tax-category-options" placeholder="例如：增值税" />
+            <datalist id="policy-tax-category-options"><option value="增值税"></option><option value="个人所得税"></option><option value="企业所得税"></option><option value="消费税"></option></datalist>
+          </label>
+          <label class="policy-field">效力状态
+            <select id="policy-status"><option value="">现行有效（默认）</option><option value="effective">有效</option><option value="partially_effective">部分有效</option><option value="repealed">已废止（已核验）</option><option value="expired">已失效（已核验）</option><option value="all">全部已核验状态</option></select>
+          </label>
+          <label class="policy-field">发布机关
+            <input id="policy-authority" placeholder="例如：国家税务总局" />
+          </label>
+          <label class="policy-field">来源
+            <input id="policy-source" placeholder="例如：国家税务总局政策法规库" />
+          </label>
+          <label class="policy-field">地区
+            <input id="policy-region" placeholder="例如：全国、北京市" />
+          </label>
+          <label class="policy-field">发布日期起
+            <input id="policy-published-from" type="date" />
+          </label>
+          <label class="policy-field">发布日期止
+            <input id="policy-published-to" type="date" />
+          </label>
+          <label class="policy-field">施行日期起
+            <input id="policy-effective-from" type="date" />
+          </label>
+          <label class="policy-field">施行日期止
+            <input id="policy-effective-to" type="date" />
+          </label>
+          <button type="submit" class="policy-search-submit">检索已核验政策</button>
+        </form>
+        <div id="policy-list" class="policy-list" aria-live="polite"></div>
       </section>
 
       <section class="content-section" aria-labelledby="tax-type-heading">
@@ -41,6 +83,9 @@
 
     <dialog id="card-dialog" class="card-dialog" aria-labelledby="detail-title">
       <article id="card-detail"></article>
+    </dialog>
+    <dialog id="policy-dialog" class="card-dialog" aria-labelledby="policy-detail-title">
+      <article id="policy-detail"></article>
     </dialog>
     <script type="module" src="/knowledge.js"></script>
   </body>

@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BlobsServer } from '@netlify/blobs/server';
-import { importPolicies, listPolicies, readPolicy } from '../netlify/lib/policy-store.mjs';
+import { importPolicies, listPolicies, readPolicy, suppressPublicPoliciesForRelation } from '../netlify/lib/policy-store.mjs';
 import { policySeedPolicies } from '../src/policy-seed.js';
 
 const directory = await mkdtemp(join(tmpdir(), 'taxkb-netlify-blobs-'));
@@ -17,6 +17,15 @@ process.env.NETLIFY_BLOBS_CONTEXT = Buffer.from(JSON.stringify({ edgeURL: blobs.
 process.env.NETLIFY_TAXKB_ADMIN_TOKEN = adminToken;
 const { default: handler } = await import('../netlify/functions/api.mjs');
 const policySeed = policySeedPolicies();
+const verifiedPolicy = {
+  ...policySeed[0],
+  id: 'policy-verified-mvp', title: '国家税务总局公告〔2026〕1号（MVP 测试）', document_no: '国家税务总局公告〔2026〕1号',
+  issuing_authority: ['国家税务总局'], publish_date: '2026-01-08', effective_date: '2026-02-01', status: 'effective', tax_categories: ['增值税'],
+  source_url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/mvp/content.html', source_name: '国家税务总局政策法规库',
+  verification_state: 'verified', source_trust_level: 'official_primary', policy_version_id: 'policy-version-verified-mvp',
+  evidence: { candidate_id: 'candidate-verified-mvp', review_decision_id: 'review-verified-mvp', policy_version_id: 'policy-version-verified-mvp', source_id: 'source-sta-policy-regulations', official_url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/mvp/content.html', body_hash: 'a'.repeat(64) },
+  review: { reviewer_level: 3, decision: 'approve', legal_status: 'effective', decided_at: '2026-01-09T00:00:00.000Z', review_decision_id: 'review-verified-mvp' }, version_relations: []
+};
 
 async function call(path, { method = 'GET', token = '', body } = {}) {
   const response = await handler(new Request(`https://taxkb.example${path}`, { method, headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined }));
@@ -97,24 +106,36 @@ test('Policy 种子导入接口只写入三条政策，并且可幂等重复执�
   const imported = await call('/api/admin/policies/import-seed', { method: 'POST', token, body: { apply: true } });
   assert.equal(imported.response.status, 200);
   assert.deepEqual(imported.body, { source: 'data/policy-seed.json', mode: 'apply', dryRun: false, total: 3, added: 3, updated: 0, skipped: 0, errors: [] });
-  assert.equal((await listPolicies()).total, 3);
+  assert.equal((await listPolicies()).total, 0, '旧种子未经过 Evidence/Level 3，不得出现在公开政策结果中');
 
   const repeated = await call('/api/admin/policies/import-seed', { method: 'POST', token, body: { apply: true } });
   assert.deepEqual(repeated.body, { source: 'data/policy-seed.json', mode: 'apply', dryRun: false, total: 3, added: 0, updated: 0, skipped: 3, errors: [] });
-  assert.equal((await readPolicy('doc-vat-law-2024')).title, '中华人民共和国增值税法');
+  assert.equal(await readPolicy('doc-vat-law-2024'), null);
 });
 
-test('Netlify Function 提供独立 Policy API，不影响知识卡片接口', async () => {
-  const listed = await call(`/api/policies?taxCategory=${encodeURIComponent('个人所得税')}`);
+test('Netlify Function 提供可追溯的已核验政策检索，不暴露旧种子', async () => {
+  await importPolicies([verifiedPolicy], { dryRun: false });
+  const listed = await call(`/api/policies?taxCategory=${encodeURIComponent('增值税')}&documentNo=${encodeURIComponent('〔2026〕1号')}&authority=${encodeURIComponent('国家税务总局')}&publishedFrom=2026-01-01&publishedTo=2026-12-31&effectiveFrom=2026-02-01`);
   assert.equal(listed.response.status, 200);
   assert.equal(listed.body.total, 1);
-  assert.equal(listed.body.results[0].id, 'doc-1458');
+  assert.equal(listed.body.results[0].id, verifiedPolicy.id);
+  assert.equal(listed.body.results[0].public_policy_eligible, true);
+  assert.equal(listed.body.results[0].evidence.body_hash, 'a'.repeat(64));
 
-  const detail = await call('/api/policies/doc-vat-law-2024');
+  const detail = await call(`/api/policies/${verifiedPolicy.id}`);
   assert.equal(detail.response.status, 200);
-  assert.equal(detail.body.policy.document_no, '中华人民共和国主席令第四十一号');
+  assert.equal(detail.body.policy.document_no, verifiedPolicy.document_no);
+  assert.equal(detail.body.policy.evidence.normalized_text, undefined);
+
+  const hiddenLegacy = await call('/api/policies/doc-vat-law-2024');
+  assert.equal(hiddenLegacy.response.status, 404);
 
   const cards = await call(`/api/knowledge/cards?query=${encodeURIComponent('年终奖')}`);
   assert.equal(cards.response.status, 200);
   assert.ok(cards.body.results.some((item) => item.card.topic === '全年一次性奖金单独计税'));
+
+  const suppressed = await suppressPublicPoliciesForRelation({ policyVersionIds: [verifiedPolicy.policy_version_id] });
+  assert.deepEqual(suppressed.policy_ids, [verifiedPolicy.id]);
+  assert.equal((await call(`/api/policies?documentNo=${encodeURIComponent('〔2026〕1号')}`)).body.total, 0);
+  assert.equal((await call(`/api/policies/${verifiedPolicy.id}`)).response.status, 404);
 });

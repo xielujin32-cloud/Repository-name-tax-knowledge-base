@@ -1,5 +1,7 @@
-export const POLICY_SCHEMA_VERSION = '1.0.0';
+export const POLICY_SCHEMA_VERSION = '1.1.0';
 export const POLICY_STATUSES = Object.freeze(['effective', 'partially_effective', 'repealed', 'expired', 'pending']);
+export const POLICY_VERIFICATION_STATES = Object.freeze(['legacy_unverified', 'pending_review', 'verified', 'rejected']);
+export const POLICY_SOURCE_TRUST_LEVELS = Object.freeze(['official_primary', 'official_authoritative', 'unknown']);
 export const POLICY_REQUIRED_FIELDS = Object.freeze([
   'id', 'title', 'document_no', 'issuing_authority', 'publish_date', 'effective_date', 'expiry_date', 'status',
   'tax_categories', 'topics', 'region', 'applicable_entities', 'keywords', 'summary', 'key_points', 'practical_guidance',
@@ -9,14 +11,6 @@ export const POLICY_ARRAY_FIELDS = Object.freeze(['issuing_authority', 'tax_cate
 
 const POLICY_DATE_FIELDS = Object.freeze(['publish_date', 'effective_date', 'expiry_date', 'last_verified_date', 'created_at', 'updated_at']);
 const POLICY_NULLABLE_TEXT_FIELDS = Object.freeze(['document_no', 'summary', 'practical_guidance', 'source_url', 'source_name']);
-
-const LEGACY_STATUS_MAP = Object.freeze({
-  current: 'effective',
-  revised: 'partially_effective',
-  repealed: 'repealed',
-  expired: 'expired',
-  pending_verification: 'pending'
-});
 
 function isDateOrNull(value) {
   if (value === null) return true;
@@ -40,6 +34,11 @@ export function validatePolicy(policy) {
   }
   for (const field of POLICY_DATE_FIELDS) if (!isDateOrNull(policy[field])) errors.push(`${field} 必须为 YYYY-MM-DD 或 null。`);
   for (const field of POLICY_NULLABLE_TEXT_FIELDS) if (policy[field] !== null && typeof policy[field] !== 'string') errors.push(`${field} 必须为字符串或 null。`);
+  if (policy.verification_state !== undefined && !POLICY_VERIFICATION_STATES.includes(policy.verification_state)) errors.push('verification_state 必须是规定枚举值。');
+  if (policy.source_trust_level !== undefined && !POLICY_SOURCE_TRUST_LEVELS.includes(policy.source_trust_level)) errors.push('source_trust_level 必须是规定枚举值。');
+  if (policy.evidence !== undefined && (policy.evidence === null || typeof policy.evidence !== 'object' || Array.isArray(policy.evidence))) errors.push('evidence 必须是对象或省略。');
+  if (policy.review !== undefined && (policy.review === null || typeof policy.review !== 'object' || Array.isArray(policy.review))) errors.push('review 必须是对象或省略。');
+  if (policy.version_relations !== undefined && !Array.isArray(policy.version_relations)) errors.push('version_relations 必须是数组或省略。');
   return errors;
 }
 
@@ -86,7 +85,11 @@ export function policyFromLegacyDocument(document, sourceById = new Map()) {
     publish_date: dateOnlyOrNull(document.publishedAt),
     effective_date: dateOnlyOrNull(document.effectiveAt),
     expiry_date: null,
-    status: LEGACY_STATUS_MAP[document.status] || 'pending',
+    // A legacy label is not sufficient evidence of current legal effect.  The
+    // original label is retained below for audit, but every migrated legacy
+    // document starts non-public and pending until it has an official Evidence
+    // chain and a Level 3 decision.
+    status: 'pending',
     tax_categories: taxCategories,
     topics: [],
     region: [],
@@ -102,8 +105,38 @@ export function policyFromLegacyDocument(document, sourceById = new Map()) {
     created_at: dateOnlyOrNull(document.createdAt),
     updated_at: null,
     legacy_document_id: String(document.id),
-    legacy_status: textOrNull(document.status)
+    legacy_status: textOrNull(document.status),
+    verification_state: 'legacy_unverified',
+    source_trust_level: 'unknown',
+    policy_version_id: null,
+    evidence: null,
+    review: null,
+    version_relations: []
   };
+}
+
+function isHttpsUrl(value) {
+  try { return new URL(String(value || '')).protocol === 'https:'; } catch { return false; }
+}
+
+/**
+ * Determines whether a policy is eligible for the public policy index.
+ * This is intentionally stricter than schema validation: an old policy can
+ * be stored for audit, but no unverified or non-official record can be shown
+ * as a policy search result.
+ */
+export function publicPolicyAvailability(policy = {}) {
+  const reasons = [];
+  if (policy.verification_state !== 'verified') reasons.push('VERIFICATION_NOT_LEVEL3_APPROVED');
+  if (!['official_primary', 'official_authoritative'].includes(policy.source_trust_level)) reasons.push('SOURCE_TRUST_NOT_OFFICIAL');
+  if (!['effective', 'partially_effective', 'repealed', 'expired'].includes(policy.status)) reasons.push('LEGAL_STATUS_NOT_VERIFIED');
+  if (!isHttpsUrl(policy.source_url)) reasons.push('OFFICIAL_URL_MISSING');
+  const evidence = policy.evidence && typeof policy.evidence === 'object' ? policy.evidence : {};
+  if (!evidence.candidate_id || !evidence.review_decision_id || !evidence.policy_version_id || !evidence.source_id || !evidence.body_hash) reasons.push('EVIDENCE_CHAIN_INCOMPLETE');
+  const review = policy.review && typeof policy.review === 'object' ? policy.review : {};
+  if (Number(review.reviewer_level) !== 3 || review.decision !== 'approve') reasons.push('LEVEL3_REVIEW_MISSING');
+  if (Array.isArray(policy.version_relations) && policy.version_relations.some((relation) => relation?.relation_state && relation.relation_state !== 'confirmed')) reasons.push('UNRESOLVED_VERSION_RELATION');
+  return Object.freeze({ eligible: reasons.length === 0, reasons: Object.freeze(reasons) });
 }
 
 export function ensurePolicySchema(data, { today = new Date().toISOString().slice(0, 10) } = {}) {

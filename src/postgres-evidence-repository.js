@@ -52,6 +52,15 @@ const hasOwn = (value, key) => Boolean(value && typeof value === 'object' && Obj
 const isObject = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
 const isSha256 = (value) => /^[a-f0-9]{64}$/.test(String(value || ''));
 const hasText = (value) => Boolean(String(value || '').trim());
+const SOURCE_TRUST_LEVELS = new Set(['official_primary', 'official_authoritative', 'unknown']);
+const PUBLIC_LEGAL_STATUSES = new Set(['effective', 'partially_effective', 'repealed', 'expired']);
+
+function registeredSourceTrust(input = {}) {
+  const sourceId = String(input.source_id || '').trim();
+  const domain = String(input.official_domain || '').trim().toLowerCase();
+  if (sourceId === CHINA_TAX_POLICY_SOURCE.source_id && domain === CHINA_TAX_POLICY_SOURCE.official_domain) return 'official_primary';
+  return 'unknown';
+}
 
 // A Neon Pool emits `error` when an idle WebSocket connection is terminated.
 // Without a listener Node treats that event as an uncaught exception.  The
@@ -284,8 +293,16 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     finally { client.release(); }
   }
   async function addSource(input) {
-    const source = { source_id: required(input.source_id || id('source'), 'source_id'), source_name: required(input.source_name, 'source_name'), official_domain: required(input.official_domain, 'official_domain'), source_type: required(input.source_type, 'source_type'), adapter_version: required(input.adapter_version, 'adapter_version'), base_url: input.base_url ? canonical(input.base_url) : null, enabled: input.enabled !== false, created_at: clock() };
-    await pool.query(`INSERT INTO sources (source_id,source_name,official_domain,source_type,adapter_version,base_url,enabled,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (source_id) DO NOTHING`, [source.source_id,source.source_name,source.official_domain,source.source_type,source.adapter_version,source.base_url,source.enabled,source.created_at]);
+    const registeredTrust = registeredSourceTrust(input);
+    const requestedTrust = String(input.trust_level || registeredTrust);
+    if (!SOURCE_TRUST_LEVELS.has(requestedTrust)) throw new Error('source.trust_level 无效。');
+    if (requestedTrust !== registeredTrust && requestedTrust !== 'unknown') throw new Error('来源可信度只能由受信任来源注册表授予。');
+    const trust_level = registeredTrust;
+    const source = { source_id: required(input.source_id || id('source'), 'source_id'), source_name: required(input.source_name, 'source_name'), official_domain: required(input.official_domain, 'official_domain'), source_type: required(input.source_type, 'source_type'), adapter_version: required(input.adapter_version, 'adapter_version'), base_url: input.base_url ? canonical(input.base_url) : null, enabled: input.enabled !== false, trust_level, created_at: clock() };
+    await pool.query(`INSERT INTO sources (source_id,source_name,official_domain,source_type,adapter_version,base_url,enabled,trust_level,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)
+      ON CONFLICT (source_id) DO UPDATE SET source_name=EXCLUDED.source_name,adapter_version=EXCLUDED.adapter_version,base_url=EXCLUDED.base_url,
+        trust_level=CASE WHEN sources.trust_level='unknown' AND EXCLUDED.trust_level<>'unknown' AND sources.official_domain=EXCLUDED.official_domain THEN EXCLUDED.trust_level ELSE sources.trust_level END,
+        updated_at=EXCLUDED.updated_at`, [source.source_id,source.source_name,source.official_domain,source.source_type,source.adapter_version,source.base_url,source.enabled,source.trust_level,source.created_at]);
     await pool.query(`INSERT INTO source_states (source_id,updated_at) VALUES ($1,$2) ON CONFLICT (source_id) DO NOTHING`, [source.source_id,clock()]);
     return (await pool.query('SELECT * FROM sources WHERE source_id=$1',[source.source_id])).rows[0];
   }
@@ -541,6 +558,17 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       'SELECT * FROM candidate_relation_proposals WHERE from_candidate_id=$1 ORDER BY created_at DESC', [required(candidateId, 'candidate_id')]
     )).rows.map(relationProposalRow);
   }
+  async function relationProposalAffectedPolicyVersions(proposalId) {
+    const proposal = (await pool.query(
+      'SELECT * FROM candidate_relation_proposals WHERE proposal_id=$1', [required(proposalId, 'proposal_id')]
+    )).rows[0];
+    if (!proposal) throw new Error('关系线索不存在。');
+    const candidateIds = [proposal.from_candidate_id, proposal.to_candidate_id].filter(Boolean);
+    if (!candidateIds.length) return [];
+    return (await pool.query(
+      'SELECT policy_version_id FROM policy_versions WHERE candidate_id=ANY($1::text[]) ORDER BY policy_version_id ASC', [candidateIds]
+    )).rows.map((row) => row.policy_version_id);
+  }
   async function generateCandidateRelationProposals(candidateId, { ruleVersion = CANDIDATE_RELATION_RULE_VERSION } = {}) {
     const candidateKey = required(candidateId, 'candidate_id');
     const locked = await withExclusiveLock(`taxkb:candidate-relation-proposal:${candidateKey}`, async () => {
@@ -624,6 +652,51 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       'SELECT * FROM candidate_risk_assessments WHERE candidate_id=$1 AND is_current', [required(candidateId, 'candidate_id')]
     )).rows[0];
     return riskAssessmentRow(row || null);
+  }
+  async function confirmedVersionRelations(policyVersionId, database = pool) {
+    const rows = (await database.query(
+      `SELECT r.policy_relation_id,r.relation_type,r.relation_state,r.created_at,
+              CASE WHEN r.from_policy_version_id=$1 THEN 'from' ELSE 'to' END AS relation_direction,
+              other.policy_id AS related_policy_id,other.policy_version_id AS related_policy_version_id,
+              other.title,other.document_no,other.official_url,other.legal_status,other.verification_state
+       FROM policy_relations r
+       JOIN policy_versions other ON other.policy_version_id=CASE
+         WHEN r.from_policy_version_id=$1 THEN r.to_policy_version_id ELSE r.from_policy_version_id END
+       WHERE (r.from_policy_version_id=$1 OR r.to_policy_version_id=$1)
+         AND r.relation_state='confirmed'
+       ORDER BY r.created_at ASC,r.policy_relation_id ASC`,
+      [required(policyVersionId, 'policy_version_id')]
+    )).rows;
+    return rows.map((row) => ({
+      policy_relation_id: row.policy_relation_id,
+      relation_type: row.relation_type,
+      relation_state: row.relation_state,
+      relation_direction: row.relation_direction,
+      related_policy_id: row.related_policy_id,
+      related_policy_version_id: row.related_policy_version_id,
+      title: row.title,
+      document_no: row.document_no,
+      official_url: row.official_url,
+      legal_status: row.legal_status,
+      verification_state: row.verification_state,
+      created_at: row.created_at
+    }));
+  }
+  async function publicationReadiness(candidate, fields, legalStatus) {
+    const blockers = [];
+    const source = candidate?.source || null;
+    const sourceTrust = String(source?.trust_level || 'unknown');
+    if (!['official_primary', 'official_authoritative'].includes(sourceTrust) || !source?.enabled) blockers.push('SOURCE_TRUST_NOT_OFFICIAL');
+    if (!PUBLIC_LEGAL_STATUSES.has(legalStatus)) blockers.push('LEGAL_STATUS_NOT_PUBLIC');
+    if (!hasText(fields?.title)) blockers.push('TITLE_MISSING');
+    if (!hasText(fields?.document_no)) blockers.push('DOCUMENT_NO_MISSING');
+    if (!hasText(fields?.publish_date)) blockers.push('PUBLISH_DATE_MISSING');
+    const assessment = await currentRiskAssessment(candidate.candidate_id);
+    if (!assessment) blockers.push('RISK_ASSESSMENT_MISSING');
+    else if (assessment.risk_level !== 'low' || Number(assessment.risk_score) > 0 || (assessment.risk_reasons || []).some((reason) => reason.hard_blocker)) blockers.push('RISK_REVIEW_REQUIRED');
+    const activeRelations = await activeRelationProposalCount(candidate.candidate_id);
+    if (Number(activeRelations) > 0) blockers.push('RELATION_REVIEW_REQUIRED');
+    return { eligible: blockers.length === 0, blockers, source_trust_level: sourceTrust, assessment_id: assessment?.assessment_id || null, active_relation_proposal_count: Number(activeRelations) };
   }
   async function activeRelationProposalCount(candidateId) {
     return (await pool.query(
@@ -854,7 +927,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     return locked.result;
   }
   async function markReviewBatchItem(manifestItemId, { item_state, review_decision_id = null, policy_id = null, policy_version_id = null, last_error = null } = {}) {
-    const allowed = new Set(['selected', 'sample_required', 'sample_approved', 'processing', 'published', 'failed', 'blocked']);
+    const allowed = new Set(['selected', 'sample_required', 'sample_approved', 'processing', 'reviewed_private', 'published', 'failed', 'blocked']);
     if (!allowed.has(item_state)) throw new Error('manifest item 状态无效。');
     await pool.query(
       `UPDATE review_batch_items SET item_state=$2,review_decision_id=COALESCE($3,review_decision_id),policy_id=COALESCE($4,policy_id),policy_version_id=COALESCE($5,policy_version_id),last_error=$6,updated_at=$7 WHERE manifest_item_id=$1`,
@@ -863,7 +936,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
   }
   async function completeReviewBatchManifest(manifestId) {
     const key = required(manifestId, 'manifest_id');
-    const pending = (await pool.query("SELECT COUNT(*)::int AS count FROM review_batch_items WHERE manifest_id=$1 AND item_state NOT IN ('sample_approved','published')", [key])).rows[0].count;
+    const pending = (await pool.query("SELECT COUNT(*)::int AS count FROM review_batch_items WHERE manifest_id=$1 AND item_state NOT IN ('sample_approved','reviewed_private','published')", [key])).rows[0].count;
     if (pending) throw new Error('manifest 仍有未完成项目。');
     await pool.query("UPDATE review_batch_manifests SET manifest_state='completed',completed_at=$2,updated_at=$2 WHERE manifest_id=$1", [key, clock()]);
     return getReviewBatchManifest(key);
@@ -893,7 +966,13 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       pool.query('SELECT * FROM policy_versions WHERE policy_version_id=$1', [job.policy_version_id]),
       pool.query('SELECT * FROM review_decisions WHERE review_decision_id=$1', [job.review_decision_id])
     ]);
-    return { job: projectionJobRow(job), policy: policy.rows[0], policy_version: policyVersion.rows[0], review_decision: { ...review.rows[0], confirmed_fields: jsonObject(review.rows[0]?.confirmed_fields) }, detail: await getCandidateForReview(job.candidate_id) };
+    return {
+      job: projectionJobRow(job),
+      policy: policy.rows[0],
+      policy_version: { ...policyVersion.rows[0], version_relations: await confirmedVersionRelations(policyVersion.rows[0]?.policy_version_id) },
+      review_decision: { ...review.rows[0], confirmed_fields: jsonObject(review.rows[0]?.confirmed_fields) },
+      detail: await getCandidateForReview(job.candidate_id)
+    };
   }
   async function getProjectionJobForPolicyVersion(policyVersionId) {
     return projectionJobRow((await pool.query('SELECT * FROM policy_projection_jobs WHERE policy_version_id=$1', [required(policyVersionId, 'policy_version_id')])).rows[0] || null);
@@ -955,7 +1034,16 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         const version = (await pool.query('SELECT * FROM policy_versions WHERE candidate_id=$1', [candidateKey])).rows[0];
         const policy = version ? (await pool.query('SELECT * FROM policies WHERE policy_id=$1', [version.policy_id])).rows[0] : null;
         if (!version || !policy) throw new Error('已批准 Candidate 缺少 Policy Version，需人工处理。');
-        return { execution: 'already_approved', ...detail, review_decision: existingApproval, policy, policy_version: version, confirmed_fields: existingApproval.confirmed_fields };
+        const fields = jsonObject(existingApproval.confirmed_fields);
+        const readiness = await publicationReadiness({ ...candidate, source: detail.source }, fields, existingApproval.legal_status);
+        return {
+          execution: 'already_approved', ...detail,
+          review_decision: { ...existingApproval, confirmed_fields: fields },
+          policy,
+          policy_version: { ...version, version_relations: await confirmedVersionRelations(version.policy_version_id) },
+          confirmed_fields: fields,
+          publication_readiness: readiness
+        };
       }
       if (requestedAction === 'reject' && candidate.verification_state === 'rejected') {
         const review = reviews.find((item) => item.reviewer_level === 3 && item.decision === 'reject');
@@ -967,6 +1055,9 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       const timestamp = clock();
       const reviewId = id('review');
       const fields = jsonObject(confirmed_fields);
+      const publicationReadinessResult = requestedAction === 'approve'
+        ? await publicationReadiness({ ...candidate, source: detail.source }, fields, legal_status)
+        : { eligible: false, blockers: ['NOT_APPROVED'], source_trust_level: detail.source?.trust_level || 'unknown', assessment_id: null, active_relation_proposal_count: 0 };
       await pool.query(
         `INSERT INTO review_decisions (review_decision_id,candidate_id,reviewer_level,decision,legal_status,note,evidence_snapshot_ids,decided_at,reviewer_id,confirmed_fields)
          VALUES ($1,$2,3,$3,$4,$5,$6,$7,$8,$9)`,
@@ -982,15 +1073,15 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         const policyId = `policy-${candidateKey}`;
         const policyVersionId = `policy-version-${candidateKey}`;
         await pool.query(
-          `INSERT INTO policies (policy_id,canonical_title,legal_status,verification_state,current_policy_version_id,source_ids,created_at,updated_at)
-           VALUES ($1,$2,$3,'verified',NULL,$4,$5,$5)
-           ON CONFLICT (policy_id) DO UPDATE SET canonical_title=EXCLUDED.canonical_title,legal_status=EXCLUDED.legal_status,verification_state='verified',source_ids=EXCLUDED.source_ids,updated_at=EXCLUDED.updated_at`,
-          [policyId, required(fields.title, '审核标题'), legal_status, JSON.stringify([candidate.source_id]), timestamp]
+          `INSERT INTO policies (policy_id,canonical_title,legal_status,verification_state,current_policy_version_id,source_ids,publication_state,created_at,updated_at)
+           VALUES ($1,$2,$3,'verified',NULL,$4,$5,$6,$6)
+           ON CONFLICT (policy_id) DO UPDATE SET canonical_title=EXCLUDED.canonical_title,legal_status=EXCLUDED.legal_status,verification_state='verified',source_ids=EXCLUDED.source_ids,publication_state=EXCLUDED.publication_state,updated_at=EXCLUDED.updated_at`,
+          [policyId, required(fields.title, '审核标题'), legal_status, JSON.stringify([candidate.source_id]), publicationReadinessResult.eligible ? 'eligible' : 'blocked', timestamp]
         );
         await pool.query(
-          `INSERT INTO policy_versions (policy_version_id,policy_id,version_number,review_decision_id,candidate_id,snapshot_id,source_id,official_url,canonical_url,title,document_no,legal_status,verification_state,effective_date,expiry_date,source_links,created_at)
-           VALUES ($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,'verified',$12,$13,$14,$15)`,
-          [policyVersionId, policyId, reviewId, candidateKey, candidate.snapshot_id, candidate.source_id, candidate.official_url, candidate.canonical_url, fields.title, fields.document_no || null, legal_status, fields.effective_date || null, fields.expiry_date || null, JSON.stringify([{ source_id: candidate.source_id, snapshot_id: candidate.snapshot_id, official_url: candidate.official_url }]), timestamp]
+          `INSERT INTO policy_versions (policy_version_id,policy_id,version_number,review_decision_id,candidate_id,snapshot_id,source_id,official_url,canonical_url,title,document_no,legal_status,verification_state,publish_date,effective_date,expiry_date,confirmed_fields,source_trust_level,source_links,created_at)
+           VALUES ($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,'verified',$12,$13,$14,$15,$16,$17,$18)`,
+          [policyVersionId, policyId, reviewId, candidateKey, candidate.snapshot_id, candidate.source_id, candidate.official_url, candidate.canonical_url, fields.title, fields.document_no || null, legal_status, fields.publish_date || null, fields.effective_date || null, fields.expiry_date || null, JSON.stringify(fields), publicationReadinessResult.source_trust_level, JSON.stringify([{ source_id: candidate.source_id, snapshot_id: candidate.snapshot_id, official_url: candidate.official_url }]), timestamp]
         );
         await pool.query('UPDATE policies SET current_policy_version_id=$2,updated_at=$3 WHERE policy_id=$1', [policyId, policyVersionId, timestamp]);
         policy = (await pool.query('SELECT * FROM policies WHERE policy_id=$1', [policyId])).rows[0];
@@ -1001,7 +1092,12 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
         [id('audit'), 'candidate', candidateKey, `level3_${requestedAction}`, JSON.stringify({ review_decision_id: reviewId, reviewer_id: reviewer, legal_status: nextLegal, policy_id: policy?.policy_id || null, policy_version_id: policyVersion?.policy_version_id || null }), timestamp]
       );
       const activeDetail = await getCandidateForReview(candidateKey);
-      return { execution: requestedAction, ...activeDetail, candidate: activeDetail.candidate, review_decision: { ...review, confirmed_fields: fields }, policy, policy_version: policyVersion, confirmed_fields: fields };
+      return {
+        execution: requestedAction, ...activeDetail, candidate: activeDetail.candidate,
+        review_decision: { ...review, confirmed_fields: fields }, policy,
+        policy_version: policyVersion ? { ...policyVersion, version_relations: await confirmedVersionRelations(policyVersion.policy_version_id) } : null,
+        confirmed_fields: fields, publication_readiness: publicationReadinessResult
+      };
     });
     if (!locked.acquired) throw new Error('该 Candidate 正在审核中，请稍后重试。');
     return locked.result;
@@ -1554,5 +1650,5 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     } finally { client.release(); }
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,relationProposalAffectedPolicyVersions,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

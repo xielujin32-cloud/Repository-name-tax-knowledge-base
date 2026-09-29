@@ -9,6 +9,7 @@ export const CHINA_TAX_POLICY_SOURCE = Object.freeze({
   source_name: '国家税务总局政策法规库',
   official_domain: 'fgk.chinatax.gov.cn',
   source_type: 'official_policy_library',
+  trust_level: 'official_primary',
   adapter_version: '2.0.0-phase2a',
   collection_url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/list.html'
 });
@@ -134,8 +135,8 @@ async function fetchListPage(fetchImpl, url) {
   return response.text();
 }
 
-async function fetchListApi(fetchImpl, channelId) {
-  const body = new URLSearchParams({ codeId: '', channelId, page: '1', size: '5', relateSubChannels: 'false' });
+async function fetchListApi(fetchImpl, channelId, { page = 1, size = 10 } = {}) {
+  const body = new URLSearchParams({ codeId: '', channelId, page: String(page), size: String(size), relateSubChannels: 'false' });
   const response = await fetchImpl(LIST_API_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', 'user-agent': USER_AGENT },
@@ -151,8 +152,10 @@ async function fetchListApi(fetchImpl, channelId) {
  * It never requests a /content.html page, records a snapshot, creates a
  * candidate, or writes to any repository/Blob store.
  */
-export async function discoverChinaTaxPolicyDryRun({ fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, limit = 5 } = {}) {
-  const safeLimit = Math.min(Math.max(Number(limit) || 5, 1), 5);
+export async function discoverChinaTaxPolicyDryRun({ fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, limit = 20, pageSize = 10, maxPages = 3 } = {}) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
+  const safePageSize = Math.min(Math.max(Number(pageSize) || 10, 1), 20);
+  const safeMaxPages = Math.min(Math.max(Number(maxPages) || 3, 1), 5);
   const collectionUrl = source.collection_url || CHINA_TAX_POLICY_SOURCE.collection_url;
   const collectionPage = new URL(collectionUrl);
   if (!POLICY_HOSTS.has(collectionPage.hostname) || !collectionPage.pathname.startsWith('/zcfgk/')) {
@@ -164,10 +167,17 @@ export async function discoverChinaTaxPolicyDryRun({ fetchImpl = fetch, source =
   const channelId = channelIdFromPage(html);
   let apiRecords = [];
   let listApiUsed = false;
+  let apiPagesRequested = 0;
+  let apiPagesReturned = 0;
   if (channelId) {
-    const payload = await fetchListApi(fetchImpl, channelId);
-    apiRecords = parseChinaTaxListApiPayload(payload).records;
-    listApiUsed = true;
+    for (let page = 1; page <= safeMaxPages && apiRecords.length < safeLimit; page += 1) {
+      const parsed = parseChinaTaxListApiPayload(await fetchListApi(fetchImpl, channelId, { page, size: safePageSize }));
+      apiPagesRequested += 1;
+      apiPagesReturned += 1;
+      apiRecords = mergeRecords([...apiRecords, ...parsed.records]);
+      if (!parsed.records.length || (parsed.total !== null && page * safePageSize >= parsed.total)) break;
+    }
+    listApiUsed = apiPagesRequested > 0;
   }
 
   // The API keeps its official ordering; list-page entries fill only missing URLs.
@@ -175,7 +185,7 @@ export async function discoverChinaTaxPolicyDryRun({ fetchImpl = fetch, source =
   return Object.freeze({
     mode: 'dry-run',
     source: Object.freeze({ ...source, collection_url: collectionUrl }),
-    discovery: Object.freeze({ collection_page: collectionUrl, list_api_used: listApiUsed, channel_id_found: Boolean(channelId), detail_pages_requested: 0 }),
+    discovery: Object.freeze({ collection_page: collectionUrl, list_api_used: listApiUsed, channel_id_found: Boolean(channelId), page_size: safePageSize, max_pages: safeMaxPages, api_pages_requested: apiPagesRequested, api_pages_returned: apiPagesReturned, detail_pages_requested: 0 }),
     candidates: Object.freeze(records.map((record) => Object.freeze({ ...record, source_id: source.source_id, source_name: source.source_name, official_domain: source.official_domain }))),
     writes: Object.freeze({ raw_snapshots: 0, candidates: 0, policies: 0, netlify_blobs: 0 })
   });

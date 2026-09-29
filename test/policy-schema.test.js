@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ensurePolicySchema, policyFromLegacyDocument, validatePolicies } from '../src/policy-schema.js';
+import { ensurePolicySchema, policyFromLegacyDocument, publicPolicyAvailability, validatePolicies } from '../src/policy-schema.js';
 
 test('旧法规迁移为标准政策字段，未知信息不编造', () => {
   const policy = policyFromLegacyDocument({
@@ -11,7 +11,8 @@ test('旧法规迁移为标准政策字段，未知信息不编造', () => {
     id: 'doc-example', title: '示例政策', document_no: null, issuing_authority: ['国家税务总局'], publish_date: '2026-08-29', effective_date: null,
     expiry_date: null, status: 'pending', tax_categories: ['个人所得税'], topics: [], region: [], applicable_entities: [], keywords: ['示例政策', '个人所得税'],
     summary: null, key_points: [], practical_guidance: null, source_url: null, source_name: null, related_policies: ['doc-related'], last_verified_date: null,
-    created_at: '2026-08-29', updated_at: null, legacy_document_id: 'doc-example', legacy_status: 'pending_verification'
+    created_at: '2026-08-29', updated_at: null, legacy_document_id: 'doc-example', legacy_status: 'pending_verification',
+    verification_state: 'legacy_unverified', source_trust_level: 'unknown', policy_version_id: null, evidence: null, review: null, version_relations: []
   });
 });
 
@@ -22,10 +23,19 @@ test('迁移保留旧 documents，并只补充缺失的标准政策', () => {
   assert.equal(data.documents.length, 1);
   assert.equal(data.policies.length, 1);
   assert.equal(data.policies[0].source_name, '官方来源');
-  assert.equal(data.policies[0].status, 'effective');
+  assert.equal(data.policies[0].status, 'pending');
+  assert.equal(data.policies[0].verification_state, 'legacy_unverified');
   const second = ensurePolicySchema(data, { today: '2026-08-29' });
   assert.equal(second.additions, 0);
   assert.equal(data.policies.length, 1);
+});
+
+test('未经官方 Evidence 和 Level 3 审核的旧政策不得作为公开现行政策', () => {
+  const legacy = policyFromLegacyDocument({ id: 'legacy-current', title: '旧 current 标签', status: 'current', taxTypes: [], relations: [] });
+  assert.deepEqual(publicPolicyAvailability(legacy), {
+    eligible: false,
+    reasons: ['VERIFICATION_NOT_LEVEL3_APPROVED', 'SOURCE_TRUST_NOT_OFFICIAL', 'LEGAL_STATUS_NOT_VERIFIED', 'OFFICIAL_URL_MISSING', 'EVIDENCE_CHAIN_INCOMPLETE', 'LEVEL3_REVIEW_MISSING']
+  });
 });
 
 test('政策导入校验拒绝空标题、重复 id、非法日期和非法状态', () => {

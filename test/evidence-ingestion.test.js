@@ -292,9 +292,9 @@ test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建
       } }
     });
     assert.equal(approved.response.status, 200);
-    assert.equal(projections.length, 1);
-    assert.match(projections[0].evidence.normalized_text, /第一条 原始证据正文一/);
-    assert.doesNotMatch(projections[0].evidence.normalized_text, /登录|本站热词|个人中心/);
+    assert.equal(approved.body.publication.execution, 'blocked');
+    assert.ok(approved.body.publication.blockers.includes('LEGAL_STATUS_NOT_PUBLIC'));
+    assert.equal(projections.length, 0, 'pending 状态不能作为可靠公开政策投影');
 
     const second = await call(handler, '/api/admin/evidence/reparse-phase2b', reparseInput);
     assert.equal(second.response.status, 422, '已审核 Candidate 不能通过重新解析接口重写');
@@ -307,7 +307,7 @@ test('Phase 2B Candidate 可从不可变 Raw HTML 重新解析正文，不新建
   }
 });
 
-test('Evidence Candidate 经过 Level 3 审核后生成幂等 Policy Version 与公开投影', async () => {
+test('Evidence Candidate 缺少 Risk 门禁时可保留 Level 3 决定，但不能生成公开投影', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-evidence-review-api-'));
   const database = new NetlifyDB({ directory: path.join(root, 'database'), logger: () => {} });
   const originalToken = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
@@ -344,9 +344,9 @@ test('Evidence Candidate 经过 Level 3 审核后生成幂等 Policy Version 与
     assert.equal(first.body.candidate.verification_state, 'verified');
     assert.equal(first.body.candidate.legal_status, 'effective');
     assert.equal(first.body.policy_version.candidate_id, candidateId);
-    assert.equal(projections.length, 1);
-    assert.equal(projections[0].title, reviewBody.fields.title);
-    assert.equal(projections[0].evidence.normalized_text.includes('原始证据正文一'), true);
+    assert.equal(first.body.publication.execution, 'blocked');
+    assert.ok(first.body.publication.blockers.includes('RISK_ASSESSMENT_MISSING'));
+    assert.equal(projections.length, 0);
 
     const repeat = await call(handler, `/api/admin/evidence/candidates/${candidateId}/review`, { method: 'POST', token: testAdminToken, body: reviewBody });
     assert.equal(repeat.response.status, 200);

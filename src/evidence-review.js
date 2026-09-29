@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { POLICY_STATUSES, dateOnlyOrNull, validatePolicy } from './policy-schema.js';
 
 const ARRAY_FIELDS = Object.freeze(['issuing_authority', 'tax_categories', 'topics', 'region', 'applicable_entities', 'keywords', 'key_points', 'related_policies']);
@@ -76,7 +77,11 @@ export function buildPublicPolicyProjection({ candidate, source, reviewDecision,
     practical_guidance: confirmedFields.practical_guidance,
     source_url: candidate.official_url,
     source_name: source.source_name,
+    source_trust_level: source.trust_level || 'unknown',
+    verification_state: policy.verification_state,
+    policy_version_id: policyVersion.policy_version_id,
     related_policies: confirmedFields.related_policies,
+    version_relations: Array.isArray(policyVersion.version_relations) ? policyVersion.version_relations : [],
     last_verified_date: reviewedDate,
     created_at: dateOnlyOrNull(candidate.created_at) || reviewedDate,
     updated_at: reviewedDate,
@@ -86,7 +91,14 @@ export function buildPublicPolicyProjection({ candidate, source, reviewDecision,
       policy_version_id: policyVersion.policy_version_id,
       source_id: source.source_id,
       official_url: candidate.official_url,
-      normalized_text: String(normalizedText || '')
+      body_hash: createHash('sha256').update(String(normalizedText || '')).digest('hex')
+    },
+    review: {
+      reviewer_level: reviewDecision.reviewer_level,
+      decision: reviewDecision.decision,
+      legal_status: reviewDecision.legal_status,
+      decided_at: reviewDecision.decided_at,
+      review_decision_id: reviewDecision.review_decision_id
     }
   };
   if (!POLICY_STATUSES.includes(projection.status)) throw new Error('审核效力状态无效。');

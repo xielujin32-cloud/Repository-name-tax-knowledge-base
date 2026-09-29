@@ -98,7 +98,7 @@ test('Risk Queue API 鉴权、筛选和 manifest 均由服务端控制', async (
   } finally { if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN; else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous; await closeFixture(fixture); }
 });
 
-test('Low Risk manifest 抽样、并发 apply、projection 失败重试和幂等发布', async () => {
+test('Low Risk manifest 抽样可完成私有 Evidence 审核，但不得自动公开政策', async () => {
   const fixture = await openFixture();
   try {
     for (let index = 1; index <= 11; index += 1) await seedLowCandidate(fixture, index);
@@ -106,39 +106,20 @@ test('Low Risk manifest 抽样、并发 apply、projection 失败重试和幂等
     assert.equal(manifest.manifest.batch_size, 11); assert.equal(manifest.manifest.sample_size, 10);
     await assert.rejects(() => fixture.repository.createLowRiskReviewManifest({ filters: {}, created_by: 'other-admin' }), /其他活动 manifest/);
     for (const item of manifest.items.filter((item) => item.is_sample)) await approveSample(fixture.repository, item.candidate_id);
-    let releaseFirst; let publisherEntered = false;
-    const firstPromise = applyLowRiskReviewManifest(manifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => {
-      publisherEntered = true;
-      return new Promise((resolve) => { releaseFirst = () => resolve({ added: 1, updated: 0, skipped: 0, errors: [] }); });
+    let publishCalls = 0;
+    const firstResult = await applyLowRiskReviewManifest(manifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => {
+      publishCalls += 1;
+      return { added: 1, updated: 0, skipped: 0, errors: [] };
     } });
-    while (!publisherEntered) await new Promise((resolve) => setTimeout(resolve, 5));
-    const concurrent = await applyLowRiskReviewManifest(manifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => ({ added: 1 }) });
-    assert.equal(concurrent.execution, 'in_progress');
-    releaseFirst();
-    const firstResult = await firstPromise;
     assert.equal(firstResult.execution, 'completed');
+    assert.equal(publishCalls, 0);
+    const completed = await fixture.repository.getReviewBatchManifest(manifest.manifest.manifest_id);
+    assert.equal(completed.items.filter((item) => item.item_state === 'reviewed_private').length, 1);
     const firstCounts = (await fixture.database.query('SELECT (SELECT COUNT(*)::int FROM review_decisions) AS reviews,(SELECT COUNT(*)::int FROM policies) AS policies,(SELECT COUNT(*)::int FROM policy_versions) AS versions,(SELECT COUNT(*)::int FROM policy_projection_jobs) AS jobs')).rows[0];
+    assert.equal(firstCounts.jobs, 0);
     const repeated = await applyLowRiskReviewManifest(manifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => { throw new Error('completed manifest must not publish again'); } });
     assert.equal(repeated.execution, 'already_completed');
     assert.deepEqual((await fixture.database.query('SELECT (SELECT COUNT(*)::int FROM review_decisions) AS reviews,(SELECT COUNT(*)::int FROM policies) AS policies,(SELECT COUNT(*)::int FROM policy_versions) AS versions,(SELECT COUNT(*)::int FROM policy_projection_jobs) AS jobs')).rows[0], firstCounts);
-
-    for (let index = 12; index <= 22; index += 1) await seedLowCandidate(fixture, index);
-    const retryManifest = await fixture.repository.createLowRiskReviewManifest({ filters: {}, created_by: 'retry-test' });
-    for (const item of retryManifest.items.filter((item) => item.is_sample)) await approveSample(fixture.repository, item.candidate_id);
-    let attempts = 0;
-    const first = await applyLowRiskReviewManifest(retryManifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => { attempts += 1; throw new Error('temporary projection outage'); } });
-    assert.equal(first.execution, 'failed');
-    const afterFailure = await fixture.repository.getReviewBatchManifest(retryManifest.manifest.manifest_id);
-    const failed = afterFailure.items.find((item) => item.item_state === 'failed');
-    assert.ok(failed?.policy_version_id, 'projection 失败后 Policy Version 已保存，重试不得重新审核');
-    const failedCounts = (await fixture.database.query('SELECT (SELECT COUNT(*)::int FROM review_decisions WHERE candidate_id=$1) AS reviews,(SELECT COUNT(*)::int FROM policies WHERE policy_id=$2) AS policies,(SELECT COUNT(*)::int FROM policy_versions WHERE candidate_id=$1) AS versions,(SELECT COUNT(*)::int FROM policy_projection_jobs WHERE policy_version_id=$3) AS jobs', [failed.candidate_id, failed.policy_id, failed.policy_version_id])).rows[0];
-    const retry = await applyLowRiskReviewManifest(retryManifest.manifest.manifest_id, { repository: fixture.repository, publishProjection: async () => { attempts += 1; return { added: 1, updated: 0, skipped: 0, errors: [] }; } });
-    assert.equal(retry.execution, 'completed'); assert.equal(attempts, 2);
-    const completed = await fixture.repository.getReviewBatchManifest(retryManifest.manifest.manifest_id);
-    assert.equal(completed.manifest.manifest_state, 'completed');
-    assert.equal(completed.items.filter((item) => item.item_state === 'published').length, 1);
-    assert.equal((await fixture.repository.getProjectionJobForPolicyVersion(failed.policy_version_id)).job_state, 'published');
-    assert.deepEqual((await fixture.database.query('SELECT (SELECT COUNT(*)::int FROM review_decisions WHERE candidate_id=$1) AS reviews,(SELECT COUNT(*)::int FROM policies WHERE policy_id=$2) AS policies,(SELECT COUNT(*)::int FROM policy_versions WHERE candidate_id=$1) AS versions,(SELECT COUNT(*)::int FROM policy_projection_jobs WHERE policy_version_id=$3) AS jobs', [failed.candidate_id, failed.policy_id, failed.policy_version_id])).rows[0], failedCounts);
   } finally { await closeFixture(fixture); }
 });
 

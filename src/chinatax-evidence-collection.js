@@ -1,5 +1,6 @@
 import { htmlToText } from './collector.js';
 import { CHINA_TAX_POLICY_SOURCE, normalizeChinaTaxPolicyUrl } from './chinatax-evidence-adapter.js';
+import { suggestEvidenceMetadata } from './evidence-metadata-suggestion.js';
 
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2b-evidence-collection)';
 
@@ -307,8 +308,117 @@ export function addChinaTaxPolicySource(repository) {
     source_name: CHINA_TAX_POLICY_SOURCE.source_name,
     official_domain: CHINA_TAX_POLICY_SOURCE.official_domain,
     source_type: CHINA_TAX_POLICY_SOURCE.source_type,
+    trust_level: CHINA_TAX_POLICY_SOURCE.trust_level,
     adapter_version: '2.0.0-phase2b',
     base_url: CHINA_TAX_POLICY_SOURCE.collection_url
+  });
+}
+
+/**
+ * Creates Evidence/Candidate records only for a bounded, already-discovered
+ * set of State Taxation Administration detail URLs. It never creates a
+ * Policy, Policy Version, or public Blob projection. Production callers must
+ * supply an explicit reviewed selection and confirmation at the API layer.
+ */
+export async function collectChinaTaxPolicyCandidates({ repository, urls = [], fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake' } = {}) {
+  if (!repository) throw new Error('官方 Candidate 收集必须提供 Evidence Repository。');
+  const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
+  if (!Array.isArray(urls) || !urls.length) throw new Error('必须提供已发现的国家税务总局官方详情 URL。');
+  const selectedUrls = [...new Set(urls.map((value) => normalizeChinaTaxPolicyUrl(value)).filter(Boolean))];
+  if (!selectedUrls.length || selectedUrls.length > cap || selectedUrls.length !== new Set(urls.map(String)).size) {
+    throw new Error(`官方 Candidate 收集仅接受 1 至 ${cap} 条互不重复的法规库详情 URL。`);
+  }
+  const sourceRecord = await addChinaTaxPolicySource(repository);
+  const run = await repository.createCollectionRun({ source_id: sourceRecord.source_id, mode });
+  const results = [];
+  try {
+    for (const officialUrl of selectedUrls) {
+      const response = await fetchOfficialDetail(fetchImpl, officialUrl);
+      const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      const snapshot = await repository.recordRawSnapshot({
+        source_id: sourceRecord.source_id,
+        collection_run_id: run.collection_run_id,
+        official_url: officialUrl,
+        canonical_url: officialUrl,
+        http_status: response.http_status,
+        response_headers_subset: response.response_headers_subset,
+        content_type: response.content_type,
+        raw_content: response.raw_html,
+        normalized_text: parsed.normalized_text,
+        parser_version: 'chinatax-evidence-3.0.0-mvp',
+        parse_result: {
+          title: parsed.title,
+          document_no: parsed.document_no,
+          document_no_source: parsed.document_no_source,
+          document_no_confidence: parsed.document_no_confidence,
+          document_no_evidence: parsed.document_no_evidence,
+          issuing_authority: parsed.issuing_authority,
+          publish_date: parsed.publish_date,
+          effective_date: parsed.effective_date,
+          expiry_date: parsed.expiry_date,
+          legal_status: 'pending'
+        }
+      });
+      const created = await repository.createCandidate({
+        snapshot_id: snapshot.snapshot_id,
+        parsed_fields: {
+          title: parsed.title,
+          document_no: parsed.document_no,
+          document_no_source: parsed.document_no_source,
+          document_no_confidence: parsed.document_no_confidence,
+          document_no_evidence: parsed.document_no_evidence,
+          issuing_authority: parsed.issuing_authority,
+          publish_date: parsed.publish_date,
+          effective_date: parsed.effective_date,
+          expiry_date: parsed.expiry_date,
+          official_url: snapshot.official_url,
+          source_id: snapshot.source_id,
+          snapshot_id: snapshot.snapshot_id
+        },
+        verification_state: 'pending_review',
+        legal_status: 'pending'
+      });
+      let metadataSuggestion = null;
+      let riskAssessment = null;
+      let relationProposals = [];
+      if (created.created) {
+        metadataSuggestion = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
+        await repository.saveMetadataSuggestion(created.candidate.candidate_id, metadataSuggestion);
+        riskAssessment = await repository.assessCandidateRisk(created.candidate.candidate_id);
+        relationProposals = (await repository.generateCandidateRelationProposals(created.candidate.candidate_id)).created;
+      }
+      results.push({
+        official_url: officialUrl,
+        candidate_id: created.candidate.candidate_id,
+        candidate_created: created.created,
+        verification_state: created.candidate.verification_state,
+        legal_status: created.candidate.legal_status,
+        title_present: Boolean(parsed.title),
+        document_no_present: Boolean(parsed.document_no),
+        metadata_suggestion_created: Boolean(metadataSuggestion),
+        risk_level: riskAssessment?.assessment?.risk_level || null,
+        risk_score: riskAssessment?.assessment?.risk_score ?? null,
+        relation_proposals_created: relationProposals.length
+      });
+    }
+    await repository.finishCollectionRun(run.collection_run_id);
+  } catch (error) {
+    await repository.finishCollectionRun(run.collection_run_id, 'failed');
+    throw error;
+  }
+  return Object.freeze({
+    mode,
+    run: { collection_run_id: run.collection_run_id, source_id: sourceRecord.source_id },
+    results: Object.freeze(results),
+    created: Object.freeze({
+      raw_snapshots: results.length,
+      candidates: results.filter((item) => item.candidate_created).length,
+      risk_assessments: results.filter((item) => item.metadata_suggestion_created).length,
+      relation_proposals: results.reduce((total, item) => total + item.relation_proposals_created, 0),
+      policies: 0,
+      policy_versions: 0,
+      public_projections: 0
+    })
   });
 }
 

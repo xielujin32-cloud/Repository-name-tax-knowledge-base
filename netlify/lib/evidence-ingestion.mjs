@@ -1,18 +1,20 @@
 import { createRecoverablePostgresEvidenceRepositoryFactory } from '../../src/postgres-evidence-repository.js';
 import { createHash } from 'node:crypto';
+import { publicPolicyAvailability } from '../../src/policy-schema.js';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
-import { CHINA_TAX_POLICY_SOURCE } from '../../src/chinatax-evidence-adapter.js';
-import { PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
+import { CHINA_TAX_POLICY_SOURCE, discoverChinaTaxPolicyDryRun } from '../../src/chinatax-evidence-adapter.js';
+import { collectChinaTaxPolicyCandidates, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
-import { importPolicies, listPolicies, readPolicy } from './policy-store.mjs';
+import { importPolicies, listPolicies, readPolicy, suppressPublicPoliciesForRelation } from './policy-store.mjs';
 import { PHASE3C1_IMPORT_MANIFEST_CONFIRMATION, PHASE3C2_CONTROLLED_APPLY_CONFIRMATION, Phase3C1PreviewFailure, collectPhase3C1ApplyMaterial, diagnosePhase3C1FullCadence, diagnosePhase3C1ImportPreview, diagnosePhase3C1OrdinalTenUpstreamStability, diagnosePhase3C1ShortCadence, preparePhase3C1ImportPreview } from '../../src/phase3c1-controlled-import.js';
 
 export const PHASE_2D_IMPORT_CONFIRMATION = 'INGEST_PHASE2B_STA_TWO_URLS';
 export const PHASE_2D_ONE_TIME_INGESTION_LOCK = 'taxkb:phase2d:phase2b-whitelist:first-production-ingestion';
 export const PHASE_2D_REPARSE_CONFIRMATION = 'REPARSE_PHASE2B_TWO_CANDIDATES';
 export const PHASE_2D_METADATA_SUGGESTION_CONFIRMATION = 'SUGGEST_PHASE2B_TWO_CANDIDATES';
+export const PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION = 'INGEST_PHASE4_STA_REVIEW_CANDIDATES';
 export const LOW_RISK_BATCH_CONFIRMATION_PHRASE = LOW_RISK_BATCH_CONFIRMATION;
 const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2d-server-evidence-ingestion)';
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
@@ -238,6 +240,8 @@ async function queueProjectionForReview(result, { repository, publishProjection,
     confirmedFields: result.confirmed_fields,
     normalizedText: result.candidate.parsed_normalized_text ?? result.raw_snapshot.normalized_text
   });
+  const availability = publicPolicyAvailability(projection);
+  if (!availability.eligible) return { execution: 'blocked', blockers: availability.reasons, job: null, publication: null };
   const job = await repository.ensureProjectionJob({
     policy_id: result.policy.policy_id,
     policy_version_id: result.policy_version.policy_version_id,
@@ -332,7 +336,7 @@ async function publicProjectionPreflight(items, { listPublicPolicies = listPolic
       const bases = [];
       if (policy.source_url === item.official_url || policy.evidence?.official_url === item.official_url) bases.push('official_url');
       if (item.document_no && policy.document_no === item.document_no) bases.push('document_no');
-      if (String(policy.evidence?.normalized_text || '') && sha256(policy.evidence.normalized_text) === item.body_hash) bases.push('body_hash');
+      if (policy.evidence?.body_hash && policy.evidence.body_hash === item.body_hash) bases.push('body_hash');
       if (bases.length) matches.push({ policy_id: policy.id, match_basis: bases });
     }
     return { ordinal: item.ordinal, official_url: item.official_url, projections: matches };
@@ -394,9 +398,11 @@ export async function reviewEvidenceCandidate(candidateId, input, { repository =
     reviewer_id: reviewerId,
     confirmed_fields: confirmedFields
   });
-  const publication = action === 'approve'
+  const publication = action === 'approve' && result.publication_readiness?.eligible
     ? await queueProjectionForReview(result, { repository, publishProjection })
-    : null;
+    : action === 'approve'
+      ? { execution: 'blocked', blockers: result.publication_readiness?.blockers || ['PUBLICATION_NOT_ELIGIBLE'] }
+      : null;
   return {
     execution: result.execution,
     candidate: adminCandidateSummary(result.candidate),
@@ -412,6 +418,7 @@ export async function reviewEvidenceCandidate(candidateId, input, { repository =
     } : null,
     policy: result.policy ? { policy_id: result.policy.policy_id, canonical_title: result.policy.canonical_title, legal_status: result.policy.legal_status, verification_state: result.policy.verification_state } : null,
     policy_version: result.policy_version ? { policy_version_id: result.policy_version.policy_version_id, policy_id: result.policy_version.policy_id, version_number: result.policy_version.version_number, candidate_id: result.policy_version.candidate_id } : null,
+    publication_readiness: result.publication_readiness || null,
     publication
   };
 }
@@ -640,7 +647,7 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   const prepared = await repository.beginReviewBatchApply(manifestId);
   if (prepared.execution !== 'ready_to_apply') return { execution: prepared.execution, manifest: safeManifest(prepared) };
   for (const item of prepared.items) {
-    if (item.is_sample || item.item_state === 'published' || item.item_state === 'sample_approved') continue;
+    if (item.is_sample || item.item_state === 'published' || item.item_state === 'reviewed_private' || item.item_state === 'sample_approved') continue;
     try {
       if (item.item_state === 'failed' && item.policy_version_id) {
         const job = await repository.getProjectionJobForPolicyVersion(item.policy_version_id);
@@ -654,6 +661,14 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
         continue;
       }
       const approved = await repository.approveLowRiskReviewBatchItem(item.manifest_item_id);
+      if (!approved.detail?.publication_readiness?.eligible) {
+        const blockers = approved.detail?.publication_readiness?.blockers || ['PUBLICATION_NOT_ELIGIBLE'];
+        await repository.markReviewBatchItem(item.manifest_item_id, {
+          item_state: 'reviewed_private',
+          last_error: `PUBLICATION_BLOCKED:${blockers.join(',')}`
+        });
+        continue;
+      }
       const projection = await queueProjectionForReview(approved.detail, { repository, publishProjection, manifestId });
       if (!projection || !['published', 'already_published'].includes(projection.execution)) {
         await repository.markReviewBatchItem(item.manifest_item_id, { item_state: 'failed', last_error: projection?.job?.last_error || 'projection failed' });
@@ -669,12 +684,30 @@ export async function applyLowRiskReviewManifest(manifestId, { repository = defa
   return { execution: 'completed', manifest: safeManifest(await repository.completeReviewBatchManifest(manifestId)) };
 }
 
-export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1PreviewJobDispatcher = defaultPhase3C1PreviewJobDispatcher, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
+export function createEvidenceAdminHandler({ repositoryFactory = defaultRepositoryFactory, fetchImpl = fetch, publishProjection = defaultPublishProjection, suppressPublicPolicies = suppressPublicPoliciesForRelation, chinaTaxDiscoveryFactory = discoverChinaTaxPolicyDryRun, chinaTaxCandidateCollector = collectChinaTaxPolicyCandidates, phase3c1PreviewFactory = preparePhase3C1ImportPreview, phase3c1ApplyMaterialFactory = collectPhase3C1ApplyMaterial, phase3c1PreviewJobDispatcher = defaultPhase3C1PreviewJobDispatcher, phase3c1ShortCadenceDiagnosticFactory = diagnosePhase3C1ShortCadence, phase3c1FullCadenceDiagnosticFactory = diagnosePhase3C1FullCadence, listPublicPolicies = listPolicies, readPublicPolicy = readPolicy } = {}) {
   return async function handleEvidenceAdmin(request, pathname, url) {
     if (!requireAdmin(request)) return json({ error: '仅管理员可执行此操作。' }, 401);
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
-    if (url.search && !isRiskQueueRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
+    const isStaDiscoveryRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/discovery';
+    if (url.search && !isRiskQueueRead && !isStaDiscoveryRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
     if (isRiskQueueRead) return json(safeRiskQueue(await repositoryFactory().listRiskQueue(riskQueueFilters(url))));
+    if (isStaDiscoveryRead) {
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 20, 1), 100);
+      const pageSize = Math.min(Math.max(Number(url.searchParams.get('page_size')) || 10, 1), 20);
+      const maxPages = Math.min(Math.max(Number(url.searchParams.get('max_pages')) || 3, 1), 5);
+      return json(await chinaTaxDiscoveryFactory({ fetchImpl, limit, pageSize, maxPages }));
+    }
+    if (request.method === 'POST' && pathname === '/api/admin/evidence/sources/chinatax/candidates') {
+      const input = await requestBody(request);
+      if (!input || typeof input !== 'object' || Array.isArray(input)
+        || Object.keys(input).length !== 3 || input.apply !== true
+        || input.confirmation !== PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION
+        || !Array.isArray(input.official_urls)) {
+        return json({ error: 'Phase 4 官方 Candidate 收集只接受已发现的官方详情 URL、固定 apply 与确认短语；不会创建 Policy 或公开投影。' }, 400);
+      }
+      const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls });
+      return json({ mode: 'review_candidate_intake', ...result }, 201);
+    }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/import-phase2b') {
       const input = await requestBody(request);
       if (Object.keys(input).length !== 2 || input.apply !== true || input.confirmation !== PHASE_2D_IMPORT_CONFIRMATION) {
@@ -824,7 +857,16 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
       const input = await requestBody(request);
       const allowed = new Set(['action', 'note']);
       if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some((key) => !allowed.has(key))) return json({ error: '关系线索审核只接受 action 与 note。' }, 400);
-      return json(await repositoryFactory().reviewCandidateRelationProposal(proposalId, { action: input.action, note: input.note || '' }));
+      const repository = repositoryFactory();
+      // Suppress any prior public projection before confirming a relationship.
+      // A confirmed relationship is evidence that an existing legal-effect
+      // conclusion needs fresh Level 3 attention; it is not itself a legal
+      // status decision and must never silently keep an old policy current.
+      const public_visibility_suppression = input.action === 'confirm'
+        ? await suppressPublicPolicies({ policyVersionIds: await repository.relationProposalAffectedPolicyVersions(proposalId) })
+        : null;
+      const outcome = await repository.reviewCandidateRelationProposal(proposalId, { action: input.action, note: input.note || '' });
+      return json({ ...outcome, public_visibility_suppression });
     }
     if (request.method === 'POST' && /^\/api\/admin\/evidence\/candidates\/[^/]+\/suggest-metadata$/.test(pathname)) {
       const candidateId = decodeURIComponent(pathname.split('/')[5]);

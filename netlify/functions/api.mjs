@@ -131,8 +131,18 @@ export function createApiHandler({ evidenceAdminHandler = createEvidenceAdminHan
     if (request.method === 'GET' && pathname === '/api/health') return json({ ok: true, storage: 'netlify-blobs' });
     if (request.method === 'GET' && pathname === '/api/policies') {
       const policies = await listPolicies({
-        query: url.searchParams.get('query') || '', taxCategory: url.searchParams.get('taxCategory') || '',
-        status: url.searchParams.get('status') || '', region: url.searchParams.get('region') || '',
+        query: url.searchParams.get('query') || url.searchParams.get('q') || '',
+        documentNo: url.searchParams.get('documentNo') || url.searchParams.get('document_no') || '',
+        taxCategory: url.searchParams.get('taxCategory') || url.searchParams.get('tax_category') || '',
+        status: url.searchParams.get('status') || '',
+        source: url.searchParams.get('source') || url.searchParams.get('source_id') || '',
+        authority: url.searchParams.get('authority') || url.searchParams.get('issuing_authority') || '',
+        region: url.searchParams.get('region') || '',
+        publishedFrom: url.searchParams.get('publishedFrom') || url.searchParams.get('published_from') || '',
+        publishedTo: url.searchParams.get('publishedTo') || url.searchParams.get('published_to') || '',
+        effectiveFrom: url.searchParams.get('effectiveFrom') || url.searchParams.get('effective_from') || '',
+        effectiveTo: url.searchParams.get('effectiveTo') || url.searchParams.get('effective_to') || '',
+        sort: url.searchParams.get('sort') || '',
         limit: url.searchParams.get('limit') || 30, offset: url.searchParams.get('offset') || 0
       });
       return json(policies);

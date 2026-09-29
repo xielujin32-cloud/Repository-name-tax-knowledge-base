@@ -38,7 +38,7 @@ test('官方列表 API 只保留其明确返回的标题、日期和法规库 UR
   assert.equal(parsed.total, 9);
 });
 
-test('dry-run 最多发现五条，不请求详情页，也不写入任何存储', async () => {
+test('dry-run 在受限分页内发现官方候选，不请求详情页，也不写入任何存储', async () => {
   const calls = [];
   async function fakeFetch(url, options = {}) {
     calls.push({ url: String(url), method: options.method || 'GET' });
@@ -59,12 +59,32 @@ test('dry-run 最多发现五条，不请求详情页，也不写入任何存储
   }
   const result = await discoverChinaTaxPolicyDryRun({ fetchImpl: fakeFetch, limit: 99 });
   assert.equal(result.mode, 'dry-run');
-  assert.equal(result.candidates.length, 5);
+  assert.equal(result.candidates.length, 6);
   assert.equal(result.candidates[0].title, 'API 文件甲');
   assert.equal(result.candidates[0].publish_date, '2026-08-29');
   assert.ok(result.candidates.every((candidate) => candidate.official_url.startsWith('https://fgk.chinatax.gov.cn/zcfgk/')));
   assert.equal(result.discovery.detail_pages_requested, 0);
+  assert.equal(result.discovery.page_size, 10);
+  assert.equal(result.discovery.api_pages_requested, 1);
   assert.deepEqual(result.writes, { raw_snapshots: 0, candidates: 0, policies: 0, netlify_blobs: 0 });
   assert.equal(calls.length, 2);
   assert.ok(calls.every((call) => !call.url.includes('/content.html')));
+});
+
+test('dry-run 在上限内请求多页官方目录，并在到达 limit 后停止', async () => {
+  const calls = [];
+  const fakeFetch = async (url, options = {}) => {
+    calls.push({ url: String(url), page: options.body?.get?.('page') || null });
+    if (String(url) === listUrl) return { ok: true, text: async () => listHtml };
+    const page = Number(options.body.get('page'));
+    const results = page === 1
+      ? [{ title: '第一页甲', url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/one/content.html', publishDate: '2026-09-01' }, { title: '第一页乙', url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/two/content.html', publishDate: '2026-08-31' }]
+      : [{ title: '第二页甲', url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/three/content.html', publishDate: '2026-08-30' }, { title: '第二页乙', url: 'https://fgk.chinatax.gov.cn/zcfgk/c100027/four/content.html', publishDate: '2026-08-29' }];
+    return { ok: true, json: async () => ({ results: { data: { page, rows: 2, total: 4, results } } }) };
+  };
+  const result = await discoverChinaTaxPolicyDryRun({ fetchImpl: fakeFetch, limit: 3, pageSize: 2, maxPages: 5 });
+  assert.equal(result.candidates.length, 3);
+  assert.equal(result.discovery.api_pages_requested, 2);
+  assert.equal(result.discovery.detail_pages_requested, 0);
+  assert.deepEqual(calls.map((item) => item.page).filter(Boolean), ['1', '2']);
 });
