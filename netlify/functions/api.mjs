@@ -133,7 +133,7 @@ export function createApiHandler({ evidenceAdminHandler = createEvidenceAdminHan
       const policies = await listPolicies({
         query: url.searchParams.get('query') || url.searchParams.get('q') || '',
         documentNo: url.searchParams.get('documentNo') || url.searchParams.get('document_no') || '',
-        taxCategory: url.searchParams.get('taxCategory') || url.searchParams.get('tax_category') || '',
+        taxCategory: url.searchParams.get('taxCategory') || url.searchParams.get('tax_category') || url.searchParams.get('tax') || '',
         status: url.searchParams.get('status') || '',
         source: url.searchParams.get('source') || url.searchParams.get('source_id') || '',
         authority: url.searchParams.get('authority') || url.searchParams.get('issuing_authority') || '',

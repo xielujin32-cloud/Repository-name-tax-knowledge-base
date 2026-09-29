@@ -115,12 +115,13 @@ test('Policy 种子导入接口只写入三条政策，并且可幂等重复执�
 
 test('Netlify Function 提供可追溯的已核验政策检索，不暴露旧种子', async () => {
   await importPolicies([verifiedPolicy], { dryRun: false });
-  const listed = await call(`/api/policies?taxCategory=${encodeURIComponent('增值税')}&documentNo=${encodeURIComponent('〔2026〕1号')}&authority=${encodeURIComponent('国家税务总局')}&publishedFrom=2026-01-01&publishedTo=2026-12-31&effectiveFrom=2026-02-01`);
+  const listed = await call(`/api/policies?tax=${encodeURIComponent('增值税')}&documentNo=${encodeURIComponent('〔2026〕1号')}&authority=${encodeURIComponent('国家税务总局')}&publishedFrom=2026-01-01&publishedTo=2026-12-31&effectiveFrom=2026-02-01`);
   assert.equal(listed.response.status, 200);
   assert.equal(listed.body.total, 1);
   assert.equal(listed.body.results[0].id, verifiedPolicy.id);
   assert.equal(listed.body.results[0].public_policy_eligible, true);
   assert.equal(listed.body.results[0].evidence.body_hash, 'a'.repeat(64));
+  assert.equal(listed.body.applied_filters.tax_category, '增值税');
 
   const detail = await call(`/api/policies/${verifiedPolicy.id}`);
   assert.equal(detail.response.status, 200);
