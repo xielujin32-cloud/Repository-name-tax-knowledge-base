@@ -38,6 +38,32 @@ test('Phase 4 P1 官方试运行只读取受控 STA 页面，输出待核验元�
   assert.ok(result.candidates[3].relation_proposals.some((item) => item.relation_type === 'repeals'));
 });
 
+test('Phase 4 P1 dry-run keeps one failed official detail explicit and makes only the other nine import-ready', async () => {
+  const failedUrl = PHASE4_P1_PILOT_OFFICIAL_URLS.at(-1);
+  const htmlByUrl = new Map(PHASE4_P1_PILOT_OFFICIAL_URLS.map((url, index) => {
+    const [title, documentNo, date, body] = rows[index];
+    return [url, page([title, documentNo, date, `${body}${' 官方政策正文内容留存备查。'.repeat(12)}`], index)];
+  }));
+  const result = await dryRunChinaTaxPolicyPilot({
+    fetchImpl: async (url) => {
+      if (String(url) === failedUrl) throw new TypeError('upstream connection terminated');
+      return new Response(htmlByUrl.get(String(url)) || '', { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+  });
+
+  assert.equal(result.candidate_count, 10);
+  assert.equal(result.import_ready_count, 9);
+  assert.equal(result.skipped_count, 1);
+  assert.equal(result.failed_count, 1);
+  const failed = result.candidates.at(-1);
+  assert.equal(failed.official_url, failedUrl);
+  assert.equal(failed.candidate_state, 'failed');
+  assert.equal(failed.intake_ready, false);
+  assert.equal(failed.dry_run_error, 'OFFICIAL_DETAIL_READ_FAILED');
+  assert.deepEqual(failed.risk_flags, ['OFFICIAL_DETAIL_READ_FAILED']);
+  assert.equal(result.writes.business_production_writes, 0);
+});
+
 test('Phase 4 P1 试运行拒绝第三方 URL，且不开始任何详情请求', async () => {
   let calls = 0;
   await assert.rejects(

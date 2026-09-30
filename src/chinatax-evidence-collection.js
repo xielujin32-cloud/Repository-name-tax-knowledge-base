@@ -365,6 +365,29 @@ function preliminaryRisk(parsed, { duplicateUrls, duplicateDocumentNumbers, dupl
   return reasons;
 }
 
+const INTAKE_BLOCKING_RISK_FLAGS = new Set([
+  'TITLE_MISSING',
+  'DOCUMENT_NO_MISSING',
+  'PUBLISH_DATE_MISSING',
+  'BODY_TOO_SHORT',
+  'DUPLICATE_OFFICIAL_URL_IN_PILOT',
+  'DUPLICATE_DOCUMENT_NUMBER_IN_PILOT',
+  'DUPLICATE_TITLE_IN_PILOT'
+]);
+
+function isIntakeReady(riskFlags) {
+  return !riskFlags.some((flag) => INTAKE_BLOCKING_RISK_FLAGS.has(flag));
+}
+
+function officialDetailFailureCode(error) {
+  const message = String(error?.message || '');
+  const httpStatus = message.match(/政策详情请求失败：(\d{3})/);
+  if (httpStatus) return `OFFICIAL_DETAIL_HTTP_${httpStatus[1]}`;
+  if (/未找到受支持的政策正文容器/.test(message)) return 'POLICY_BODY_CONTAINER_MISSING';
+  if (/AbortError|timeout|timed out/i.test(message)) return 'OFFICIAL_DETAIL_TIMEOUT';
+  return 'OFFICIAL_DETAIL_READ_FAILED';
+}
+
 /**
  * Inspects a bounded State Taxation Administration pilot batch without
  * persisting any data. It is intentionally not an importer: legal status is
@@ -394,7 +417,7 @@ export async function dryRunChinaTaxPolicyPilot({
       staged.push({ officialUrl, response, parsed, metadata, statusHint: officialStatusHint(response.raw_html) });
     } catch (error) {
       // Do not include upstream response bodies in a dry-run report.
-      staged.push({ officialUrl, error: String(error?.message || 'OFFICIAL_DETAIL_READ_FAILED') });
+      staged.push({ officialUrl, failureCode: officialDetailFailureCode(error) });
     }
   }
 
@@ -412,15 +435,17 @@ export async function dryRunChinaTaxPolicyPilot({
   const titleCounts = countBy((item) => item.parsed?.title || '');
 
   const candidates = staged.map((item, index) => {
-    if (item.error) return Object.freeze({
+    if (item.failureCode) return Object.freeze({
       ordinal: index + 1,
       official_url: item.officialUrl,
       source_id: source.source_id,
       source_name: source.source_name,
       source_agency: '国家税务总局',
-      dry_run_error: 'OFFICIAL_DETAIL_READ_FAILED',
+      source_domain: source.official_domain,
+      candidate_state: 'failed',
+      dry_run_error: item.failureCode,
       suggested_validity_status: 'pending_verification',
-      risk_flags: ['OFFICIAL_DETAIL_READ_FAILED'],
+      risk_flags: [item.failureCode],
       relation_proposals: [],
       intake_ready: false
     });
@@ -462,7 +487,8 @@ export async function dryRunChinaTaxPolicyPilot({
         duplicateTitles: parsed.title && (titleCounts.get(parsed.title) || 0) > 1
       }),
       relation_proposals: relations.map((relation) => ({ relation_type: relation.relation_type, target_reference: relation.target_reference, confidence: relation.confidence })),
-      intake_ready: !risks.includes('TITLE_MISSING') && !risks.includes('BODY_TOO_SHORT')
+      candidate_state: isIntakeReady(risks) ? 'ready' : 'failed',
+      intake_ready: isIntakeReady(risks)
     });
   });
   const covered = new Set(candidates.flatMap((item) => item.pilot_topics || []));
@@ -470,6 +496,9 @@ export async function dryRunChinaTaxPolicyPilot({
     mode: 'dry-run',
     source: Object.freeze({ source_id: source.source_id, source_name: source.source_name, source_domain: source.official_domain, trust_level: source.trust_level }),
     candidate_count: candidates.length,
+    import_ready_count: candidates.filter((item) => item.intake_ready).length,
+    skipped_count: candidates.filter((item) => !item.intake_ready).length,
+    failed_count: candidates.filter((item) => !item.intake_ready).length,
     coverage: Object.freeze({ requested_topics: PHASE4_P1_PILOT_TOPIC_LABELS, covered_topics: [...covered], missing_topics: PHASE4_P1_PILOT_TOPIC_LABELS.filter((item) => !covered.has(item)) }),
     candidates: Object.freeze(candidates),
     writes: Object.freeze({ raw_snapshots: 0, evidence: 0, candidates: 0, reviews: 0, policies: 0, policy_versions: 0, public_projections: 0, business_production_writes: 0 })
@@ -505,13 +534,40 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
   const sourceRecord = await addChinaTaxPolicySource(repository);
   const run = await repository.createCollectionRun({ source_id: sourceRecord.source_id, mode });
   const results = [];
+  const skipped = [];
   try {
     for (const officialUrl of selectedUrls) {
-      const response = await fetchOfficialDetail(fetchImpl, officialUrl);
-      const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
-      const metadataSuggestion = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
-      const pilotTopics = topicMatches(parsed.title, parsed.normalized_text);
-      const sourceStatusHint = officialStatusHint(response.raw_html);
+      let prepared;
+      try {
+        const response = await fetchOfficialDetail(fetchImpl, officialUrl);
+        const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+        const riskFlags = preliminaryRisk(parsed, { duplicateUrls: false, duplicateDocumentNumbers: false, duplicateTitles: false });
+        if (!isIntakeReady(riskFlags)) {
+          skipped.push(Object.freeze({
+            official_url: officialUrl,
+            outcome: 'skipped',
+            reason: 'PILOT_CANDIDATE_NOT_INTAKE_READY',
+            risk_flags: Object.freeze(riskFlags)
+          }));
+          continue;
+        }
+        prepared = {
+          response,
+          parsed,
+          metadataSuggestion: suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text }),
+          pilotTopics: topicMatches(parsed.title, parsed.normalized_text),
+          sourceStatusHint: officialStatusHint(response.raw_html)
+        };
+      } catch (error) {
+        skipped.push(Object.freeze({
+          official_url: officialUrl,
+          outcome: 'failed',
+          reason: officialDetailFailureCode(error),
+          risk_flags: Object.freeze([officialDetailFailureCode(error)])
+        }));
+        continue;
+      }
+      const { response, parsed, metadataSuggestion, pilotTopics, sourceStatusHint } = prepared;
       const snapshot = await repository.recordRawSnapshot({
         source_id: sourceRecord.source_id,
         collection_run_id: run.collection_run_id,
@@ -585,7 +641,7 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
         legal_status: created.candidate.legal_status,
         title_present: Boolean(parsed.title),
         document_no_present: Boolean(parsed.document_no),
-        metadata_suggestion_created: true,
+        metadata_suggestion_created: Boolean(created.created),
         risk_level: riskAssessment?.assessment?.risk_level || null,
         risk_score: riskAssessment?.assessment?.risk_score ?? null,
         relation_proposals_created: relationProposals.length
@@ -600,10 +656,12 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
     mode,
     run: { collection_run_id: run.collection_run_id, source_id: sourceRecord.source_id },
     results: Object.freeze(results),
+    skipped: Object.freeze(skipped),
+    failed: Object.freeze(skipped.filter((item) => item.outcome === 'failed')),
     created: Object.freeze({
       raw_snapshots: results.length,
       candidates: results.filter((item) => item.candidate_created).length,
-      risk_assessments: results.filter((item) => item.metadata_suggestion_created).length,
+      risk_assessments: results.filter((item) => item.risk_level !== null).length,
       relation_proposals: results.reduce((total, item) => total + item.relation_proposals_created, 0),
       policies: 0,
       policy_versions: 0,

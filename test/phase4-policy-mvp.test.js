@@ -65,6 +65,31 @@ test('Phase 4 官方 STA intake 只创建 Evidence、Candidate、Risk 和关系�
   } finally { await dispose(value); }
 });
 
+test('Phase 4 official intake skips one unreadable detail without creating Evidence or Candidate for it', async () => {
+  const value = await fixture();
+  try {
+    const result = await collectChinaTaxPolicyCandidates({
+      repository: value.repository,
+      urls: [primaryUrl, secondUrl],
+      fetchImpl: async (url) => {
+        if (String(url) === secondUrl) throw new TypeError('upstream connection terminated');
+        return new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), { status: 200, headers: { 'content-type': 'text/html' } });
+      }
+    });
+    assert.equal(result.results.length, 1);
+    assert.equal(result.results[0].official_url, primaryUrl);
+    assert.deepEqual(result.skipped, [{ official_url: secondUrl, outcome: 'failed', reason: 'OFFICIAL_DETAIL_READ_FAILED', risk_flags: ['OFFICIAL_DETAIL_READ_FAILED'] }]);
+    assert.equal(result.failed.length, 1);
+    assert.equal(result.created.raw_snapshots, 1);
+    assert.equal(result.created.candidates, 1);
+    assert.equal(result.created.policies, 0);
+    assert.equal(result.created.policy_versions, 0);
+    assert.equal(result.created.public_projections, 0);
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM raw_snapshots')).rows[0].count, 1);
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM candidates')).rows[0].count, 1);
+  } finally { await dispose(value); }
+});
+
 test('Risk/Level 3 门禁只公开已核验且无阻断项的政策，缺少风险审查的批准不会写公开投影', async () => {
   const value = await fixture();
   try {
