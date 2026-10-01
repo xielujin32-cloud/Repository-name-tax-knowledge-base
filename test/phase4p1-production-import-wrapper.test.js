@@ -34,13 +34,22 @@ test('Phase 4 P1 import wrapper accepts only the safe subset of the exact offici
   assert.match(wrapper, /skipped_count/);
 });
 
-test('Phase 4 P1 import wrapper requires a second GUI confirmation and POSTs only the dry-run-safe fixed subset', async () => {
+test('Phase 4 P1 import wrapper requires a second GUI confirmation and POSTs only the dry-run-safe frozen subset', async () => {
   const wrapper = await readFile(wrapperPath, 'utf8');
   const confirmation = wrapper.indexOf('if (-not (Confirm-ProductionCandidateImport -ReadyCount');
   const post = wrapper.indexOf('Invoke-WebRequest -Method Post -Uri $importUrl');
   assert.ok(confirmation >= 0 && post > confirmation);
   assert.match(wrapper, /下一步将向 Production 写入 Candidate\/Evidence 审核数据，但不会公开政策/);
-  assert.match(wrapper, /\$requestBody = @\{ apply = \$true; confirmation = \$confirmationPhrase; official_urls = @\(\$dryRunDecision\.import_candidates \| ForEach-Object \{ \$_.official_url \}\) \}/);
+  assert.match(wrapper, /function Get-ExpectedImportItems/);
+  assert.match(wrapper, /body_hash = \[string\]\$_\.body_hash/);
+  assert.match(wrapper, /policy_title = \[string\]\$_\.policy_title/);
+  assert.match(wrapper, /document_number = \[string\]\$_\.document_number/);
+  assert.match(wrapper, /publication_date = \[string\]\$_\.publication_date/);
+  assert.match(wrapper, /\$expectedItems = Get-ExpectedImportItems -Candidates @\(\$dryRunDecision\.import_candidates\)/);
+  assert.match(wrapper, /expected_items = @\(\$expectedItems\)/);
+  assert.match(wrapper, /official_urls = @\(\$expectedItems \| ForEach-Object \{ \$_.official_url \}\)/);
+  assert.match(wrapper, /\$expectedItems = Get-ExpectedImportItems -Candidates @\(\$dryRunDecision\.import_candidates\)/);
+  assert.doesNotMatch(wrapper, /Get-ExpectedImportItems -Candidates @\(\$dryRun\.candidates\)/);
   assert.match(wrapper, /固定批次：10 条官方 URL；本次可导入 \$ReadyCount 条，已明确跳过 \$SkippedCount 条失败项/);
   assert.doesNotMatch(wrapper, /Invoke-WebRequest -Method (Put|Patch|Delete)/i);
 });

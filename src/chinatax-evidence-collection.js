@@ -389,6 +389,127 @@ function officialDetailFailureCode(error) {
 }
 
 /**
+ * A deliberately safe error for the write-time attestation gate.  Its code is
+ * suitable for an administrator response; it never includes an upstream body
+ * or an authentication value.
+ */
+export class ChinaTaxCandidatePrewriteValidationError extends Error {
+  constructor(code) {
+    super(code);
+    this.name = 'ChinaTaxCandidatePrewriteValidationError';
+    this.code = code;
+  }
+}
+
+function prewriteFailure(code) {
+  throw new ChinaTaxCandidatePrewriteValidationError(code);
+}
+
+function selectedChinaTaxPolicyUrls(urls, maxCandidates) {
+  if (!Array.isArray(urls) || !urls.length) {
+    throw new Error('必须提供已发现的国家税务总局官方详情 URL。');
+  }
+  const selectedUrls = [...new Set(urls.map((value) => normalizeChinaTaxPolicyUrl(value)).filter(Boolean))];
+  if (!selectedUrls.length || selectedUrls.length > maxCandidates || selectedUrls.length !== new Set(urls.map(String)).size) {
+    throw new Error(`官方 Candidate 收集仅接受 1 至 ${maxCandidates} 条互不重复的法规库详情 URL。`);
+  }
+  return selectedUrls;
+}
+
+function expectedItemsByOfficialUrl(selectedUrls, expectedItems) {
+  if (!Array.isArray(expectedItems) || expectedItems.length !== selectedUrls.length) {
+    prewriteFailure('PREWRITE_URL_SET_MISMATCH');
+  }
+  const byUrl = new Map();
+  for (const item of expectedItems) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) prewriteFailure('PREWRITE_EXPECTED_ITEM_INVALID');
+    const officialUrl = normalizeChinaTaxPolicyUrl(item.official_url);
+    if (!officialUrl || byUrl.has(officialUrl)) prewriteFailure('PREWRITE_URL_SET_MISMATCH');
+    const bodyHash = String(item.body_hash || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(bodyHash)) prewriteFailure('PREWRITE_EXPECTED_BODY_HASH_MISSING');
+    const policyTitle = clean(item.policy_title);
+    const documentNumber = clean(item.document_number);
+    const publicationDate = clean(item.publication_date);
+    if (!policyTitle || !documentNumber || !/^\d{4}-\d{2}-\d{2}$/.test(publicationDate || '')) {
+      prewriteFailure('PREWRITE_EXPECTED_METADATA_MISSING');
+    }
+    byUrl.set(officialUrl, Object.freeze({
+      official_url: officialUrl,
+      body_hash: bodyHash,
+      policy_title: policyTitle,
+      document_number: documentNumber,
+      publication_date: publicationDate
+    }));
+  }
+  if (byUrl.size !== selectedUrls.length || selectedUrls.some((officialUrl) => !byUrl.has(officialUrl))) {
+    prewriteFailure('PREWRITE_URL_SET_MISMATCH');
+  }
+  return byUrl;
+}
+
+/**
+ * Refetches the already dry-run-approved detail pages and attests the exact
+ * content and identity before any repository write begins.  This is separate
+ * from persistence so a changed upstream page cannot leave a partial intake.
+ */
+export async function preflightChinaTaxPolicyCandidateImport({
+  urls = [], expectedItems = [], fetchImpl = fetch, maxCandidates = 20
+} = {}) {
+  const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
+  const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
+  const expectedByUrl = expectedItemsByOfficialUrl(selectedUrls, expectedItems);
+  const staged = [];
+
+  for (const officialUrl of selectedUrls) {
+    const expected = expectedByUrl.get(officialUrl);
+    let response;
+    let parsed;
+    try {
+      response = await fetchOfficialDetail(fetchImpl, officialUrl);
+      parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+    } catch (error) {
+      prewriteFailure(`PREWRITE_${officialDetailFailureCode(error)}`);
+    }
+    if (sha256(parsed.normalized_text) !== expected.body_hash) prewriteFailure('PREWRITE_BODY_HASH_MISMATCH');
+    if (clean(parsed.title) !== expected.policy_title
+      || clean(parsed.document_no) !== expected.document_number
+      || clean(parsed.publish_date) !== expected.publication_date) {
+      prewriteFailure('PREWRITE_METADATA_MISMATCH');
+    }
+    staged.push({ officialUrl, response, parsed });
+  }
+
+  const countBy = (selector) => {
+    const counts = new Map();
+    for (const item of staged) {
+      const value = selector(item);
+      if (!value) continue;
+      counts.set(value, (counts.get(value) || 0) + 1);
+    }
+    return counts;
+  };
+  const urlCounts = countBy((item) => item.officialUrl);
+  const documentNoCounts = countBy((item) => item.parsed.document_no || '');
+  const titleCounts = countBy((item) => item.parsed.title || '');
+  return Object.freeze(staged.map((item) => {
+    const riskFlags = preliminaryRisk(item.parsed, {
+      duplicateUrls: (urlCounts.get(item.officialUrl) || 0) > 1,
+      duplicateDocumentNumbers: item.parsed.document_no && (documentNoCounts.get(item.parsed.document_no) || 0) > 1,
+      duplicateTitles: item.parsed.title && (titleCounts.get(item.parsed.title) || 0) > 1
+    });
+    if (!isIntakeReady(riskFlags)) prewriteFailure('PREWRITE_CANDIDATE_NOT_INTAKE_READY');
+    return Object.freeze({
+      officialUrl: item.officialUrl,
+      response: item.response,
+      parsed: item.parsed,
+      metadataSuggestion: suggestEvidenceMetadata({ title: item.parsed.title || '', normalized_text: item.parsed.normalized_text }),
+      pilotTopics: topicMatches(item.parsed.title, item.parsed.normalized_text),
+      sourceStatusHint: officialStatusHint(item.response.raw_html)
+    });
+  }));
+}
+
+/**
  * Inspects a bounded State Taxation Administration pilot batch without
  * persisting any data. It is intentionally not an importer: legal status is
  * always pending_verification and all relation clues remain proposals.
@@ -523,14 +644,17 @@ export function addChinaTaxPolicySource(repository) {
  * Policy, Policy Version, or public Blob projection. Production callers must
  * supply an explicit reviewed selection and confirmation at the API layer.
  */
-export async function collectChinaTaxPolicyCandidates({ repository, urls = [], fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake' } = {}) {
+export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake' } = {}) {
   if (!repository) throw new Error('官方 Candidate 收集必须提供 Evidence Repository。');
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
-  if (!Array.isArray(urls) || !urls.length) throw new Error('必须提供已发现的国家税务总局官方详情 URL。');
-  const selectedUrls = [...new Set(urls.map((value) => normalizeChinaTaxPolicyUrl(value)).filter(Boolean))];
-  if (!selectedUrls.length || selectedUrls.length > cap || selectedUrls.length !== new Set(urls.map(String)).size) {
-    throw new Error(`官方 Candidate 收集仅接受 1 至 ${cap} 条互不重复的法规库详情 URL。`);
-  }
+  const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
+  // An expected set is present only on the protected Production endpoint. It
+  // is fully read and attested before addSource/createCollectionRun, so no
+  // snapshot, Evidence, Candidate, Risk or Relation write can precede it.
+  const prewritePreparedByUrl = Array.isArray(expectedItems)
+    ? new Map((await preflightChinaTaxPolicyCandidateImport({ urls: selectedUrls, expectedItems, fetchImpl, maxCandidates: cap }))
+      .map((item) => [item.officialUrl, item]))
+    : null;
   const sourceRecord = await addChinaTaxPolicySource(repository);
   const run = await repository.createCollectionRun({ source_id: sourceRecord.source_id, mode });
   const results = [];
@@ -538,34 +662,41 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], f
   try {
     for (const officialUrl of selectedUrls) {
       let prepared;
-      try {
-        const response = await fetchOfficialDetail(fetchImpl, officialUrl);
-        const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
-        const riskFlags = preliminaryRisk(parsed, { duplicateUrls: false, duplicateDocumentNumbers: false, duplicateTitles: false });
-        if (!isIntakeReady(riskFlags)) {
+      if (prewritePreparedByUrl) {
+        prepared = prewritePreparedByUrl.get(officialUrl);
+        // The preflight maps exactly to selectedUrls. Keep this fail-closed
+        // guard in case a future caller changes that invariant.
+        if (!prepared) prewriteFailure('PREWRITE_URL_SET_MISMATCH');
+      } else {
+        try {
+          const response = await fetchOfficialDetail(fetchImpl, officialUrl);
+          const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+          const riskFlags = preliminaryRisk(parsed, { duplicateUrls: false, duplicateDocumentNumbers: false, duplicateTitles: false });
+          if (!isIntakeReady(riskFlags)) {
+            skipped.push(Object.freeze({
+              official_url: officialUrl,
+              outcome: 'skipped',
+              reason: 'PILOT_CANDIDATE_NOT_INTAKE_READY',
+              risk_flags: Object.freeze(riskFlags)
+            }));
+            continue;
+          }
+          prepared = {
+            response,
+            parsed,
+            metadataSuggestion: suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text }),
+            pilotTopics: topicMatches(parsed.title, parsed.normalized_text),
+            sourceStatusHint: officialStatusHint(response.raw_html)
+          };
+        } catch (error) {
           skipped.push(Object.freeze({
             official_url: officialUrl,
-            outcome: 'skipped',
-            reason: 'PILOT_CANDIDATE_NOT_INTAKE_READY',
-            risk_flags: Object.freeze(riskFlags)
+            outcome: 'failed',
+            reason: officialDetailFailureCode(error),
+            risk_flags: Object.freeze([officialDetailFailureCode(error)])
           }));
           continue;
         }
-        prepared = {
-          response,
-          parsed,
-          metadataSuggestion: suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text }),
-          pilotTopics: topicMatches(parsed.title, parsed.normalized_text),
-          sourceStatusHint: officialStatusHint(response.raw_html)
-        };
-      } catch (error) {
-        skipped.push(Object.freeze({
-          official_url: officialUrl,
-          outcome: 'failed',
-          reason: officialDetailFailureCode(error),
-          risk_flags: Object.freeze([officialDetailFailureCode(error)])
-        }));
-        continue;
       }
       const { response, parsed, metadataSuggestion, pilotTopics, sourceStatusHint } = prepared;
       const snapshot = await repository.recordRawSnapshot({

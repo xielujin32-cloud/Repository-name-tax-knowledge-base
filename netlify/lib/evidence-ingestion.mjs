@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { publicPolicyAvailability } from '../../src/policy-schema.js';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE, discoverChinaTaxPolicyDryRun } from '../../src/chinatax-evidence-adapter.js';
-import { collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
+import { ChinaTaxCandidatePrewriteValidationError, collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
@@ -704,13 +704,24 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     if (request.method === 'POST' && pathname === '/api/admin/evidence/sources/chinatax/candidates') {
       const input = await requestBody(request);
       if (!input || typeof input !== 'object' || Array.isArray(input)
-        || Object.keys(input).length !== 3 || input.apply !== true
+        || Object.keys(input).length !== 4 || input.apply !== true
         || input.confirmation !== PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION
-        || !Array.isArray(input.official_urls)) {
-        return json({ error: 'Phase 4 官方 Candidate 收集只接受已发现的官方详情 URL、固定 apply 与确认短语；不会创建 Policy 或公开投影。' }, 400);
+        || !Array.isArray(input.official_urls) || !Array.isArray(input.expected_items)) {
+        return json({ error: 'Phase 4 官方 Candidate 收集只接受已验证的官方详情 URL、正文哈希、固定 apply 与确认短语；不会创建 Policy 或公开投影。' }, 400);
       }
-      const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls });
-      return json({ mode: 'review_candidate_intake', ...result }, 201);
+      try {
+        const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls, expectedItems: input.expected_items });
+        return json({ mode: 'review_candidate_intake', ...result }, 201);
+      } catch (error) {
+        if (error instanceof ChinaTaxCandidatePrewriteValidationError) {
+          return json({
+            error: 'phase4p1_prewrite_validation_failed',
+            code: error.code,
+            business_production_writes: 0
+          }, 409);
+        }
+        throw error;
+      }
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/import-phase2b') {
       const input = await requestBody(request);

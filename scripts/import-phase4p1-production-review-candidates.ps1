@@ -193,6 +193,33 @@ function Get-DryRunImportDecision {
   return [pscustomobject]@{ ready = (-not $blocked); import_candidates = @($ready); skipped_candidates = @($skipped) }
 }
 
+function Get-ExpectedImportItems {
+  param([Parameter(Mandatory = $true)][object[]]$Candidates)
+  $items = @($Candidates | ForEach-Object {
+    [ordered]@{
+      official_url = [string]$_.official_url
+      body_hash = [string]$_.body_hash
+      policy_title = [string]$_.policy_title
+      document_number = [string]$_.document_number
+      publication_date = [string]$_.publication_date
+    }
+  })
+  if ($items.Count -lt 9 -or $items.Count -gt 10) { throw [System.InvalidOperationException]::new('expected_items_count_invalid') }
+  foreach ($item in $items) {
+    $invalidItem = (
+      $item.official_url -notmatch '^https://fgk\.chinatax\.gov\.cn/zcfgk/[^?#]+/content\.html$' -or
+      $item.body_hash -notmatch '^[a-f0-9]{64}$' -or
+      [string]::IsNullOrWhiteSpace($item.policy_title) -or
+      [string]::IsNullOrWhiteSpace($item.document_number) -or
+      $item.publication_date -notmatch '^\d{4}-\d{2}-\d{2}$'
+    )
+    if ($invalidItem) {
+      throw [System.InvalidOperationException]::new('expected_items_invalid')
+    }
+  }
+  return $items
+}
+
 function Get-Json {
   param([Parameter(Mandatory = $true)][string]$Uri, $Headers)
   $response = Invoke-WebRequest -Method Get -Uri $Uri -Headers $Headers -UseBasicParsing -ErrorAction Stop
@@ -298,7 +325,13 @@ function Invoke-Phase4P1ProductionImport {
     }
 
     $stage = 'candidate_evidence_import'
-    $requestBody = @{ apply = $true; confirmation = $confirmationPhrase; official_urls = @($dryRunDecision.import_candidates | ForEach-Object { $_.official_url }) } | ConvertTo-Json -Compress
+    $expectedItems = Get-ExpectedImportItems -Candidates @($dryRunDecision.import_candidates)
+    $requestBody = [ordered]@{
+      apply = $true
+      confirmation = $confirmationPhrase
+      official_urls = @($expectedItems | ForEach-Object { $_.official_url })
+      expected_items = @($expectedItems)
+    } | ConvertTo-Json -Depth 4 -Compress
     $productionPostSent = $true
     $importResponse = Invoke-WebRequest -Method Post -Uri $importUrl -Headers $headers -ContentType 'application/json' -Body $requestBody -UseBasicParsing -ErrorAction Stop
     $import = $importResponse.Content | ConvertFrom-Json

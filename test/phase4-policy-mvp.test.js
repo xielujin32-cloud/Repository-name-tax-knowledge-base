@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,13 @@ const primaryUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-one/content
 const secondUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-two/content.html';
 const body = '第一条 为规范增值税有关事项，纳税人应当按照本公告规定办理。'.repeat(18);
 const page = (title, documentNo, content = body) => `<html><head><meta name="PubDate" content="2026-09-01"></head><body><div class="detials contentLeft"><h3>${title}</h3><h5 class="actfwzh">${documentNo}</h5><div class="article"><div class="arc_cont"><p>${content}</p></div></div></div></body></html>`;
+const expectedItem = (officialUrl, title, documentNumber, content = body) => ({
+  official_url: officialUrl,
+  body_hash: createHash('sha256').update(content).digest('hex'),
+  policy_title: title,
+  document_number: documentNumber,
+  publication_date: '2026-09-01'
+});
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'taxkb-phase4-mvp-'));
@@ -90,6 +98,120 @@ test('Phase 4 official intake skips one unreadable detail without creating Evide
   } finally { await dispose(value); }
 });
 
+test('Phase 4 protected intake attests all 9 expected items before any Candidate or Evidence write', async () => {
+  const value = await fixture();
+  try {
+    const pilot = Array.from({ length: 9 }, (_, index) => {
+      const ordinal = index + 1;
+      const officialUrl = `https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-attested-${ordinal}/content.html`;
+      const title = `国家税务总局关于增值税测试事项${ordinal}的公告`;
+      const documentNumber = `国家税务总局公告2026年第${ordinal}号`;
+      const content = `${body}${ordinal}`;
+      return { officialUrl, title, documentNumber, content };
+    });
+    const pages = new Map(pilot.map((item) => [item.officialUrl, page(item.title, item.documentNumber, item.content)]));
+    const result = await collectChinaTaxPolicyCandidates({
+      repository: value.repository,
+      urls: pilot.map((item) => item.officialUrl),
+      expectedItems: pilot.map((item) => expectedItem(item.officialUrl, item.title, item.documentNumber, item.content)),
+      fetchImpl: async (url) => new Response(pages.get(String(url)), { status: 200, headers: { 'content-type': 'text/html' } })
+    });
+    assert.equal(result.results.length, 9);
+    assert.equal(result.created.raw_snapshots, 9);
+    assert.equal(result.created.candidates, 9);
+    assert.equal(result.created.policies, 0);
+    assert.equal(result.created.policy_versions, 0);
+    assert.equal(result.created.public_projections, 0);
+  } finally { await dispose(value); }
+});
+
+test('Phase 4 protected candidate route returns a safe 409 and zero writes when a pre-write hash changes', async () => {
+  const value = await fixture();
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase4-prewrite-token';
+  try {
+    const handler = createEvidenceAdminHandler({
+      repositoryFactory: () => value.repository,
+      fetchImpl: async () => new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), { status: 200, headers: { 'content-type': 'text/html' } })
+    });
+    const response = await handler(new Request('https://taxkb.test/api/admin/evidence/sources/chinatax/candidates', {
+      method: 'POST',
+      headers: { authorization: 'Bearer phase4-prewrite-token', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        apply: true,
+        confirmation: PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION,
+        official_urls: [primaryUrl],
+        expected_items: [{ ...expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), body_hash: 'f'.repeat(64) }]
+      })
+    }), '/api/admin/evidence/sources/chinatax/candidates', new URL('https://taxkb.test/api/admin/evidence/sources/chinatax/candidates'));
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      error: 'phase4p1_prewrite_validation_failed',
+      code: 'PREWRITE_BODY_HASH_MISMATCH',
+      business_production_writes: 0
+    });
+    for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals']) {
+      const { rows } = await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+      assert.equal(rows[0].count, 0, `${table} must stay empty after a rejected request`);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+    else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+    await dispose(value);
+  }
+});
+
+test('Phase 4 protected intake rejects any hash, URL set, or missing hash before all business writes', async () => {
+  const cases = [
+    {
+      name: 'hash mismatch',
+      urls: [primaryUrl, secondUrl],
+      expectedItems: [
+        { ...expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), body_hash: '0'.repeat(64) },
+        expectedItem(secondUrl, '国家税务总局关于增值税补充事项的公告', '国家税务总局公告2026年第2号')
+      ],
+      code: 'PREWRITE_BODY_HASH_MISMATCH'
+    },
+    {
+      name: 'URL set mismatch',
+      urls: [primaryUrl, secondUrl],
+      expectedItems: [
+        expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'),
+        expectedItem('https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-third/content.html', '国家税务总局关于增值税补充事项的公告', '国家税务总局公告2026年第2号')
+      ],
+      code: 'PREWRITE_URL_SET_MISMATCH'
+    },
+    {
+      name: 'missing expected hash',
+      urls: [primaryUrl, secondUrl],
+      expectedItems: [
+        { ...expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), body_hash: '' },
+        expectedItem(secondUrl, '国家税务总局关于增值税补充事项的公告', '国家税务总局公告2026年第2号')
+      ],
+      code: 'PREWRITE_EXPECTED_BODY_HASH_MISSING'
+    }
+  ];
+  for (const scenario of cases) {
+    const value = await fixture();
+    try {
+      await assert.rejects(
+        () => collectChinaTaxPolicyCandidates({
+          repository: value.repository,
+          urls: scenario.urls,
+          expectedItems: scenario.expectedItems,
+          fetchImpl: async () => new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), { status: 200, headers: { 'content-type': 'text/html' } })
+        }),
+        (error) => error?.code === scenario.code,
+        scenario.name
+      );
+      for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals', 'policies', 'policy_versions']) {
+        const { rows } = await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+        assert.equal(rows[0].count, 0, `${scenario.name}: ${table} must stay empty`);
+      }
+    } finally { await dispose(value); }
+  }
+});
+
 test('Risk/Level 3 门禁只公开已核验且无阻断项的政策，缺少风险审查的批准不会写公开投影', async () => {
   const value = await fixture();
   try {
@@ -151,8 +273,9 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
       discoveryOptions = options;
       return { mode: 'dry-run', candidates: [{ official_url: primaryUrl, title: '安全摘要' }], writes: { raw_snapshots: 0, candidates: 0, policies: 0, netlify_blobs: 0 } };
     },
-    chinaTaxCandidateCollector: async ({ urls }) => {
+    chinaTaxCandidateCollector: async ({ urls, expectedItems }) => {
       intakeCalls += 1;
+      assert.equal(expectedItems.length, urls.length);
       return { selected_count: urls.length, created: { raw_snapshots: 1, candidates: 1, policies: 0, policy_versions: 0, public_projections: 0 } };
     }
   });
@@ -175,14 +298,19 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
     assert.equal(discoveryOptions.maxPages, 5);
 
     const rejected = await invoke('/api/admin/evidence/sources/chinatax/candidates', {
-      method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN, body: { apply: true, confirmation: 'wrong', official_urls: [primaryUrl] }
+      method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN, body: { apply: true, confirmation: 'wrong', official_urls: [primaryUrl], expected_items: [] }
     });
     assert.equal(rejected.status, 400);
     assert.equal(intakeCalls, 0);
 
     const intake = await invoke('/api/admin/evidence/sources/chinatax/candidates', {
       method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN,
-      body: { apply: true, confirmation: PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION, official_urls: [primaryUrl] }
+      body: {
+        apply: true,
+        confirmation: PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION,
+        official_urls: [primaryUrl],
+        expected_items: [expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号')]
+      }
     });
     const intakeBody = await intake.json();
     assert.equal(intake.status, 201);
