@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { publicPolicyAvailability } from '../../src/policy-schema.js';
 import { createNetlifyBlobsEvidenceObjectStore } from '../../src/evidence-object-store.js';
 import { CHINA_TAX_POLICY_SOURCE, discoverChinaTaxPolicyDryRun } from '../../src/chinatax-evidence-adapter.js';
-import { ChinaTaxCandidatePrewriteValidationError, collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
+import { ChinaTaxCandidatePrewriteValidationError, collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot, PHASE4_P1_PILOT_OFFICIAL_URLS, PHASE_2B_ALLOWED_DETAIL_URLS, parseChinaTaxPolicyEvidence } from '../../src/chinatax-evidence-collection.js';
 import { buildPublicPolicyProjection, normalizeReviewFields } from '../../src/evidence-review.js';
 import { suggestEvidenceMetadata } from '../../src/evidence-metadata-suggestion.js';
 import { LOW_RISK_BATCH_CONFIRMATION } from '../../src/risk-review-queue.js';
@@ -690,6 +690,7 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     const isRiskQueueRead = request.method === 'GET' && pathname === '/api/admin/evidence/risk-queue';
     const isStaDiscoveryRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/discovery';
     const isStaPilotDryRunRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/pilot-dry-run';
+    const isStaPilotIntakeStatusRead = request.method === 'GET' && pathname === '/api/admin/evidence/sources/chinatax/pilot-intake-status';
     if (url.search && !isRiskQueueRead && !isStaDiscoveryRead && !isStaPilotDryRunRead) return json({ error: 'Evidence 接口不接受查询参数。' }, 400);
     if (isRiskQueueRead) return json(safeRiskQueue(await repositoryFactory().listRiskQueue(riskQueueFilters(url))));
     if (isStaDiscoveryRead) {
@@ -700,6 +701,22 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     }
     if (isStaPilotDryRunRead) {
       return json(await chinaTaxPilotDryRunFactory({ fetchImpl }));
+    }
+    if (isStaPilotIntakeStatusRead) {
+      const diagnostic = await repositoryFactory().getOfficialIntakeDiagnostics({
+        sourceId: CHINA_TAX_POLICY_SOURCE.source_id,
+        officialUrls: PHASE4_P1_PILOT_OFFICIAL_URLS
+      });
+      return json({
+        mode: 'read_only_pilot_intake_status',
+        source_id: CHINA_TAX_POLICY_SOURCE.source_id,
+        ...diagnostic,
+        policy_writes: 0,
+        policy_version_writes: 0,
+        public_projection_writes: 0,
+        level3_approvals: 0,
+        business_production_writes: diagnostic.total_business_writes
+      });
     }
     if (request.method === 'POST' && pathname === '/api/admin/evidence/sources/chinatax/candidates') {
       const input = await requestBody(request);
@@ -717,6 +734,8 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
           return json({
             error: 'phase4p1_prewrite_validation_failed',
             code: error.code,
+            mismatch: error.mismatch,
+            partial_write_detected: false,
             business_production_writes: 0
           }, 409);
         }

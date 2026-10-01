@@ -145,15 +145,37 @@ test('Phase 4 protected candidate route returns a safe 409 and zero writes when 
       })
     }), '/api/admin/evidence/sources/chinatax/candidates', new URL('https://taxkb.test/api/admin/evidence/sources/chinatax/candidates'));
     assert.equal(response.status, 409);
-    assert.deepEqual(await response.json(), {
-      error: 'phase4p1_prewrite_validation_failed',
-      code: 'PREWRITE_BODY_HASH_MISMATCH',
-      business_production_writes: 0
-    });
+    const rejected = await response.json();
+    assert.equal(rejected.error, 'phase4p1_prewrite_validation_failed');
+    assert.equal(rejected.code, 'PREWRITE_BODY_HASH_MISMATCH');
+    assert.equal(rejected.business_production_writes, 0);
+    assert.equal(rejected.partial_write_detected, false);
+    assert.equal(rejected.mismatch.ordinal, 1);
+    assert.equal(rejected.mismatch.official_url, primaryUrl);
+    assert.equal(rejected.mismatch.mismatch_reason, 'BODY_HASH_MISMATCH');
+    assert.equal(rejected.mismatch.expected.body_hash, 'f'.repeat(64));
+    assert.equal(rejected.mismatch.actual.policy_title, '国家税务总局关于增值税测试事项的公告');
+    assert.equal(rejected.mismatch.actual.document_number, '国家税务总局公告2026年第1号');
+    assert.equal(rejected.mismatch.actual.publication_date, '2026-09-01');
     for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals']) {
       const { rows } = await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
       assert.equal(rows[0].count, 0, `${table} must stay empty after a rejected request`);
     }
+    const diagnosticResponse = await handler(new Request('https://taxkb.test/api/admin/evidence/sources/chinatax/pilot-intake-status', {
+      headers: { authorization: 'Bearer phase4-prewrite-token' }
+    }), '/api/admin/evidence/sources/chinatax/pilot-intake-status', new URL('https://taxkb.test/api/admin/evidence/sources/chinatax/pilot-intake-status'));
+    assert.equal(diagnosticResponse.status, 200);
+    const diagnostic = await diagnosticResponse.json();
+    assert.equal(diagnostic.mode, 'read_only_pilot_intake_status');
+    assert.equal(diagnostic.raw_snapshot_writes, 0);
+    assert.equal(diagnostic.evidence_writes, 0);
+    assert.equal(diagnostic.candidate_writes, 0);
+    assert.equal(diagnostic.risk_writes, 0);
+    assert.equal(diagnostic.relation_writes, 0);
+    assert.equal(diagnostic.total_business_writes, 0);
+    assert.equal(diagnostic.partial_write_detected, false);
+    assert.equal(diagnostic.business_production_writes, 0);
+    assert.equal(/raw_html|normalized_text|authorization|cookie/i.test(JSON.stringify(diagnostic)), false);
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
     else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;

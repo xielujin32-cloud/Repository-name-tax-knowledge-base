@@ -1649,6 +1649,48 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       finally { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [lockName]); }
     } finally { client.release(); }
   }
+  async function getOfficialIntakeDiagnostics({ sourceId, officialUrls = [] } = {}) {
+    const sourceKey = required(sourceId, 'source_id');
+    const urls = [...new Set(officialUrls.map((value) => canonical(value)))];
+    if (!urls.length) throw new Error('official_urls 不能为空。');
+    const { rows } = await pool.query(
+      `WITH scoped_snapshots AS (
+         SELECT snapshot_id,collection_run_id FROM raw_snapshots
+         WHERE source_id=$1 AND canonical_url=ANY($2::text[])
+       ), scoped_candidates AS (
+         SELECT candidate_id,collection_run_id FROM candidates
+         WHERE source_id=$1 AND canonical_url=ANY($2::text[])
+       ), scoped_runs AS (
+         SELECT DISTINCT collection_run_id FROM scoped_snapshots
+         UNION SELECT DISTINCT collection_run_id FROM scoped_candidates
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM scoped_snapshots) AS raw_snapshots,
+         (SELECT COUNT(*)::int FROM scoped_candidates) AS candidates,
+         (SELECT COUNT(*)::int FROM candidate_risk_assessments a JOIN scoped_candidates c ON c.candidate_id=a.candidate_id) AS risk_assessments,
+         (SELECT COUNT(*)::int FROM candidate_relation_proposals p JOIN scoped_candidates c ON c.candidate_id=p.from_candidate_id) AS relation_proposals,
+         (SELECT COUNT(*)::int FROM scoped_runs) AS collection_runs,
+         (SELECT COUNT(*)::int FROM audit_events a
+            WHERE (a.entity_type='candidate' AND a.entity_id IN (SELECT candidate_id FROM scoped_candidates))
+               OR (a.entity_type='collection_run' AND a.entity_id IN (SELECT collection_run_id FROM scoped_runs))) AS audit_events`,
+      [sourceKey, urls]
+    );
+    const counts = rows[0];
+    const totalBusinessWrites = Number(counts.raw_snapshots) + Number(counts.candidates)
+      + Number(counts.risk_assessments) + Number(counts.relation_proposals);
+    return Object.freeze({
+      official_url_count: urls.length,
+      raw_snapshot_writes: Number(counts.raw_snapshots),
+      evidence_writes: Number(counts.raw_snapshots),
+      candidate_writes: Number(counts.candidates),
+      risk_writes: Number(counts.risk_assessments),
+      relation_writes: Number(counts.relation_proposals),
+      collection_run_writes: Number(counts.collection_runs),
+      audit_writes: Number(counts.audit_events),
+      total_business_writes: totalBusinessWrites,
+      partial_write_detected: totalBusinessWrites > 0
+    });
+  }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,relationProposalAffectedPolicyVersions,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,relationProposalAffectedPolicyVersions,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,getOfficialIntakeDiagnostics,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

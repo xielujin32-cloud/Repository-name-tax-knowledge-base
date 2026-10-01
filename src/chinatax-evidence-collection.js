@@ -394,15 +394,16 @@ function officialDetailFailureCode(error) {
  * or an authentication value.
  */
 export class ChinaTaxCandidatePrewriteValidationError extends Error {
-  constructor(code) {
+  constructor(code, mismatch = null) {
     super(code);
     this.name = 'ChinaTaxCandidatePrewriteValidationError';
     this.code = code;
+    this.mismatch = mismatch;
   }
 }
 
-function prewriteFailure(code) {
-  throw new ChinaTaxCandidatePrewriteValidationError(code);
+function prewriteFailure(code, mismatch = null) {
+  throw new ChinaTaxCandidatePrewriteValidationError(code, mismatch);
 }
 
 function selectedChinaTaxPolicyUrls(urls, maxCandidates) {
@@ -460,7 +461,8 @@ export async function preflightChinaTaxPolicyCandidateImport({
   const expectedByUrl = expectedItemsByOfficialUrl(selectedUrls, expectedItems);
   const staged = [];
 
-  for (const officialUrl of selectedUrls) {
+  for (const [index, officialUrl] of selectedUrls.entries()) {
+    const ordinal = index + 1;
     const expected = expectedByUrl.get(officialUrl);
     let response;
     let parsed;
@@ -468,13 +470,33 @@ export async function preflightChinaTaxPolicyCandidateImport({
       response = await fetchOfficialDetail(fetchImpl, officialUrl);
       parsed = parseChinaTaxPolicyEvidence(response.raw_html);
     } catch (error) {
-      prewriteFailure(`PREWRITE_${officialDetailFailureCode(error)}`);
+      prewriteFailure(`PREWRITE_${officialDetailFailureCode(error)}`, Object.freeze({ ordinal, official_url: officialUrl, mismatch_reason: officialDetailFailureCode(error) }));
     }
-    if (sha256(parsed.normalized_text) !== expected.body_hash) prewriteFailure('PREWRITE_BODY_HASH_MISMATCH');
-    if (clean(parsed.title) !== expected.policy_title
-      || clean(parsed.document_no) !== expected.document_number
-      || clean(parsed.publish_date) !== expected.publication_date) {
-      prewriteFailure('PREWRITE_METADATA_MISMATCH');
+    const actual = Object.freeze({
+      body_hash: sha256(parsed.normalized_text),
+      policy_title: clean(parsed.title),
+      document_number: clean(parsed.document_no),
+      publication_date: clean(parsed.publish_date)
+    });
+    if (actual.body_hash !== expected.body_hash) {
+      prewriteFailure('PREWRITE_BODY_HASH_MISMATCH', Object.freeze({
+        ordinal,
+        official_url: officialUrl,
+        mismatch_reason: 'BODY_HASH_MISMATCH',
+        expected,
+        actual
+      }));
+    }
+    if (actual.policy_title !== expected.policy_title
+      || actual.document_number !== expected.document_number
+      || actual.publication_date !== expected.publication_date) {
+      prewriteFailure('PREWRITE_METADATA_MISMATCH', Object.freeze({
+        ordinal,
+        official_url: officialUrl,
+        mismatch_reason: 'METADATA_MISMATCH',
+        expected,
+        actual
+      }));
     }
     staged.push({ officialUrl, response, parsed });
   }

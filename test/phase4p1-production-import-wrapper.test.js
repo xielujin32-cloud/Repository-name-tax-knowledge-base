@@ -14,6 +14,7 @@ test('Phase 4 P1 import wrapper is fixed to exactly ten STA official URLs and on
   assert.equal(new Set(urls).size, 10);
   assert.match(wrapper, /\$dryRunUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/pilot-dry-run"/);
   assert.match(wrapper, /\$importUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/candidates"/);
+  assert.match(wrapper, /\$pilotIntakeStatusUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/pilot-intake-status"/);
   assert.match(wrapper, /\$confirmationPhrase = 'INGEST_PHASE4_STA_REVIEW_CANDIDATES'/);
   assert.match(wrapper, /Get-Json -Uri \$dryRunUrl -Headers \$headers/);
   assert.equal((wrapper.match(/Invoke-WebRequest -Method Post -Uri \$importUrl/g) || []).length, 1);
@@ -65,6 +66,32 @@ test('Phase 4 P1 import wrapper clears Token and never persists, prints, or seri
   assert.doesNotMatch(wrapper, /Write-(?:Host|Output).*\$token/i);
   assert.doesNotMatch(wrapper, /ConvertTo-Json.*\$token/i);
   assert.doesNotMatch(wrapper, /raw_html|normalized_text\s*:\s*|cookie|authorization\s*:/i);
+});
+
+test('Phase 4 P1 import wrapper turns a pre-write 409 into a read-only NO-GO attestation', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const post = wrapper.indexOf('Invoke-WebRequest -Method Post -Uri $importUrl');
+  const errorHandling = wrapper.indexOf("error = 'prewrite_consistency_validation_failed'");
+  const statusRead = wrapper.indexOf('Get-PilotIntakeStatus -Headers $headers');
+  assert.ok(post >= 0 && errorHandling > post && statusRead > post, 'only the failure branch may issue the follow-up status GET');
+  assert.match(wrapper, /function Get-SafeHttpErrorJson/);
+  assert.match(wrapper, /execution = 'NO-GO'/);
+  assert.match(wrapper, /partial_write_detected = \$partialWriteDetected/);
+  assert.match(wrapper, /consistency_code = \$safeError\.code/);
+  const noGoPayload = wrapper.slice(errorHandling, wrapper.indexOf('})', errorHandling) + 2);
+  assert.doesNotMatch(noGoPayload, /\$token|authorization|cookie/i);
+});
+
+test('Phase 4 P1 import wrapper has a read-only pilot intake status mode that cannot POST', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const functionStart = wrapper.indexOf('function Invoke-Phase4P1ReadOnlyIntakeStatus');
+  const functionEnd = wrapper.indexOf('function Invoke-Phase4P1ProductionImport');
+  const branch = wrapper.indexOf('if ($ReadOnlyIntakeStatus)');
+  assert.ok(functionStart >= 0 && functionEnd > functionStart && branch > functionEnd);
+  assert.match(wrapper, /event = 'phase4p1_production_pilot_intake_status'/);
+  assert.match(wrapper, /Get-Json -Uri \$pilotIntakeStatusUrl -Headers \$headers/);
+  assert.doesNotMatch(wrapper.slice(functionStart, functionEnd), /Invoke-WebRequest -Method Post|\/candidates|apply\s*=/i);
+  assert.match(wrapper, /production_post_sent = \$false/);
 });
 
 test('Phase 4 P1 import wrapper self-test returns before all HTTP calls and emits no Production request', async () => {

@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-  [switch]$SelfTest
+  [switch]$SelfTest,
+  [switch]$ReadOnlyIntakeStatus
 )
 
 # Local-only operator wrapper. It is deliberately fixed to the reviewed Phase 4
@@ -12,6 +13,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $productionOrigin = 'https://xielujin-tax-knowledge-base.netlify.app'
 $dryRunUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/pilot-dry-run"
 $importUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/candidates"
+$pilotIntakeStatusUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/pilot-intake-status"
 $statusUrl = "$productionOrigin/api/admin/evidence/status"
 $candidateListUrl = "$productionOrigin/api/admin/evidence/candidates"
 $publicPoliciesUrl = "$productionOrigin/api/policies?limit=1&offset=0"
@@ -226,6 +228,33 @@ function Get-Json {
   return [pscustomobject]@{ response = $response; body = ($response.Content | ConvertFrom-Json) }
 }
 
+function Get-SafeHttpErrorJson {
+  param($Response)
+  if ($null -eq $Response) { return $null }
+  $stream = $null
+  $reader = $null
+  try {
+    $stream = $Response.GetResponseStream()
+    if ($null -eq $stream) { return $null }
+    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+    $content = $reader.ReadToEnd()
+    if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+    return $content | ConvertFrom-Json
+  } catch {
+    # The only safe fallback is to omit the body. Do not print exception text:
+    # a transport implementation can attach request headers to it.
+    return $null
+  } finally {
+    if ($reader) { $reader.Dispose() }
+    elseif ($stream) { $stream.Dispose() }
+  }
+}
+
+function Get-PilotIntakeStatus {
+  param($Headers)
+  return (Get-Json -Uri $pilotIntakeStatusUrl -Headers $Headers).body
+}
+
 function Get-StatusCounts {
   param($Headers)
   return (Get-Json -Uri $statusUrl -Headers $Headers).body.counts
@@ -273,6 +302,45 @@ function Invoke-Phase4P1GuiSelfTest {
     Write-SafeJson ([ordered]@{ event = 'phase4p1_production_candidate_import_self_test'; dialog_result = 'EMPTY'; production_request_sent = $false; business_production_writes = 0 })
   } finally {
     if ($secureValue) { $secureValue.Dispose() }
+  }
+}
+
+function Invoke-Phase4P1ReadOnlyIntakeStatus {
+  $secureToken = $null
+  $token = $null
+  $tokenBstr = [IntPtr]::Zero
+  $stage = 'token_input'
+  try {
+    $secureToken = Read-GuiSecureString -Prompt 'Enter administrator Token to read the Phase 4 P1 pilot intake status. No import request will be sent.'
+    $tokenBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenBstr).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
+    if ($token.ToCharArray() | Where-Object { ([int][char]$_) -lt 32 -or ([int][char]$_) -eq 127 }) { throw [System.InvalidOperationException]::new('token_contains_control_character') }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' }
+    $stage = 'read_only_pilot_intake_status'
+    $result = Get-Json -Uri $pilotIntakeStatusUrl -Headers $headers
+    Write-SafeJson ([ordered]@{
+      event = 'phase4p1_production_pilot_intake_status'
+      execution = 'READ_ONLY'
+      http_status = [int]$result.response.StatusCode
+      intake_status = $result.body
+      production_post_sent = $false
+      business_production_writes = Safe-Number $result.body.business_production_writes
+    })
+  } catch {
+    $tokenInputCodes = @('token_input_cancelled', 'token_empty_after_secure_input', 'token_contains_control_character')
+    if ($stage -eq 'token_input' -and $tokenInputCodes -contains $_.Exception.Message) {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_pilot_intake_status'; error = 'local_token_input_error'; reason = $_.Exception.Message; production_post_sent = $false; business_production_writes = 0 })
+    } elseif ($_.Exception.Response) {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_pilot_intake_status'; error = 'read_only_status_http_error'; stage = $stage; http_status = [int]$_.Exception.Response.StatusCode; production_post_sent = $false; business_production_writes = 0 })
+    } else {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_pilot_intake_status'; error = 'read_only_status_request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; production_post_sent = $false; business_production_writes = 0 })
+    }
+  } finally {
+    if ($tokenBstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr) }
+    if ($secureToken) { $secureToken.Dispose() }
+    $token = $null
   }
 }
 
@@ -394,7 +462,33 @@ function Invoke-Phase4P1ProductionImport {
     if ($stage -eq 'token_input' -and $tokenInputCodes -contains $_.Exception.Message) {
       Write-SafeJson ([ordered]@{ event = 'phase4p1_production_candidate_evidence_import'; error = 'local_token_input_error'; reason = $_.Exception.Message; production_post_sent = $false; business_production_writes = 0 })
     } elseif ($httpResponse) {
-      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_candidate_evidence_import'; error = 'import_http_error'; stage = $stage; http_status = [int]$httpResponse.StatusCode; production_post_sent = $productionPostSent; business_production_writes = $(if ($productionPostSent) { 'unknown_after_post' } else { 0 }) })
+      $httpStatus = [int]$httpResponse.StatusCode
+      if ($stage -eq 'candidate_evidence_import' -and $httpStatus -eq 409) {
+        $safeError = Get-SafeHttpErrorJson -Response $httpResponse
+        $intakeStatus = $null
+        try { $intakeStatus = Get-PilotIntakeStatus -Headers $headers } catch { $intakeStatus = $null }
+        $businessWrites = 'unknown_after_post'
+        $partialWriteDetected = $null
+        if ($intakeStatus) {
+          $businessWrites = Safe-Number $intakeStatus.business_production_writes
+          $partialWriteDetected = ($intakeStatus.partial_write_detected -eq $true)
+        }
+        Write-SafeJson ([ordered]@{
+          event = 'phase4p1_production_candidate_evidence_import'
+          execution = 'NO-GO'
+          error = 'prewrite_consistency_validation_failed'
+          stage = $stage
+          http_status = $httpStatus
+          consistency_code = $safeError.code
+          mismatch = $safeError.mismatch
+          partial_write_detected = $partialWriteDetected
+          intake_status = $intakeStatus
+          production_post_sent = $productionPostSent
+          business_production_writes = $businessWrites
+        })
+      } else {
+        Write-SafeJson ([ordered]@{ event = 'phase4p1_production_candidate_evidence_import'; error = 'import_http_error'; stage = $stage; http_status = $httpStatus; production_post_sent = $productionPostSent; business_production_writes = $(if ($productionPostSent) { 'unknown_after_post' } else { 0 }) })
+      }
     } else {
       # Do not include exception.Message: HTTP implementations can include headers.
       Write-SafeJson ([ordered]@{ event = 'phase4p1_production_candidate_evidence_import'; error = 'import_request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; production_post_sent = $productionPostSent; business_production_writes = $(if ($productionPostSent) { 'unknown_after_post' } else { 0 }) })
@@ -408,6 +502,10 @@ function Invoke-Phase4P1ProductionImport {
 
 if ($SelfTest) {
   Invoke-Phase4P1GuiSelfTest
+  return
+}
+if ($ReadOnlyIntakeStatus) {
+  Invoke-Phase4P1ReadOnlyIntakeStatus
   return
 }
 Invoke-Phase4P1ProductionImport
