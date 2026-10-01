@@ -160,12 +160,21 @@ function Safe-DryRunCandidate {
       final_domain = $Candidate.diagnostic.final_domain
       redirected = ($Candidate.diagnostic.redirected -eq $true)
       content_type = $Candidate.diagnostic.content_type
+      content_encoding = $Candidate.diagnostic.content_encoding
+      response_headers = $Candidate.diagnostic.response_headers
       response_bytes = $Candidate.diagnostic.response_bytes
+      response_sha256 = $Candidate.diagnostic.response_sha256
+      html_title = $Candidate.diagnostic.html_title
+      meta_refresh_target = $Candidate.diagnostic.meta_refresh_target
+      script_src_count = $Candidate.diagnostic.script_src_count
+      script_src_hosts = @($Candidate.diagnostic.script_src_hosts)
+      client_side_redirect_detected = ($Candidate.diagnostic.client_side_redirect_detected -eq $true)
       body_container = $Candidate.diagnostic.body_container
       body_container_found = ($Candidate.diagnostic.body_container_found -eq $true)
       title_found = ($Candidate.diagnostic.title_found -eq $true)
       document_number_found = ($Candidate.diagnostic.document_number_found -eq $true)
       publication_date_found = ($Candidate.diagnostic.publication_date_found -eq $true)
+      response_classification = $Candidate.diagnostic.response_classification
       failure_reason = $Candidate.diagnostic.failure_reason
     }
     relation_proposals = @($Candidate.relation_proposals | ForEach-Object {
@@ -388,6 +397,7 @@ function Invoke-Phase4P1ProductionImport {
       failed_count = @($dryRunDecision.skipped_candidates).Count
       import_ready_official_urls = @($dryRunDecision.import_candidates | ForEach-Object { $_.official_url })
       source = [ordered]@{ source_id = $dryRun.source.source_id; source_name = $dryRun.source.source_name; source_domain = $dryRun.source.source_domain; trust_level = $dryRun.source.trust_level }
+      transport_comparison = $dryRun.transport_comparison
       candidates = @($dryRun.candidates | ForEach-Object { Safe-DryRunCandidate $_ })
       business_production_writes = Safe-Number $dryRun.writes.business_production_writes
     }

@@ -117,12 +117,21 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     final_domain: 'fgk.chinatax.gov.cn',
     redirected: false,
     content_type: 'text/html; charset=utf-8',
+    content_encoding: null,
+    response_headers: {},
     response_bytes: Buffer.byteLength(validHtml, 'utf8'),
+    response_sha256: createHash('sha256').update(validHtml).digest('hex'),
+    html_title: null,
+    meta_refresh_target: null,
+    script_src_count: 0,
+    script_src_hosts: [],
+    client_side_redirect_detected: false,
     body_container: 'arc_cont',
     body_container_found: true,
     title_found: true,
     document_number_found: true,
     publication_date_found: true,
+    response_classification: 'official_policy_detail',
     failure_reason: null
   });
   assert.equal(failed.dry_run_error, 'POLICY_BODY_CONTAINER_MISSING');
@@ -132,13 +141,38 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     final_domain: 'fgk.chinatax.gov.cn',
     redirected: false,
     content_type: 'text/html; charset=utf-8',
+    content_encoding: null,
+    response_headers: {},
     response_bytes: Buffer.byteLength(missingContainerHtml, 'utf8'),
+    response_sha256: createHash('sha256').update(missingContainerHtml).digest('hex'),
+    html_title: null,
+    meta_refresh_target: null,
+    script_src_count: 0,
+    script_src_hosts: [],
+    client_side_redirect_detected: false,
     body_container: null,
     body_container_found: false,
     title_found: false,
     document_number_found: false,
     publication_date_found: false,
+    response_classification: 'short_html_shell_or_error_page',
     failure_reason: 'POLICY_BODY_CONTAINER_MISSING'
+  });
+  assert.deepEqual(result.transport_comparison, {
+    ready: {
+      count: 1,
+      response_bytes: { min: Buffer.byteLength(validHtml, 'utf8'), max: Buffer.byteLength(validHtml, 'utf8') },
+      classifications: { official_policy_detail: 1 },
+      content_types: { 'text/html; charset=utf-8': 1 },
+      content_encodings: { unknown: 1 }
+    },
+    failed_or_skipped: {
+      count: 1,
+      response_bytes: { min: Buffer.byteLength(missingContainerHtml, 'utf8'), max: Buffer.byteLength(missingContainerHtml, 'utf8') },
+      classifications: { short_html_shell_or_error_page: 1 },
+      content_types: { 'text/html; charset=utf-8': 1 },
+      content_encodings: { unknown: 1 }
+    }
   });
   assert.doesNotMatch(JSON.stringify(result), /raw_html|normalized_text_object_key|cookie|authorization/i);
 });
@@ -158,6 +192,29 @@ test('Phase 4 pilot uses explicit browser-compatible official-page request heade
   assert.match(requestInit.headers['user-agent'], /^TaxPolicyKnowledgeBase\/0\.3/);
   assert.match(requestInit.headers.accept, /^text\/html,/);
   assert.equal(requestInit.headers['accept-language'], 'zh-CN,zh;q=0.9');
+});
+
+test('Phase 4 pilot classifies challenge and client-side redirect shells without disclosing their HTML', async () => {
+  const challengeUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-challenge/content.html';
+  const redirectUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-redirect/content.html';
+  const result = await dryRunChinaTaxPolicyPilot({
+    urls: [challengeUrl, redirectUrl],
+    fetchImpl: async (url) => new Response(
+      String(url) === challengeUrl
+        ? '<html><title>Access Denied</title><body>Security verification required</body></html>'
+        : '<html><head><meta http-equiv="refresh" content="0; url=/zcfgk/c100027/next/content.html"></head><body></body></html>',
+      { status: 200, headers: { 'content-type': 'text/html', server: 'safe-test-gateway' } }
+    )
+  });
+  const challenge = result.candidates[0].diagnostic;
+  const redirect = result.candidates[1].diagnostic;
+  assert.equal(challenge.response_classification, 'waf_or_challenge_page');
+  assert.equal(challenge.html_title, 'Access Denied');
+  assert.deepEqual(challenge.response_headers, { server: 'safe-test-gateway' });
+  assert.equal(redirect.response_classification, 'client_side_redirect_page');
+  assert.equal(redirect.meta_refresh_target, 'fgk.chinatax.gov.cn/zcfgk/c100027/next/content.html');
+  assert.equal(redirect.client_side_redirect_detected, true);
+  assert.doesNotMatch(JSON.stringify(result), /Security verification required|raw_html|authorization|cookie/i);
 });
 
 test('Phase 4 protected intake attests all 9 expected items before any Candidate or Evidence write', async () => {

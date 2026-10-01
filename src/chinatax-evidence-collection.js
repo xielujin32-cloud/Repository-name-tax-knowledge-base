@@ -285,6 +285,63 @@ function headersSubset(headers) {
   return subset;
 }
 
+function diagnosticHeadersSubset(headers) {
+  // Never expose set-cookie, authorization, location query strings, or any
+  // arbitrary upstream header. These fields are sufficient to distinguish a
+  // CDN/WAF response variant from a normal official detail response.
+  const keys = ['content-encoding', 'content-length', 'server', 'via', 'x-cache', 'cf-cache-status', 'etag', 'last-modified', 'date'];
+  const subset = {};
+  for (const key of keys) {
+    const value = typeof headers?.get === 'function' ? headers.get(key) : headers?.[key];
+    if (value) subset[key] = String(value).replace(/[\r\n]+/g, ' ').slice(0, 240);
+  }
+  return Object.freeze(subset);
+}
+
+function safeResponseTitle(html) {
+  const title = textFromFirst(html, /<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  return title ? title.slice(0, 160) : null;
+}
+
+function safeMetaRefreshTarget(html) {
+  const tags = String(html || '').match(/<meta\b[^>]*>/gi) || [];
+  const refresh = tags.find((tag) => attributeValue(tag, 'http-equiv').toLowerCase() === 'refresh');
+  const content = refresh ? attributeValue(refresh, 'content') : '';
+  const target = content.match(/(?:^|;)\s*url\s*=\s*([^;\s]+)/i)?.[1]?.replace(/^["']|["']$/g, '') || '';
+  if (!target) return null;
+  try {
+    const value = new URL(target, 'https://fgk.chinatax.gov.cn');
+    return value.protocol === 'https:' && value.hostname === 'fgk.chinatax.gov.cn'
+      ? `${value.hostname}${value.pathname}`
+      : 'cross_origin_or_invalid';
+  } catch {
+    return 'invalid';
+  }
+}
+
+function scriptSourceHosts(html) {
+  const values = [...String(html || '').matchAll(/<script\b[^>]*\bsrc\s*=\s*(["'])([\s\S]*?)\1[^>]*>/gi)]
+    .map((match) => String(match[2] || '').trim())
+    .filter(Boolean);
+  const hosts = new Set();
+  for (const value of values) {
+    try { hosts.add(new URL(value, 'https://fgk.chinatax.gov.cn').hostname); } catch { hosts.add('invalid'); }
+  }
+  return Object.freeze({ count: values.length, hosts: [...hosts].sort().slice(0, 8) });
+}
+
+function classifyChinaTaxResponse(html, bodyContainer) {
+  if (bodyContainer) return 'official_policy_detail';
+  const plain = htmlToText(String(html || '')).replace(/\s+/g, ' ').trim();
+  const source = String(html || '').toLowerCase();
+  const hasChallenge = /captcha|challenge|access denied|forbidden|security verification|human verification|waf|验证码|安全验证|人机验证|访问受限|拒绝访问/.test(plain.toLowerCase());
+  const hasClientRedirect = /(?:window|document)?\.?location(?:\.href)?\s*=|location\.replace\s*\(|location\.assign\s*\(/.test(source) || Boolean(safeMetaRefreshTarget(html));
+  if (hasChallenge) return 'waf_or_challenge_page';
+  if (hasClientRedirect) return 'client_side_redirect_page';
+  if (Buffer.byteLength(String(html || ''), 'utf8') <= 1024) return 'short_html_shell_or_error_page';
+  return 'html_without_supported_policy_container';
+}
+
 function safeFinalUrl(value, fallback) {
   try {
     const parsed = new URL(String(value || fallback));
@@ -302,18 +359,30 @@ function safeDetailDiagnostic(response, officialUrl, rawHtml, { parsed = null, f
   const reportedStatus = response?.status ?? response?.http_status ?? inherited.http_status ?? 0;
   const httpStatus = Number(reportedStatus) || null;
   const contentType = response?.headers?.get?.('content-type') || response?.content_type || inherited.content_type || 'text/html';
+  const bodyContainer = chinaTaxBodyContainerKind(rawHtml);
+  const scripts = scriptSourceHosts(rawHtml);
+  const hasResponseHeaders = typeof response?.headers?.get === 'function';
   return Object.freeze({
     http_status: httpStatus,
     final_url: finalUrl,
     final_domain: finalUrl ? new URL(finalUrl).hostname : null,
     redirected: Boolean(response?.redirected ?? inherited.redirected),
     content_type: contentType,
+    content_encoding: response?.headers?.get?.('content-encoding') || inherited.content_encoding || null,
+    response_headers: hasResponseHeaders ? diagnosticHeadersSubset(response.headers) : (inherited.response_headers || Object.freeze({})),
     response_bytes: Buffer.byteLength(String(rawHtml || ''), 'utf8'),
-    body_container: chinaTaxBodyContainerKind(rawHtml),
-    body_container_found: Boolean(chinaTaxBodyContainerKind(rawHtml)),
+    response_sha256: sha256(rawHtml),
+    html_title: safeResponseTitle(rawHtml),
+    meta_refresh_target: safeMetaRefreshTarget(rawHtml),
+    script_src_count: scripts.count,
+    script_src_hosts: scripts.hosts,
+    client_side_redirect_detected: classifyChinaTaxResponse(rawHtml, bodyContainer) === 'client_side_redirect_page',
+    body_container: bodyContainer,
+    body_container_found: Boolean(bodyContainer),
     title_found: Boolean(parsed?.title),
     document_number_found: Boolean(parsed?.document_no),
     publication_date_found: Boolean(parsed?.publish_date),
+    response_classification: classifyChinaTaxResponse(rawHtml, bodyContainer),
     failure_reason: failureReason || null
   });
 }
@@ -437,6 +506,29 @@ const INTAKE_BLOCKING_RISK_FLAGS = new Set([
 
 function isIntakeReady(riskFlags) {
   return !riskFlags.some((flag) => INTAKE_BLOCKING_RISK_FLAGS.has(flag));
+}
+
+function diagnosticComparison(candidates) {
+  const summarize = (items) => {
+    const diagnostics = items.map((item) => item.diagnostic).filter(Boolean);
+    const bytes = diagnostics.map((item) => Number(item.response_bytes || 0)).filter((item) => Number.isFinite(item));
+    const countBy = (selector) => Object.fromEntries([...diagnostics.reduce((counts, item) => {
+      const value = selector(item) || 'unknown';
+      counts.set(value, (counts.get(value) || 0) + 1);
+      return counts;
+    }, new Map()).entries()].sort(([a], [b]) => a.localeCompare(b)));
+    return Object.freeze({
+      count: diagnostics.length,
+      response_bytes: Object.freeze({ min: bytes.length ? Math.min(...bytes) : null, max: bytes.length ? Math.max(...bytes) : null }),
+      classifications: countBy((item) => item.response_classification),
+      content_types: countBy((item) => item.content_type),
+      content_encodings: countBy((item) => item.content_encoding)
+    });
+  };
+  return Object.freeze({
+    ready: summarize(candidates.filter((item) => item.intake_ready)),
+    failed_or_skipped: summarize(candidates.filter((item) => !item.intake_ready))
+  });
 }
 
 function officialDetailFailureCode(error) {
@@ -714,6 +806,7 @@ export async function dryRunChinaTaxPolicyPilot({
     failed_count: candidates.filter((item) => !item.intake_ready).length,
     coverage: Object.freeze({ requested_topics: PHASE4_P1_PILOT_TOPIC_LABELS, covered_topics: [...covered], missing_topics: PHASE4_P1_PILOT_TOPIC_LABELS.filter((item) => !covered.has(item)) }),
     candidates: Object.freeze(candidates),
+    transport_comparison: diagnosticComparison(candidates),
     writes: Object.freeze({ raw_snapshots: 0, evidence: 0, candidates: 0, reviews: 0, policies: 0, policy_versions: 0, public_projections: 0, business_production_writes: 0 })
   });
 }
