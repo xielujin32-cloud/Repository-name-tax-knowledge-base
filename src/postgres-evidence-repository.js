@@ -1632,6 +1632,177 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
     );
     return result.rows[0].count === urls.length;
   }
+  /**
+   * Commits a fully-attested Phase 4 P1 pilot as one database unit.  The
+   * caller supplies only already-fetched/parsed materials; this function does
+   * not fetch an upstream URL.  Object-store writes are staged first and are
+   * deleted if the database transaction does not commit, so a failed batch
+   * cannot leave a visible Raw Snapshot, Candidate, Risk or Relation record.
+   */
+  async function importChinaTaxPolicyCandidateBatchAtomic({ source = CHINA_TAX_POLICY_SOURCE, mode = 'mvp-official-candidate-intake', items = [] } = {}) {
+    if (mode !== 'mvp-official-candidate-intake') throw new Error('Phase 4 P1 atomic intake 只允许受控 pilot mode。');
+    if (!Array.isArray(items) || !items.length || items.length > 20) throw new Error('Phase 4 P1 atomic intake 只接受 1 至 20 条已验证材料。');
+    const sourceId = required(source.source_id, 'source_id');
+    const sourceDomain = required(source.official_domain, 'official_domain');
+    if (registeredSourceTrust({ source_id: sourceId, official_domain: sourceDomain }) !== 'official_primary') {
+      throw new Error('Phase 4 P1 atomic intake 只允许已注册的官方来源。');
+    }
+    const records = items.map((item, index) => {
+      const officialUrl = canonical(item?.officialUrl);
+      const parsed = item?.parsed || {};
+      const response = item?.response || {};
+      const rawHtml = String(response.raw_html || '');
+      const normalizedText = String(parsed.normalized_text || '');
+      const bodyHash = sha256(normalizedText);
+      if (!rawHtml || !normalizedText || !isSha256(bodyHash)) throw new Error(`Phase 4 P1 已验证材料无效（${index + 1}）。`);
+      const metadataSuggestion = item?.metadataSuggestion;
+      if (!metadataSuggestion || metadataSuggestion.input_body_sha256 !== bodyHash) throw new Error(`Phase 4 P1 metadata 建议与正文不一致（${index + 1}）。`);
+      const snapshotId = id('snapshot');
+      const candidateId = id('candidate');
+      const parsedFields = {
+        title: parsed.title || null,
+        document_no: parsed.document_no || null,
+        document_no_source: parsed.document_no_source || 'missing',
+        document_no_confidence: parsed.document_no_confidence || 'none',
+        document_no_evidence: parsed.document_no_evidence || null,
+        issuing_authority: Array.isArray(parsed.issuing_authority) ? parsed.issuing_authority : [],
+        publish_date: parsed.publish_date || null,
+        effective_date: parsed.effective_date || null,
+        expiry_date: parsed.expiry_date || null,
+        official_url: officialUrl,
+        source_id: sourceId,
+        snapshot_id: snapshotId,
+        tax_categories: metadataSuggestion.tax_categories?.values || [],
+        topics: Array.isArray(item?.pilotTopics) ? item.pilotTopics : [],
+        region: ['全国'],
+        policy_category: 'tax_policy',
+        validity_status_suggestion: 'pending_verification',
+        official_status_hint: item?.sourceStatusHint || 'official_page_status_not_structurally_found',
+        metadata_suggestion: metadataSuggestion
+      };
+      return {
+        ordinal: index + 1, officialUrl, parsed, response, rawHtml, normalizedText,
+        bodyHash, metadataSuggestion, snapshotId, candidateId, parsedFields,
+        rawObjectKey: `raw-snapshots/${snapshotId}/raw`,
+        normalizedTextObjectKey: `raw-snapshots/${snapshotId}/normalized-text`
+      };
+    });
+    if (new Set(records.map((item) => item.officialUrl)).size !== records.length) {
+      const error = new Error('Phase 4 P1 atomic intake 出现重复官方 URL。');
+      error.code = 'PILOT_DUPLICATE_URL';
+      throw error;
+    }
+    const lockKey = `taxkb:phase4p1-intake:${sha256(stable(records.map((item) => ({ url: item.officialUrl, hash: item.bodyHash }))))}`;
+    const locked = await withExclusiveLock(lockKey, async () => {
+      const unreferencedObjectKeys = [];
+      try {
+        for (const item of records) {
+          await objectStore.putImmutable(item.rawObjectKey, item.rawHtml);
+          unreferencedObjectKeys.push(item.rawObjectKey);
+          await objectStore.putImmutable(item.normalizedTextObjectKey, item.normalizedText);
+          unreferencedObjectKeys.push(item.normalizedTextObjectKey);
+        }
+        const result = await transaction(async (client) => {
+          const timestamp = clock();
+          // Re-check all duplicate conflicts while holding the batch lock and
+          // before inserting a source, run, snapshot or candidate.
+          for (const item of records) {
+            const duplicate = await client.query(
+              `SELECT 1 FROM raw_snapshots WHERE source_id=$1 AND (canonical_url=$2 OR normalized_text_sha256=$3)
+               UNION ALL
+               SELECT 1 FROM candidates WHERE source_id=$1 AND (canonical_url=$2 OR normalized_text_sha256=$3)
+               LIMIT 1`,
+              [sourceId, item.officialUrl, item.bodyHash]
+            );
+            if (duplicate.rows.length) {
+              const error = new Error(`Phase 4 P1 已存在相同官方 Evidence（${item.ordinal}）。`);
+              error.code = 'PILOT_EXISTING_EVIDENCE_CONFLICT';
+              throw error;
+            }
+          }
+          await client.query(`INSERT INTO sources (source_id,source_name,official_domain,source_type,adapter_version,base_url,enabled,trust_level,created_at,updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,true,$7,$8,$8)
+            ON CONFLICT (source_id) DO NOTHING`,
+          [sourceId, required(source.source_name, 'source_name'), sourceDomain, required(source.source_type, 'source_type'), required(source.adapter_version, 'adapter_version'), source.base_url ? canonical(source.base_url) : null, 'official_primary', timestamp]);
+          await client.query('INSERT INTO source_states (source_id,updated_at) VALUES ($1,$2) ON CONFLICT (source_id) DO NOTHING', [sourceId, timestamp]);
+          const runId = id('collection-run');
+          await client.query(`INSERT INTO collection_runs (collection_run_id,source_id,mode,collection_state,started_at,completed_at,discovered_count)
+            VALUES ($1,$2,$3,'completed',$4,$4,$5)`, [runId, sourceId, mode, timestamp, records.length]);
+          const results = [];
+          let riskCount = 0;
+          let relationCount = 0;
+          for (const item of records) {
+            const documentNo = textValue(item.parsedFields.document_no);
+            const trustedDocumentNo = documentNo && item.parsedFields.document_no_confidence === 'high'
+              && ['structured_field', 'title_nearby', 'body_lead'].includes(item.parsedFields.document_no_source);
+            const documentNoConflicts = trustedDocumentNo ? (await client.query(
+              `SELECT candidate_id,canonical_url,normalized_text_sha256,parsed_fields->>'title' AS title
+               FROM candidates
+               WHERE parsed_fields->>'document_no'=$1
+                 AND parsed_fields->>'document_no_confidence'='high'
+                 AND parsed_fields->>'document_no_source' IN ('structured_field','title_nearby','body_lead')
+                 AND normalized_text_sha256<>$2`, [documentNo, item.bodyHash]
+            )).rows.map((row) => ({ candidate_id: row.candidate_id, canonical_url: row.canonical_url, title: row.title || null })) : [];
+            const versionChanges = (await client.query(
+              `SELECT candidate_id,normalized_text_sha256 FROM candidates
+               WHERE source_id=$1 AND canonical_url=$2 AND normalized_text_sha256<>$3`,
+              [sourceId, item.officialUrl, item.bodyHash]
+            )).rows.map((row) => ({ candidate_id: row.candidate_id, normalized_text_sha256: row.normalized_text_sha256 }));
+            const detail = {
+              candidate: { candidate_id: item.candidateId, snapshot_id: item.snapshotId, source_id: sourceId, collection_run_id: runId, official_url: item.officialUrl, normalized_text_sha256: item.bodyHash, parsed_fields: item.parsedFields, parsed_normalized_text: item.normalizedText },
+              raw_snapshot: { snapshot_id: item.snapshotId, source_id: sourceId, collection_run_id: runId, raw_sha256: sha256(item.rawHtml), normalized_text_sha256: item.bodyHash, normalized_text: item.normalizedText, http_status: Number(item.response.http_status || 200), parser_version: 'chinatax-evidence-3.0.0-mvp' },
+              collection_run: { collection_run_id: runId, source_id: sourceId },
+              source: { source_id: sourceId, official_domain: sourceDomain, enabled: true }
+            };
+            const risk = evaluateCandidateRisk(detail, { conflicts: { document_no_conflicts: documentNoConflicts, suspected_version_changes: versionChanges, relation_conflicts: [] } });
+            await client.query(`INSERT INTO raw_snapshots (snapshot_id,source_id,collection_run_id,official_url,canonical_url,fetched_at,http_status,response_headers_subset,content_type,raw_object_key,normalized_text_object_key,raw_sha256,normalized_text_sha256,parser_version,parse_result_hash,previous_snapshot_id,content_changed)
+              VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULL,true)`,
+              [item.snapshotId, sourceId, runId, item.officialUrl, timestamp, Number(item.response.http_status || 200), JSON.stringify(item.response.response_headers_subset || {}), String(item.response.content_type || 'text/html'), item.rawObjectKey, item.normalizedTextObjectKey, sha256(item.rawHtml), item.bodyHash, 'chinatax-evidence-3.0.0-mvp', sha256(stable({ ...item.parsedFields, legal_status: 'pending', verification_state: 'pending_review' }))]);
+            await client.query(`INSERT INTO candidates (candidate_id,snapshot_id,source_id,collection_run_id,official_url,canonical_url,normalized_text_sha256,parsed_fields,verification_state,legal_status,observed_snapshot_ids,last_seen_snapshot_id,created_at,updated_at)
+              VALUES ($1,$2,$3,$4,$5,$5,$6,$7,'pending_review','pending',$8,$2,$9,$9)`,
+              [item.candidateId, item.snapshotId, sourceId, runId, item.officialUrl, item.bodyHash, JSON.stringify(item.parsedFields), JSON.stringify([item.snapshotId]), timestamp]);
+            await client.query(`INSERT INTO candidate_risk_assessments (assessment_id,candidate_id,rule_version,input_body_sha256,parser_version,input_context_sha256,risk_level,risk_score,risk_reasons,quality_metrics,assessed_at,is_current)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,true)`,
+              [id('risk-assessment'), item.candidateId, risk.rule_version, risk.input_body_sha256, risk.parser_version, risk.input_context_sha256, risk.risk_level, Number(risk.risk_score), JSON.stringify(risk.risk_reasons || []), JSON.stringify(risk.quality_metrics || {}), timestamp]);
+            riskCount += 1;
+            await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'candidate', item.candidateId, 'metadata_suggestion_generated', JSON.stringify({ rule_version: item.metadataSuggestion.rule_version, input_body_sha256: item.bodyHash, tax_categories: item.metadataSuggestion.tax_categories?.values || [], keywords: item.metadataSuggestion.keywords?.values || [] }), timestamp]);
+            await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'candidate', item.candidateId, 'candidate_risk_assessed', JSON.stringify({ rule_version: risk.rule_version, risk_level: risk.risk_level, risk_score: risk.risk_score, input_body_sha256: item.bodyHash }), timestamp]);
+            const proposals = proposeCandidateRelations({ normalized_text: item.normalizedText });
+            const createdProposalIds = [];
+            for (const proposal of proposals) {
+              const targetDocumentNo = textValue(proposal.target_reference?.document_no);
+              const target = targetDocumentNo ? (await client.query(
+                `SELECT candidate_id FROM candidates WHERE candidate_id<>$1 AND parsed_fields->>'document_no'=$2 ORDER BY created_at DESC LIMIT 1`,
+                [item.candidateId, targetDocumentNo]
+              )).rows[0] : null;
+              const proposalId = id('relation-proposal');
+              const inserted = await client.query(`INSERT INTO candidate_relation_proposals
+                (proposal_id,from_candidate_id,to_candidate_id,relation_type,rule_version,input_body_sha256,target_reference,evidence,confidence,proposal_state,created_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'proposed',$10)
+                ON CONFLICT DO NOTHING RETURNING proposal_id`,
+                [proposalId, item.candidateId, target?.candidate_id || null, proposal.relation_type, proposal.rule_version, proposal.input_body_sha256, JSON.stringify(proposal.target_reference), JSON.stringify(proposal.evidence), proposal.confidence, timestamp]);
+              if (inserted.rows[0]) createdProposalIds.push(inserted.rows[0].proposal_id);
+            }
+            if (createdProposalIds.length) {
+              relationCount += createdProposalIds.length;
+              await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'candidate', item.candidateId, 'candidate_relation_proposed', JSON.stringify({ rule_version: CANDIDATE_RELATION_RULE_VERSION, proposal_ids: createdProposalIds, input_body_sha256: item.bodyHash }), timestamp]);
+            }
+            results.push({ official_url: item.officialUrl, candidate_id: item.candidateId, candidate_created: true, verification_state: 'pending_review', legal_status: 'pending', title_present: Boolean(item.parsed.title), document_no_present: Boolean(item.parsed.document_no), metadata_suggestion_created: true, risk_level: risk.risk_level, risk_score: risk.risk_score, relation_proposals_created: createdProposalIds.length });
+          }
+          await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'collection_run', runId, 'phase4p1_atomic_intake_completed', JSON.stringify({ item_count: records.length, mode, policy_writes: 0, policy_version_writes: 0, public_projection_writes: 0, level3_approvals: 0 }), timestamp]);
+          return { mode, run: { collection_run_id: runId, source_id: sourceId }, results, skipped: [], failed: [], created: { raw_snapshots: records.length, candidates: records.length, risk_assessments: riskCount, relation_proposals: relationCount, policies: 0, policy_versions: 0, public_projections: 0 } };
+        });
+        return Object.freeze(result);
+      } catch (error) {
+        if (typeof objectStore.deleteUnreferenced === 'function') {
+          await Promise.allSettled(unreferencedObjectKeys.map((key) => objectStore.deleteUnreferenced(key)));
+        }
+        throw error;
+      }
+    });
+    if (!locked.acquired) throw new Error('Phase 4 P1 pilot intake 正在执行，请稍后重试。');
+    return locked.result;
+  }
   async function withExclusiveLock(lockName, work) {
     if (typeof pool.connect !== 'function') {
       // @netlify/database-dev exposes a single local query interface. The
@@ -1649,48 +1820,97 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
       finally { await client.query('SELECT pg_advisory_unlock(hashtext($1))', [lockName]); }
     } finally { client.release(); }
   }
-  async function getOfficialIntakeDiagnostics({ sourceId, officialUrls = [] } = {}) {
+  async function getOfficialIntakeDiagnostics({ sourceId, officialUrls = [], mode = 'mvp-official-candidate-intake' } = {}) {
     const sourceKey = required(sourceId, 'source_id');
     const urls = [...new Set(officialUrls.map((value) => canonical(value)))];
     if (!urls.length) throw new Error('official_urls 不能为空。');
-    const { rows } = await pool.query(
-      `WITH scoped_snapshots AS (
-         SELECT snapshot_id,collection_run_id FROM raw_snapshots
-         WHERE source_id=$1 AND canonical_url=ANY($2::text[])
-       ), scoped_candidates AS (
-         SELECT candidate_id,collection_run_id FROM candidates
-         WHERE source_id=$1 AND canonical_url=ANY($2::text[])
-       ), scoped_runs AS (
-         SELECT DISTINCT collection_run_id FROM scoped_snapshots
-         UNION SELECT DISTINCT collection_run_id FROM scoped_candidates
-       )
-       SELECT
-         (SELECT COUNT(*)::int FROM scoped_snapshots) AS raw_snapshots,
-         (SELECT COUNT(*)::int FROM scoped_candidates) AS candidates,
-         (SELECT COUNT(*)::int FROM candidate_risk_assessments a JOIN scoped_candidates c ON c.candidate_id=a.candidate_id) AS risk_assessments,
-         (SELECT COUNT(*)::int FROM candidate_relation_proposals p JOIN scoped_candidates c ON c.candidate_id=p.from_candidate_id) AS relation_proposals,
-         (SELECT COUNT(*)::int FROM scoped_runs) AS collection_runs,
-         (SELECT COUNT(*)::int FROM audit_events a
-            WHERE (a.entity_type='candidate' AND a.entity_id IN (SELECT candidate_id FROM scoped_candidates))
-               OR (a.entity_type='collection_run' AND a.entity_id IN (SELECT collection_run_id FROM scoped_runs))) AS audit_events`,
-      [sourceKey, urls]
-    );
-    const counts = rows[0];
-    const totalBusinessWrites = Number(counts.raw_snapshots) + Number(counts.candidates)
-      + Number(counts.risk_assessments) + Number(counts.relation_proposals);
+    // The first diagnostic counted every historical record with a matching URL.
+    // One pilot URL is also in the legacy Phase 2B allow-list, so recovery must
+    // instead scope every count to the Phase 4 P1 collection-run mode.
+    const runRows = (await pool.query(
+      `SELECT r.collection_run_id,r.source_id,r.mode,r.collection_state,r.started_at,r.completed_at,r.discovered_count
+       FROM collection_runs r
+       WHERE r.source_id=$1 AND r.mode=$2
+         AND (EXISTS (SELECT 1 FROM raw_snapshots s WHERE s.collection_run_id=r.collection_run_id AND s.canonical_url=ANY($3::text[]))
+              OR EXISTS (SELECT 1 FROM candidates c WHERE c.collection_run_id=r.collection_run_id AND c.canonical_url=ANY($3::text[])))
+       ORDER BY r.started_at ASC`, [sourceKey, mode, urls])).rows;
+    const runIds = runRows.map((row) => row.collection_run_id);
+    const snapshotRows = runIds.length ? (await pool.query(
+      `SELECT s.snapshot_id,s.collection_run_id,s.official_url,s.canonical_url,s.normalized_text_sha256,s.raw_sha256,s.fetched_at,s.http_status
+       FROM raw_snapshots s WHERE s.collection_run_id=ANY($1::text[]) AND s.canonical_url=ANY($2::text[])
+       ORDER BY s.fetched_at ASC`, [runIds, urls])).rows : [];
+    const candidateRows = runIds.length ? (await pool.query(
+      `SELECT c.candidate_id,c.snapshot_id,c.collection_run_id,c.official_url,c.canonical_url,c.normalized_text_sha256,c.verification_state,c.legal_status,c.created_at,
+              EXISTS (SELECT 1 FROM review_decisions d WHERE d.candidate_id=c.candidate_id) AS has_review_decision,
+              EXISTS (SELECT 1 FROM policy_versions v WHERE v.candidate_id=c.candidate_id) AS has_policy_version
+       FROM candidates c WHERE c.collection_run_id=ANY($1::text[]) AND c.canonical_url=ANY($2::text[])
+       ORDER BY c.created_at ASC`, [runIds, urls])).rows : [];
+    const candidateIds = candidateRows.map((row) => row.candidate_id);
+    const riskRows = candidateIds.length ? (await pool.query(
+      'SELECT assessment_id,candidate_id FROM candidate_risk_assessments WHERE candidate_id=ANY($1::text[]) ORDER BY assessed_at ASC', [candidateIds])).rows : [];
+    const relationRows = candidateIds.length ? (await pool.query(
+      'SELECT proposal_id,from_candidate_id AS candidate_id,relation_type,proposal_state FROM candidate_relation_proposals WHERE from_candidate_id=ANY($1::text[]) ORDER BY created_at ASC', [candidateIds])).rows : [];
+    const auditRows = (runIds.length || candidateIds.length) ? (await pool.query(
+      `SELECT audit_event_id,entity_type,entity_id,event_type,created_at FROM audit_events
+       WHERE (entity_type='collection_run' AND entity_id=ANY($1::text[]))
+          OR (entity_type='candidate' AND entity_id=ANY($2::text[]))
+       ORDER BY created_at ASC`, [runIds, candidateIds])).rows : [];
+    const allMatching = (await pool.query(
+      `SELECT
+        (SELECT COUNT(*)::int FROM raw_snapshots WHERE source_id=$1 AND canonical_url=ANY($2::text[])) AS raw_snapshots,
+        (SELECT COUNT(*)::int FROM candidates WHERE source_id=$1 AND canonical_url=ANY($2::text[])) AS candidates`, [sourceKey, urls])).rows[0];
+    const totalBusinessWrites = snapshotRows.length + candidateRows.length + riskRows.length + relationRows.length;
+    const snapshotById = new Map(snapshotRows.map((row) => [row.snapshot_id, row]));
+    const recoveryItems = candidateRows.map((candidate) => {
+      const snapshot = snapshotById.get(candidate.snapshot_id) || null;
+      const run = runRows.find((row) => row.collection_run_id === candidate.collection_run_id) || null;
+      const eligible = Boolean(snapshot && run
+        && ['failed', 'cancelled'].includes(run.collection_state)
+        && candidate.verification_state === 'pending_review'
+        && candidate.legal_status === 'pending'
+        && !candidate.has_review_decision
+        && !candidate.has_policy_version);
+      return Object.freeze({
+        collection_run_id: candidate.collection_run_id,
+        collection_state: run?.collection_state || null,
+        snapshot_id: candidate.snapshot_id,
+        evidence_id: candidate.snapshot_id,
+        candidate_id: candidate.candidate_id,
+        official_url: candidate.official_url,
+        body_hash: candidate.normalized_text_sha256,
+        verification_state: candidate.verification_state,
+        legal_status: candidate.legal_status,
+        recovery_eligible: eligible,
+        recovery_reason: eligible ? 'FAILED_PILOT_PENDING_REVIEW_ONLY' : 'NOT_A_FAILED_UNREVIEWED_PILOT_RECORD'
+      });
+    });
     return Object.freeze({
+      diagnostic_scope: Object.freeze({ source_id: sourceKey, collection_mode: mode, official_url_count: urls.length }),
       official_url_count: urls.length,
-      raw_snapshot_writes: Number(counts.raw_snapshots),
-      evidence_writes: Number(counts.raw_snapshots),
-      candidate_writes: Number(counts.candidates),
-      risk_writes: Number(counts.risk_assessments),
-      relation_writes: Number(counts.relation_proposals),
-      collection_run_writes: Number(counts.collection_runs),
-      audit_writes: Number(counts.audit_events),
+      raw_snapshot_writes: snapshotRows.length,
+      evidence_writes: snapshotRows.length,
+      candidate_writes: candidateRows.length,
+      risk_writes: riskRows.length,
+      relation_writes: relationRows.length,
+      collection_run_writes: runRows.length,
+      audit_writes: auditRows.length,
       total_business_writes: totalBusinessWrites,
-      partial_write_detected: totalBusinessWrites > 0
+      partial_write_detected: totalBusinessWrites > 0,
+      non_pilot_matching_records: Object.freeze({
+        raw_snapshots: Math.max(0, Number(allMatching.raw_snapshots) - snapshotRows.length),
+        candidates: Math.max(0, Number(allMatching.candidates) - candidateRows.length)
+      }),
+      recovery_dry_run: Object.freeze({
+        execution: 'dry_run', mutation_allowed: false, requires_manual_confirmation: true,
+        proposed_action: 'quarantine_failed_pilot_only',
+        collection_runs: Object.freeze(runRows.map((row) => ({ collection_run_id: row.collection_run_id, source_id: row.source_id, mode: row.mode, collection_state: row.collection_state, discovered_count: row.discovered_count, started_at: row.started_at, completed_at: row.completed_at }))),
+        items: Object.freeze(recoveryItems),
+        risk_assessment_ids: Object.freeze(riskRows.map((row) => row.assessment_id)),
+        relation_proposal_ids: Object.freeze(relationRows.map((row) => row.proposal_id)),
+        audit_event_ids: Object.freeze(auditRows.map((row) => row.audit_event_id))
+      })
     });
   }
   async function counts() { const tables=['sources','source_states','collection_runs','raw_snapshots','candidates','review_decisions','policies','policy_versions','policy_relations','audit_events']; const output={}; for(const table of tables) output[table]=(await pool.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count; return output; }
-  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,relationProposalAffectedPolicyVersions,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,getOfficialIntakeDiagnostics,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
+  return Object.freeze({addSource,createCollectionRun,finishCollectionRun,recordRawSnapshot,createCandidate,traceCandidate,listCandidateStatuses,listCandidatesForReview,getCandidateForReview,reparseCandidate,saveMetadataSuggestion,detectCandidateRiskConflicts,saveCandidateRiskAssessment,assessCandidateRisk,listCandidateRiskAssessments,listCandidateRelationProposals,relationProposalAffectedPolicyVersions,generateCandidateRelationProposals,reviewCandidateRelationProposal,currentRiskAssessment,activeRelationProposalCount,listRiskQueue,createLowRiskReviewManifest,getReviewBatchManifest,blockReviewBatchManifest,refreshReviewBatchSamples,beginReviewBatchApply,markReviewBatchItem,completeReviewBatchManifest,failReviewBatchManifest,ensureProjectionJob,getProjectionJobDetail,getProjectionJobForPolicyVersion,markProjectionJob,getReviewBatchItem,approveLowRiskReviewBatchItem,reviewCandidate,createPhase3C1FrozenImportManifest,createPhase3C1FrozenImportManifestFromPreviewJob,getControlledImportManifest,getPhase3C1FrozenManifestIntegrity,preflightControlledImportManifest,createPhase3C2ControlledPreflight,getPhase3C2ControlledPreflight,applyPhase3C2ControlledImport,createPhase3C1PreviewJob,getPhase3C1PreviewJob,getPhase3C1PreviewJobReadiness,beginPhase3C1PreviewJob,updatePhase3C1PreviewJobProgress,persistPhase3C1PreviewJobMaterials,finishPhase3C1PreviewJob,blockPhase3C1PreviewJob,failPhase3C1PreviewJob,hasCompletedCandidatesForUrls,importChinaTaxPolicyCandidateBatchAtomic,getOfficialIntakeDiagnostics,withExclusiveLock,counts,readRawObject:(key)=>objectStore.read(key),close:()=>pool.end?.()});
 }

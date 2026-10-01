@@ -411,7 +411,7 @@ function selectedChinaTaxPolicyUrls(urls, maxCandidates) {
     throw new Error('必须提供已发现的国家税务总局官方详情 URL。');
   }
   const selectedUrls = [...new Set(urls.map((value) => normalizeChinaTaxPolicyUrl(value)).filter(Boolean))];
-  if (!selectedUrls.length || selectedUrls.length > maxCandidates || selectedUrls.length !== new Set(urls.map(String)).size) {
+  if (!selectedUrls.length || selectedUrls.length > maxCandidates || selectedUrls.length !== urls.length) {
     throw new Error(`官方 Candidate 收集仅接受 1 至 ${maxCandidates} 条互不重复的法规库详情 URL。`);
   }
   return selectedUrls;
@@ -677,6 +677,22 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], e
     ? new Map((await preflightChinaTaxPolicyCandidateImport({ urls: selectedUrls, expectedItems, fetchImpl, maxCandidates: cap }))
       .map((item) => [item.officialUrl, item]))
     : null;
+  // Protected Production intake never persists item-by-item.  The full batch
+  // has already been fetched and attested above; hand its prepared materials
+  // to the repository's single database transaction.  Blob objects are staged
+  // first and removed if the database transaction cannot commit.
+  if (prewritePreparedByUrl && typeof repository.importChinaTaxPolicyCandidateBatchAtomic === 'function') {
+    const prepared = selectedUrls.map((officialUrl) => {
+      const item = prewritePreparedByUrl.get(officialUrl);
+      if (!item) prewriteFailure('PREWRITE_URL_SET_MISMATCH');
+      return item;
+    });
+    return repository.importChinaTaxPolicyCandidateBatchAtomic({
+      source,
+      mode,
+      items: prepared
+    });
+  }
   const sourceRecord = await addChinaTaxPolicySource(repository);
   const run = await repository.createCollectionRun({ source_id: sourceRecord.source_id, mode });
   const results = [];

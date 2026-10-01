@@ -234,6 +234,132 @@ test('Phase 4 protected intake rejects any hash, URL set, or missing hash before
   }
 });
 
+test('Phase 4 P1 atomic intake rejects a first-item or tenth-item consistency mismatch with zero writes', async () => {
+  for (const mismatchOrdinal of [1, 10]) {
+    const value = await fixture();
+    try {
+      const pilot = Array.from({ length: 10 }, (_, index) => {
+        const ordinal = index + 1;
+        const officialUrl = `https://fgk.chinatax.gov.cn/zcfgk/c100027/phase4-atomic-${ordinal}/content.html`;
+        const title = `国家税务总局关于原子导入测试${ordinal}的公告`;
+        const documentNumber = `国家税务总局公告2026年第${ordinal}号`;
+        const content = `${body}${ordinal}`;
+        return { officialUrl, title, documentNumber, content };
+      });
+      const pages = new Map(pilot.map((item) => [item.officialUrl, page(item.title, item.documentNumber, item.content)]));
+      const expected = pilot.map((item) => expectedItem(item.officialUrl, item.title, item.documentNumber, item.content));
+      expected[mismatchOrdinal - 1] = { ...expected[mismatchOrdinal - 1], body_hash: 'a'.repeat(64) };
+      await assert.rejects(
+        () => collectChinaTaxPolicyCandidates({
+          repository: value.repository,
+          urls: pilot.map((item) => item.officialUrl),
+          expectedItems: expected,
+          fetchImpl: async (url) => new Response(pages.get(String(url)), { status: 200, headers: { 'content-type': 'text/html' } })
+        }),
+        (error) => error?.code === 'PREWRITE_BODY_HASH_MISMATCH' && error?.mismatch?.ordinal === mismatchOrdinal
+      );
+      for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals', 'policies', 'policy_versions']) {
+        const { rows } = await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+        assert.equal(rows[0].count, 0, `ordinal ${mismatchOrdinal}: ${table} must stay empty`);
+      }
+    } finally { await dispose(value); }
+  }
+});
+
+test('Phase 4 P1 protected intake rejects a parse failure or duplicate URL before any write', async () => {
+  for (const scenario of ['parse_failure', 'duplicate_url']) {
+    const value = await fixture();
+    try {
+      const urls = scenario === 'duplicate_url' ? [primaryUrl, primaryUrl] : [primaryUrl, secondUrl];
+      const expectedItems = scenario === 'duplicate_url'
+        ? [expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号')]
+        : [
+            expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'),
+            expectedItem(secondUrl, '国家税务总局关于增值税补充事项的公告', '国家税务总局公告2026年第2号')
+          ];
+      await assert.rejects(
+        () => collectChinaTaxPolicyCandidates({
+          repository: value.repository,
+          urls,
+          expectedItems,
+          fetchImpl: async (url) => {
+            if (scenario === 'parse_failure' && String(url) === secondUrl) return new Response('<html><body>no supported article container</body></html>', { status: 200 });
+            return new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), { status: 200, headers: { 'content-type': 'text/html' } });
+          }
+        }),
+        (error) => scenario === 'parse_failure'
+          ? error?.code === 'PREWRITE_POLICY_BODY_CONTAINER_MISSING'
+          : /互不重复/.test(String(error?.message || ''))
+      );
+      for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals', 'policies', 'policy_versions']) {
+        const { rows } = await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`);
+        assert.equal(rows[0].count, 0, `${scenario}: ${table} must stay empty`);
+      }
+    } finally { await dispose(value); }
+  }
+});
+
+test('Phase 4 P1 atomic database conflict rolls back the whole protected batch without a new run or Candidate', async () => {
+  const value = await fixture();
+  try {
+    const title = '国家税务总局关于增值税测试事项的公告';
+    const documentNumber = '国家税务总局公告2026年第1号';
+    const html = page(title, documentNumber);
+    await collectChinaTaxPolicyCandidates({
+      repository: value.repository,
+      urls: [primaryUrl],
+      fetchImpl: async () => new Response(html, { status: 200, headers: { 'content-type': 'text/html' } })
+    });
+    const before = {};
+    for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals', 'policies', 'policy_versions']) {
+      before[table] = (await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count;
+    }
+    await assert.rejects(
+      () => collectChinaTaxPolicyCandidates({
+        repository: value.repository,
+        urls: [primaryUrl],
+        expectedItems: [expectedItem(primaryUrl, title, documentNumber)],
+        fetchImpl: async () => new Response(html, { status: 200, headers: { 'content-type': 'text/html' } })
+      }),
+      (error) => error?.code === 'PILOT_EXISTING_EVIDENCE_CONFLICT'
+    );
+    for (const [table, count] of Object.entries(before)) {
+      assert.equal((await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count, count, `${table} must not gain a partial record`);
+    }
+  } finally { await dispose(value); }
+});
+
+test('Phase 4 P1 recovery dry-run scopes objects to pilot runs and excludes same-URL legacy Evidence', async () => {
+  const value = await fixture();
+  try {
+    const source = await value.repository.addSource({
+      source_id: 'source-sta-policy-regulations', source_name: '国家税务总局政策法规库', official_domain: 'fgk.chinatax.gov.cn',
+      source_type: 'official-policy-regulations', trust_level: 'official_primary', adapter_version: 'test', base_url: 'https://fgk.chinatax.gov.cn/'
+    });
+    const legacyRun = await value.repository.createCollectionRun({ source_id: source.source_id, mode: 'phase2d-production-whitelist' });
+    const legacySnapshot = await value.repository.recordRawSnapshot({ source_id: source.source_id, collection_run_id: legacyRun.collection_run_id, official_url: primaryUrl, raw_content: '<article>legacy evidence</article>', normalized_text: `${body} legacy`, parser_version: 'test', parse_result: {} });
+    await value.repository.createCandidate({ snapshot_id: legacySnapshot.snapshot_id, parsed_fields: { title: 'legacy', document_no: '国家税务总局公告2025年第1号', document_no_source: 'structured_field', document_no_confidence: 'high' } });
+    await value.repository.finishCollectionRun(legacyRun.collection_run_id, 'completed');
+
+    const pilotRun = await value.repository.createCollectionRun({ source_id: source.source_id, mode: 'mvp-official-candidate-intake' });
+    const pilotSnapshot = await value.repository.recordRawSnapshot({ source_id: source.source_id, collection_run_id: pilotRun.collection_run_id, official_url: primaryUrl, raw_content: '<article>failed pilot evidence</article>', normalized_text: `${body} failed pilot`, parser_version: 'test', parse_result: {} });
+    const pilotCandidate = await value.repository.createCandidate({ snapshot_id: pilotSnapshot.snapshot_id, parsed_fields: { title: 'pilot', document_no: '国家税务总局公告2026年第1号', document_no_source: 'structured_field', document_no_confidence: 'high' } });
+    await value.repository.finishCollectionRun(pilotRun.collection_run_id, 'failed');
+
+    const diagnostic = await value.repository.getOfficialIntakeDiagnostics({ sourceId: source.source_id, officialUrls: [primaryUrl] });
+    assert.equal(diagnostic.raw_snapshot_writes, 1);
+    assert.equal(diagnostic.candidate_writes, 1);
+    assert.equal(diagnostic.non_pilot_matching_records.raw_snapshots, 1);
+    assert.equal(diagnostic.non_pilot_matching_records.candidates, 1);
+    assert.equal(diagnostic.recovery_dry_run.execution, 'dry_run');
+    assert.equal(diagnostic.recovery_dry_run.mutation_allowed, false);
+    assert.deepEqual(diagnostic.recovery_dry_run.items.map((item) => item.candidate_id), [pilotCandidate.candidate.candidate_id]);
+    assert.equal(diagnostic.recovery_dry_run.items[0].snapshot_id, pilotSnapshot.snapshot_id);
+    assert.equal(diagnostic.recovery_dry_run.items[0].recovery_eligible, true);
+    assert.equal(diagnostic.recovery_dry_run.items[0].official_url, primaryUrl);
+  } finally { await dispose(value); }
+});
+
 test('Risk/Level 3 门禁只公开已核验且无阻断项的政策，缺少风险审查的批准不会写公开投影', async () => {
   const value = await fixture();
   try {

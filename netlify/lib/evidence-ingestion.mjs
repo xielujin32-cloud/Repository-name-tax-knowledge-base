@@ -730,11 +730,11 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
         const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls, expectedItems: input.expected_items });
         return json({ mode: 'review_candidate_intake', ...result }, 201);
       } catch (error) {
-        if (error instanceof ChinaTaxCandidatePrewriteValidationError) {
+        if (error instanceof ChinaTaxCandidatePrewriteValidationError || /^PILOT_/.test(String(error?.code || ''))) {
           return json({
             error: 'phase4p1_prewrite_validation_failed',
             code: error.code,
-            mismatch: error.mismatch,
+            mismatch: error.mismatch || null,
             partial_write_detected: false,
             business_production_writes: 0
           }, 409);
