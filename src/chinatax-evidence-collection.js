@@ -4,7 +4,12 @@ import { CHINA_TAX_POLICY_SOURCE, normalizeChinaTaxPolicyUrl } from './chinatax-
 import { suggestEvidenceMetadata } from './evidence-metadata-suggestion.js';
 import { proposeCandidateRelations } from './candidate-relation-proposal.js';
 
-const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.2 (phase2b-evidence-collection)';
+const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (official-policy-evidence-collector)';
+const DETAIL_REQUEST_HEADERS = Object.freeze({
+  'user-agent': DETAIL_USER_AGENT,
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'accept-language': 'zh-CN,zh;q=0.9'
+});
 
 // This Phase 2B collector is deliberately allow-listed. It cannot be pointed at
 // the legacy dataset, a search result, or another official/third-party URL.
@@ -123,6 +128,19 @@ export function extractChinaTaxPolicyBodyHtml(html) {
     || elementWithClasses(html, ['article_content'])
     || firstTagElement(html, 'article')
     || null;
+}
+
+// This is intentionally a structural fingerprint rather than a content
+// sample.  It lets the protected dry-run distinguish an upstream gateway or
+// challenge page from a genuine STA template change without returning policy
+// prose, HTML, cookies, or response headers outside the small safe subset.
+function chinaTaxBodyContainerKind(html) {
+  if (elementWithClasses(html, ['arc_cont'])) return 'arc_cont';
+  if (elementWithClasses(html, ['TRS_Editor'])) return 'TRS_Editor';
+  if (elementWithClasses(html, ['article-content'])) return 'article-content';
+  if (elementWithClasses(html, ['article_content'])) return 'article_content';
+  if (firstTagElement(html, 'article')) return 'article';
+  return null;
 }
 
 function documentDetailHtml(html) {
@@ -267,6 +285,39 @@ function headersSubset(headers) {
   return subset;
 }
 
+function safeFinalUrl(value, fallback) {
+  try {
+    const parsed = new URL(String(value || fallback));
+    return parsed.protocol === 'https:' && parsed.hostname === 'fgk.chinatax.gov.cn'
+      ? parsed.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeDetailDiagnostic(response, officialUrl, rawHtml, { parsed = null, failureReason = null } = {}) {
+  const inherited = response?.fetch_diagnostic || {};
+  const finalUrl = safeFinalUrl(response?.url || inherited.final_url, officialUrl);
+  const reportedStatus = response?.status ?? response?.http_status ?? inherited.http_status ?? 0;
+  const httpStatus = Number(reportedStatus) || null;
+  const contentType = response?.headers?.get?.('content-type') || response?.content_type || inherited.content_type || 'text/html';
+  return Object.freeze({
+    http_status: httpStatus,
+    final_url: finalUrl,
+    final_domain: finalUrl ? new URL(finalUrl).hostname : null,
+    redirected: Boolean(response?.redirected ?? inherited.redirected),
+    content_type: contentType,
+    response_bytes: Buffer.byteLength(String(rawHtml || ''), 'utf8'),
+    body_container: chinaTaxBodyContainerKind(rawHtml),
+    body_container_found: Boolean(chinaTaxBodyContainerKind(rawHtml)),
+    title_found: Boolean(parsed?.title),
+    document_number_found: Boolean(parsed?.document_no),
+    publication_date_found: Boolean(parsed?.publish_date),
+    failure_reason: failureReason || null
+  });
+}
+
 function allowedUrl(value) {
   const normalized = normalizeChinaTaxPolicyUrl(value);
   if (!normalized || !PHASE_2B_ALLOWED_DETAIL_URLS.includes(normalized)) {
@@ -312,16 +363,25 @@ export function parseChinaTaxPolicyEvidence(html) {
 
 async function fetchOfficialDetail(fetchImpl, officialUrl) {
   const response = await fetchImpl(officialUrl, {
-    headers: { 'user-agent': DETAIL_USER_AGENT },
+    // Some official CDN nodes vary their response by Accept/Accept-Language.
+    // Keep this explicit and identical in local and serverless runs; the
+    // parser still fails closed unless the actual policy fields are present.
+    headers: DETAIL_REQUEST_HEADERS,
     signal: AbortSignal.timeout(20_000)
   });
   const rawHtml = await response.text();
-  if (!response.ok) throw new Error(`国家税务总局政策详情请求失败：${response.status}`);
+  const fetchDiagnostic = safeDetailDiagnostic(response, officialUrl, rawHtml);
+  if (!response.ok) {
+    const error = new Error(`国家税务总局政策详情请求失败：${response.status}`);
+    error.fetch_diagnostic = safeDetailDiagnostic(response, officialUrl, rawHtml, { failureReason: `OFFICIAL_DETAIL_HTTP_${response.status}` });
+    throw error;
+  }
   return {
     http_status: response.status,
     response_headers_subset: headersSubset(response.headers),
     content_type: response.headers?.get?.('content-type') || 'text/html',
-    raw_html: rawHtml
+    raw_html: rawHtml,
+    fetch_diagnostic: fetchDiagnostic
   };
 }
 
@@ -553,14 +613,22 @@ export async function dryRunChinaTaxPolicyPilot({
 
   const staged = [];
   for (const officialUrl of selectedUrls) {
+    let response = null;
     try {
-      const response = await fetchOfficialDetail(fetchImpl, officialUrl);
+      response = await fetchOfficialDetail(fetchImpl, officialUrl);
       const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
       const metadata = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
       staged.push({ officialUrl, response, parsed, metadata, statusHint: officialStatusHint(response.raw_html) });
     } catch (error) {
       // Do not include upstream response bodies in a dry-run report.
-      staged.push({ officialUrl, failureCode: officialDetailFailureCode(error) });
+      const failureCode = officialDetailFailureCode(error);
+      staged.push({
+        officialUrl,
+        response,
+        failureCode,
+        diagnostic: error?.fetch_diagnostic
+          || (response ? safeDetailDiagnostic(response, officialUrl, response.raw_html, { failureReason: failureCode }) : null)
+      });
     }
   }
 
@@ -587,6 +655,7 @@ export async function dryRunChinaTaxPolicyPilot({
       source_domain: source.official_domain,
       candidate_state: 'failed',
       dry_run_error: item.failureCode,
+      diagnostic: item.diagnostic || null,
       suggested_validity_status: 'pending_verification',
       risk_flags: [item.failureCode],
       relation_proposals: [],
@@ -630,6 +699,7 @@ export async function dryRunChinaTaxPolicyPilot({
         duplicateTitles: parsed.title && (titleCounts.get(parsed.title) || 0) > 1
       }),
       relation_proposals: relations.map((relation) => ({ relation_type: relation.relation_type, target_reference: relation.target_reference, confidence: relation.confidence })),
+      diagnostic: safeDetailDiagnostic(item.response, item.officialUrl, item.response.raw_html, { parsed }),
       candidate_state: isIntakeReady(risks) ? 'ready' : 'failed',
       intake_ready: isIntakeReady(risks)
     });

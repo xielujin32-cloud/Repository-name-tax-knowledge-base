@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
-import { collectChinaTaxPolicyCandidates } from '../src/chinatax-evidence-collection.js';
+import { collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot } from '../src/chinatax-evidence-collection.js';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
 import { createEvidenceAdminHandler, PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION, reviewEvidenceCandidate } from '../netlify/lib/evidence-ingestion.mjs';
@@ -96,6 +96,68 @@ test('Phase 4 official intake skips one unreadable detail without creating Evide
     assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM raw_snapshots')).rows[0].count, 1);
     assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM candidates')).rows[0].count, 1);
   } finally { await dispose(value); }
+});
+
+test('Phase 4 pilot dry-run returns safe per-page transport and structure diagnostics without policy HTML', async () => {
+  const validHtml = page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号');
+  const missingContainerHtml = '<html><head><meta name="PubDate" content="2026-09-02"></head><body><h3>网关响应页面</h3></body></html>';
+  const result = await dryRunChinaTaxPolicyPilot({
+    urls: [primaryUrl, secondUrl],
+    fetchImpl: async (url) => new Response(
+      String(url) === primaryUrl ? validHtml : missingContainerHtml,
+      { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }
+    )
+  });
+  assert.equal(result.candidate_count, 2);
+  const ready = result.candidates.find((item) => item.official_url === primaryUrl);
+  const failed = result.candidates.find((item) => item.official_url === secondUrl);
+  assert.deepEqual(ready.diagnostic, {
+    http_status: 200,
+    final_url: primaryUrl,
+    final_domain: 'fgk.chinatax.gov.cn',
+    redirected: false,
+    content_type: 'text/html; charset=utf-8',
+    response_bytes: Buffer.byteLength(validHtml, 'utf8'),
+    body_container: 'arc_cont',
+    body_container_found: true,
+    title_found: true,
+    document_number_found: true,
+    publication_date_found: true,
+    failure_reason: null
+  });
+  assert.equal(failed.dry_run_error, 'POLICY_BODY_CONTAINER_MISSING');
+  assert.deepEqual(failed.diagnostic, {
+    http_status: 200,
+    final_url: secondUrl,
+    final_domain: 'fgk.chinatax.gov.cn',
+    redirected: false,
+    content_type: 'text/html; charset=utf-8',
+    response_bytes: Buffer.byteLength(missingContainerHtml, 'utf8'),
+    body_container: null,
+    body_container_found: false,
+    title_found: false,
+    document_number_found: false,
+    publication_date_found: false,
+    failure_reason: 'POLICY_BODY_CONTAINER_MISSING'
+  });
+  assert.doesNotMatch(JSON.stringify(result), /raw_html|normalized_text_object_key|cookie|authorization/i);
+});
+
+test('Phase 4 pilot uses explicit browser-compatible official-page request headers in every runtime', async () => {
+  let requestInit = null;
+  await dryRunChinaTaxPolicyPilot({
+    urls: [primaryUrl],
+    fetchImpl: async (_url, init) => {
+      requestInit = init;
+      return new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      });
+    }
+  });
+  assert.match(requestInit.headers['user-agent'], /^TaxPolicyKnowledgeBase\/0\.3/);
+  assert.match(requestInit.headers.accept, /^text\/html,/);
+  assert.equal(requestInit.headers['accept-language'], 'zh-CN,zh;q=0.9');
 });
 
 test('Phase 4 protected intake attests all 9 expected items before any Candidate or Evidence write', async () => {

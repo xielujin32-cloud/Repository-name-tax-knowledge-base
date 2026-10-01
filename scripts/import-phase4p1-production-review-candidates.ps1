@@ -154,6 +154,20 @@ function Safe-DryRunCandidate {
     body_hash = $Candidate.body_hash
     summary = Short-Summary $Candidate.summary
     risk_flags = @($Candidate.risk_flags)
+    diagnostic = [ordered]@{
+      http_status = $Candidate.diagnostic.http_status
+      final_url = $Candidate.diagnostic.final_url
+      final_domain = $Candidate.diagnostic.final_domain
+      redirected = ($Candidate.diagnostic.redirected -eq $true)
+      content_type = $Candidate.diagnostic.content_type
+      response_bytes = $Candidate.diagnostic.response_bytes
+      body_container = $Candidate.diagnostic.body_container
+      body_container_found = ($Candidate.diagnostic.body_container_found -eq $true)
+      title_found = ($Candidate.diagnostic.title_found -eq $true)
+      document_number_found = ($Candidate.diagnostic.document_number_found -eq $true)
+      publication_date_found = ($Candidate.diagnostic.publication_date_found -eq $true)
+      failure_reason = $Candidate.diagnostic.failure_reason
+    }
     relation_proposals = @($Candidate.relation_proposals | ForEach-Object {
       [ordered]@{ relation_type = $_.relation_type; target_reference = $_.target_reference; confidence = $_.confidence }
     })

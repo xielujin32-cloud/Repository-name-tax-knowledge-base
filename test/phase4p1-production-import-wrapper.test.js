@@ -35,6 +35,15 @@ test('Phase 4 P1 import wrapper accepts only the safe subset of the exact offici
   assert.match(wrapper, /skipped_count/);
 });
 
+test('Phase 4 P1 import wrapper exposes only safe upstream diagnostics from the authenticated dry-run', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  for (const field of ['http_status', 'final_url', 'final_domain', 'redirected', 'content_type', 'response_bytes', 'body_container_found', 'title_found', 'document_number_found', 'publication_date_found', 'failure_reason']) {
+    assert.match(wrapper, new RegExp(`diagnostic[\\s\\S]{0,1200}${field}`), `missing safe diagnostic field: ${field}`);
+  }
+  const safeCandidate = wrapper.slice(wrapper.indexOf('function Safe-DryRunCandidate'), wrapper.indexOf('function Get-DryRunImportDecision'));
+  assert.doesNotMatch(safeCandidate, /raw_html|normalized_text|cookie|authorization|token/i);
+});
+
 test('Phase 4 P1 import wrapper requires a second GUI confirmation and POSTs only the dry-run-safe frozen subset', async () => {
   const wrapper = await readFile(wrapperPath, 'utf8');
   const confirmation = wrapper.indexOf('if (-not (Confirm-ProductionCandidateImport -ReadyCount');
