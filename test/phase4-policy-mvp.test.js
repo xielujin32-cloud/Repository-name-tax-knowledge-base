@@ -176,7 +176,7 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     response_classification: 'short_html_shell_or_error_page',
     failure_reason: 'POLICY_BODY_CONTAINER_MISSING',
     retrieval: {
-      attempt_count: 2,
+      attempt_count: 3,
       retried: true,
       retry_reason: 'SHORT_HTML_SHELL_OR_ERROR_PAGE',
       initial_response_classification: 'short_html_shell_or_error_page',
@@ -217,6 +217,9 @@ test('Phase 4 pilot uses explicit browser-compatible official-page request heade
   assert.match(requestInit.headers['user-agent'], /^TaxPolicyKnowledgeBase\/0\.3/);
   assert.match(requestInit.headers.accept, /^text\/html,/);
   assert.equal(requestInit.headers['accept-language'], 'zh-CN,zh;q=0.9');
+  assert.equal(requestInit.headers['cache-control'], 'no-cache, no-store, max-age=0');
+  assert.equal(requestInit.headers.pragma, 'no-cache');
+  assert.equal(requestInit.cache, 'no-store');
 });
 
 test('Phase 4 pilot classifies challenge and client-side redirect shells without disclosing their HTML', async () => {
@@ -323,6 +326,26 @@ test('Phase 4 pilot retries one transient short official shell and remains fail-
     initial_response_classification: 'short_html_shell_or_error_page',
     initial_response_sha256: createHash('sha256').update(shortShell).digest('hex')
   });
+});
+
+test('Phase 4 default transport recovery permits a complete third response but never accepts either short shell', async () => {
+  const shortShell = '<html><body>temporary gateway page</body></html>';
+  let calls = 0;
+  const recovered = await dryRunChinaTaxPolicyPilot({
+    urls: [primaryUrl],
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(calls < 3 ? shortShell : page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      });
+    }
+  });
+  assert.equal(calls, 3);
+  assert.equal(recovered.import_ready_count, 1);
+  assert.equal(recovered.candidates[0].diagnostic.retrieval.attempt_count, 3);
+  assert.equal(recovered.candidates[0].diagnostic.retrieval.retried, true);
+  assert.equal(recovered.writes.business_production_writes, 0);
 });
 
 test('Phase 4 protected import retries only before its atomic pre-write gate and does not persist an incomplete retry', async () => {

@@ -8,13 +8,19 @@ const DETAIL_USER_AGENT = 'TaxPolicyKnowledgeBase/0.3 (official-policy-evidence-
 const DETAIL_REQUEST_HEADERS = Object.freeze({
   'user-agent': DETAIL_USER_AGENT,
   accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'accept-language': 'zh-CN,zh;q=0.9'
+  'accept-language': 'zh-CN,zh;q=0.9',
+  // The official library has intermittently returned a short, stale shell
+  // with HTTP 200 for an otherwise valid detail page. Require an upstream
+  // revalidation in every collector path; this never accepts the shell.
+  'cache-control': 'no-cache, no-store, max-age=0',
+  pragma: 'no-cache'
 });
-// A small, bounded retry is permitted only for the exact short HTML shell
-// observed from an otherwise-successful official detail URL.  It is part of
-// the read-only preparation phase: a second incomplete response still fails
-// closed and never reaches a repository write.
+// Bounded retries are permitted only for the exact short HTML shell observed
+// from an otherwise-successful official detail URL. They are part of read-only
+// preparation: every incomplete response still fails closed before a write.
 const SHORT_SHELL_RETRY_DELAY_MS = 1_250;
+const SHORT_SHELL_SECOND_RETRY_DELAY_MS = 4_000;
+const MAX_SHORT_SHELL_RETRY_DELAY_MS = SHORT_SHELL_SECOND_RETRY_DELAY_MS;
 const TRANSPORT_DIAGNOSTIC_DELAY_MS = 1_250;
 
 // This Phase 2B collector is deliberately allow-listed. It cannot be pointed at
@@ -465,6 +471,7 @@ async function fetchOfficialDetail(fetchImpl, officialUrl) {
     // Keep this explicit and identical in local and serverless runs; the
     // parser still fails closed unless the actual policy fields are present.
     headers: DETAIL_REQUEST_HEADERS,
+    cache: 'no-store',
     signal: AbortSignal.timeout(20_000)
   });
   const rawHtml = await response.text();
@@ -501,18 +508,23 @@ function isRetryableShortShell(response, officialUrl) {
 }
 
 function waitForOfficialDetailRetry(delayMs) {
-  const boundedDelay = Math.min(Math.max(Number(delayMs) || 0, 0), SHORT_SHELL_RETRY_DELAY_MS);
+  const boundedDelay = Math.min(Math.max(Number(delayMs) || 0, 0), MAX_SHORT_SHELL_RETRY_DELAY_MS);
   return boundedDelay ? new Promise((resolve) => setTimeout(resolve, boundedDelay)) : Promise.resolve();
 }
 
 /**
- * Parses a single official page, with one conservative retry for the known
- * short-shell response only. This runs before dry-run output or pre-write
+ * Parses a single official page, with bounded conservative retries for the
+ * known short-shell response only. This runs before dry-run output or pre-write
  * attestation; it never writes Evidence, Candidates, or any business record.
  */
-async function fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS } = {}) {
+async function fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs = null } = {}) {
+  // Passing retryDelayMs is retained for deterministic local tests. Production
+  // defaults to two bounded attempts after the first short shell (1.25s, 4s).
+  const retryDelays = retryDelayMs === null
+    ? [SHORT_SHELL_RETRY_DELAY_MS, SHORT_SHELL_SECOND_RETRY_DELAY_MS]
+    : [retryDelayMs];
   let initialDiagnostic = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
+  for (let attempt = 1; attempt <= retryDelays.length + 1; attempt += 1) {
     let response;
     try {
       response = await fetchOfficialDetail(fetchImpl, officialUrl);
@@ -530,9 +542,9 @@ async function fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayM
       const failureCode = officialDetailFailureCode(error);
       const diagnostic = error?.fetch_diagnostic
         || (response ? safeDetailDiagnostic(response, officialUrl, response.raw_html, { failureReason: failureCode }) : null);
-      if (attempt === 1 && response && isRetryableShortShell(response, officialUrl)) {
+      if (attempt <= retryDelays.length && response && isRetryableShortShell(response, officialUrl)) {
         initialDiagnostic = diagnostic;
-        await waitForOfficialDetailRetry(retryDelayMs);
+        await waitForOfficialDetailRetry(retryDelays[attempt - 1]);
         continue;
       }
       if (diagnostic) {
@@ -775,7 +787,7 @@ function expectedItemsByOfficialUrl(selectedUrls, expectedItems) {
  * from persistence so a changed upstream page cannot leave a partial intake.
  */
 export async function preflightChinaTaxPolicyCandidateImport({
-  urls = [], expectedItems = [], fetchImpl = fetch, maxCandidates = 20, retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS
+  urls = [], expectedItems = [], fetchImpl = fetch, maxCandidates = 20, retryDelayMs = null
 } = {}) {
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
@@ -861,7 +873,7 @@ export async function dryRunChinaTaxPolicyPilot({
   fetchImpl = fetch,
   source = CHINA_TAX_POLICY_SOURCE,
   maxCandidates = 20,
-  retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS
+  retryDelayMs = null
 } = {}) {
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   if (!Array.isArray(urls) || urls.length < 1 || urls.length > cap) {
@@ -999,7 +1011,7 @@ export function addChinaTaxPolicySource(repository) {
  * Policy, Policy Version, or public Blob projection. Production callers must
  * supply an explicit reviewed selection and confirmation at the API layer.
  */
-export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake', retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS } = {}) {
+export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake', retryDelayMs = null } = {}) {
   if (!repository) throw new Error('官方 Candidate 收集必须提供 Evidence Repository。');
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
