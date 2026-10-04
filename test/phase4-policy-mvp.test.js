@@ -132,7 +132,14 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     document_number_found: true,
     publication_date_found: true,
     response_classification: 'official_policy_detail',
-    failure_reason: null
+    failure_reason: null,
+    retrieval: {
+      attempt_count: 1,
+      retried: false,
+      retry_reason: null,
+      initial_response_classification: null,
+      initial_response_sha256: null
+    }
   });
   assert.equal(failed.dry_run_error, 'POLICY_BODY_CONTAINER_MISSING');
   assert.deepEqual(failed.diagnostic, {
@@ -156,7 +163,14 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     document_number_found: false,
     publication_date_found: false,
     response_classification: 'short_html_shell_or_error_page',
-    failure_reason: 'POLICY_BODY_CONTAINER_MISSING'
+    failure_reason: 'POLICY_BODY_CONTAINER_MISSING',
+    retrieval: {
+      attempt_count: 2,
+      retried: true,
+      retry_reason: 'SHORT_HTML_SHELL_OR_ERROR_PAGE',
+      initial_response_classification: 'short_html_shell_or_error_page',
+      initial_response_sha256: createHash('sha256').update(missingContainerHtml).digest('hex')
+    }
   });
   assert.deepEqual(result.transport_comparison, {
     ready: {
@@ -215,6 +229,79 @@ test('Phase 4 pilot classifies challenge and client-side redirect shells without
   assert.equal(redirect.meta_refresh_target, 'fgk.chinatax.gov.cn/zcfgk/c100027/next/content.html');
   assert.equal(redirect.client_side_redirect_detected, true);
   assert.doesNotMatch(JSON.stringify(result), /Security verification required|raw_html|authorization|cookie/i);
+});
+
+test('Phase 4 pilot retries one transient short official shell and remains fail-closed if the retry is also incomplete', async () => {
+  const shortShell = '<html><body>temporary gateway page</body></html>';
+  let calls = 0;
+  const recovered = await dryRunChinaTaxPolicyPilot({
+    urls: [primaryUrl],
+    retryDelayMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(calls === 1 ? shortShell : page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), {
+        status: 200,
+        headers: { 'content-type': 'text/html' }
+      });
+    }
+  });
+  assert.equal(calls, 2);
+  assert.equal(recovered.import_ready_count, 1);
+  assert.deepEqual(recovered.candidates[0].diagnostic.retrieval, {
+    attempt_count: 2,
+    retried: true,
+    retry_reason: 'SHORT_HTML_SHELL_OR_ERROR_PAGE',
+    initial_response_classification: 'short_html_shell_or_error_page',
+    initial_response_sha256: createHash('sha256').update(shortShell).digest('hex')
+  });
+
+  calls = 0;
+  const stillIncomplete = await dryRunChinaTaxPolicyPilot({
+    urls: [primaryUrl],
+    retryDelayMs: 0,
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(shortShell, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+  });
+  assert.equal(calls, 2);
+  assert.equal(stillIncomplete.import_ready_count, 0);
+  assert.equal(stillIncomplete.writes.business_production_writes, 0);
+  assert.equal(stillIncomplete.candidates[0].dry_run_error, 'POLICY_BODY_CONTAINER_MISSING');
+  assert.deepEqual(stillIncomplete.candidates[0].diagnostic.retrieval, {
+    attempt_count: 2,
+    retried: true,
+    retry_reason: 'SHORT_HTML_SHELL_OR_ERROR_PAGE',
+    initial_response_classification: 'short_html_shell_or_error_page',
+    initial_response_sha256: createHash('sha256').update(shortShell).digest('hex')
+  });
+});
+
+test('Phase 4 protected import retries only before its atomic pre-write gate and does not persist an incomplete retry', async () => {
+  const value = await fixture();
+  try {
+    const shortShell = '<html><body>temporary gateway page</body></html>';
+    const expected = expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号');
+    let calls = 0;
+    await assert.rejects(
+      () => collectChinaTaxPolicyCandidates({
+        repository: value.repository,
+        urls: [primaryUrl],
+        expectedItems: [expected],
+        retryDelayMs: 0,
+        fetchImpl: async () => {
+          calls += 1;
+          return new Response(shortShell, { status: 200, headers: { 'content-type': 'text/html' } });
+        }
+      }),
+      (error) => error?.code === 'PREWRITE_POLICY_BODY_CONTAINER_MISSING'
+    );
+    assert.equal(calls, 2);
+    for (const table of ['raw_snapshots', 'candidates', 'collection_runs', 'candidate_risk_assessments', 'candidate_relation_proposals']) {
+      assert.equal((await value.database.query(`SELECT COUNT(*)::int AS count FROM ${table}`)).rows[0].count, 0);
+    }
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM policies')).rows[0].count, 0);
+  } finally { await dispose(value); }
 });
 
 test('Phase 4 protected intake attests all 9 expected items before any Candidate or Evidence write', async () => {

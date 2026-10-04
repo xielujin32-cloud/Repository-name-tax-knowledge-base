@@ -10,6 +10,11 @@ const DETAIL_REQUEST_HEADERS = Object.freeze({
   accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'accept-language': 'zh-CN,zh;q=0.9'
 });
+// A small, bounded retry is permitted only for the exact short HTML shell
+// observed from an otherwise-successful official detail URL.  It is part of
+// the read-only preparation phase: a second incomplete response still fails
+// closed and never reaches a repository write.
+const SHORT_SHELL_RETRY_DELAY_MS = 1_250;
 
 // This Phase 2B collector is deliberately allow-listed. It cannot be pointed at
 // the legacy dataset, a search result, or another official/third-party URL.
@@ -383,7 +388,8 @@ function safeDetailDiagnostic(response, officialUrl, rawHtml, { parsed = null, f
     document_number_found: Boolean(parsed?.document_no),
     publication_date_found: Boolean(parsed?.publish_date),
     response_classification: classifyChinaTaxResponse(rawHtml, bodyContainer),
-    failure_reason: failureReason || null
+    failure_reason: failureReason || null,
+    retrieval: inherited.retrieval || null
   });
 }
 
@@ -452,6 +458,74 @@ async function fetchOfficialDetail(fetchImpl, officialUrl) {
     raw_html: rawHtml,
     fetch_diagnostic: fetchDiagnostic
   };
+}
+
+function detailRetryMetadata({ attemptCount, retryReason = null, initialDiagnostic = null }) {
+  return Object.freeze({
+    attempt_count: attemptCount,
+    retried: attemptCount > 1,
+    retry_reason: retryReason,
+    initial_response_classification: initialDiagnostic?.response_classification || null,
+    initial_response_sha256: initialDiagnostic?.response_sha256 || null
+  });
+}
+
+function isRetryableShortShell(response, officialUrl) {
+  const diagnostic = safeDetailDiagnostic(response, officialUrl, response?.raw_html);
+  return diagnostic.http_status >= 200
+    && diagnostic.http_status < 300
+    && diagnostic.response_classification === 'short_html_shell_or_error_page';
+}
+
+function waitForOfficialDetailRetry(delayMs) {
+  const boundedDelay = Math.min(Math.max(Number(delayMs) || 0, 0), SHORT_SHELL_RETRY_DELAY_MS);
+  return boundedDelay ? new Promise((resolve) => setTimeout(resolve, boundedDelay)) : Promise.resolve();
+}
+
+/**
+ * Parses a single official page, with one conservative retry for the known
+ * short-shell response only. This runs before dry-run output or pre-write
+ * attestation; it never writes Evidence, Candidates, or any business record.
+ */
+async function fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS } = {}) {
+  let initialDiagnostic = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let response;
+    try {
+      response = await fetchOfficialDetail(fetchImpl, officialUrl);
+      const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      response.fetch_diagnostic = Object.freeze({
+        ...safeDetailDiagnostic(response, officialUrl, response.raw_html, { parsed }),
+        retrieval: detailRetryMetadata({
+          attemptCount: attempt,
+          retryReason: initialDiagnostic ? 'SHORT_HTML_SHELL_OR_ERROR_PAGE' : null,
+          initialDiagnostic
+        })
+      });
+      return Object.freeze({ response, parsed });
+    } catch (error) {
+      const failureCode = officialDetailFailureCode(error);
+      const diagnostic = error?.fetch_diagnostic
+        || (response ? safeDetailDiagnostic(response, officialUrl, response.raw_html, { failureReason: failureCode }) : null);
+      if (attempt === 1 && response && isRetryableShortShell(response, officialUrl)) {
+        initialDiagnostic = diagnostic;
+        await waitForOfficialDetailRetry(retryDelayMs);
+        continue;
+      }
+      if (diagnostic) {
+        error.fetch_diagnostic = Object.freeze({
+          ...diagnostic,
+          retrieval: detailRetryMetadata({
+            attemptCount: attempt,
+            retryReason: initialDiagnostic ? 'SHORT_HTML_SHELL_OR_ERROR_PAGE' : null,
+            initialDiagnostic
+          })
+        });
+      }
+      throw error;
+    }
+  }
+  throw new Error('OFFICIAL_DETAIL_RETRY_EXHAUSTED');
 }
 
 function sha256(value) {
@@ -606,7 +680,7 @@ function expectedItemsByOfficialUrl(selectedUrls, expectedItems) {
  * from persistence so a changed upstream page cannot leave a partial intake.
  */
 export async function preflightChinaTaxPolicyCandidateImport({
-  urls = [], expectedItems = [], fetchImpl = fetch, maxCandidates = 20
+  urls = [], expectedItems = [], fetchImpl = fetch, maxCandidates = 20, retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS
 } = {}) {
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
@@ -619,8 +693,7 @@ export async function preflightChinaTaxPolicyCandidateImport({
     let response;
     let parsed;
     try {
-      response = await fetchOfficialDetail(fetchImpl, officialUrl);
-      parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      ({ response, parsed } = await fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs }));
     } catch (error) {
       prewriteFailure(`PREWRITE_${officialDetailFailureCode(error)}`, Object.freeze({ ordinal, official_url: officialUrl, mismatch_reason: officialDetailFailureCode(error) }));
     }
@@ -692,7 +765,8 @@ export async function dryRunChinaTaxPolicyPilot({
   urls = PHASE4_P1_PILOT_OFFICIAL_URLS,
   fetchImpl = fetch,
   source = CHINA_TAX_POLICY_SOURCE,
-  maxCandidates = 20
+  maxCandidates = 20,
+  retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS
 } = {}) {
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   if (!Array.isArray(urls) || urls.length < 1 || urls.length > cap) {
@@ -707,8 +781,9 @@ export async function dryRunChinaTaxPolicyPilot({
   for (const officialUrl of selectedUrls) {
     let response = null;
     try {
-      response = await fetchOfficialDetail(fetchImpl, officialUrl);
-      const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+      const detail = await fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs });
+      response = detail.response;
+      const { parsed } = detail;
       const metadata = suggestEvidenceMetadata({ title: parsed.title || '', normalized_text: parsed.normalized_text });
       staged.push({ officialUrl, response, parsed, metadata, statusHint: officialStatusHint(response.raw_html) });
     } catch (error) {
@@ -829,7 +904,7 @@ export function addChinaTaxPolicySource(repository) {
  * Policy, Policy Version, or public Blob projection. Production callers must
  * supply an explicit reviewed selection and confirmation at the API layer.
  */
-export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake' } = {}) {
+export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake', retryDelayMs = SHORT_SHELL_RETRY_DELAY_MS } = {}) {
   if (!repository) throw new Error('官方 Candidate 收集必须提供 Evidence Repository。');
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
@@ -837,7 +912,7 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], e
   // is fully read and attested before addSource/createCollectionRun, so no
   // snapshot, Evidence, Candidate, Risk or Relation write can precede it.
   const prewritePreparedByUrl = Array.isArray(expectedItems)
-    ? new Map((await preflightChinaTaxPolicyCandidateImport({ urls: selectedUrls, expectedItems, fetchImpl, maxCandidates: cap }))
+    ? new Map((await preflightChinaTaxPolicyCandidateImport({ urls: selectedUrls, expectedItems, fetchImpl, maxCandidates: cap, retryDelayMs }))
       .map((item) => [item.officialUrl, item]))
     : null;
   // Protected Production intake never persists item-by-item.  The full batch
@@ -870,8 +945,8 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], e
         if (!prepared) prewriteFailure('PREWRITE_URL_SET_MISMATCH');
       } else {
         try {
-          const response = await fetchOfficialDetail(fetchImpl, officialUrl);
-          const parsed = parseChinaTaxPolicyEvidence(response.raw_html);
+          const detail = await fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayMs });
+          const { response, parsed } = detail;
           const riskFlags = preliminaryRisk(parsed, { duplicateUrls: false, duplicateDocumentNumbers: false, duplicateTitles: false });
           if (!isIntakeReady(riskFlags)) {
             skipped.push(Object.freeze({

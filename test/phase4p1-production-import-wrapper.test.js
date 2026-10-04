@@ -37,7 +37,7 @@ test('Phase 4 P1 import wrapper accepts only the safe subset of the exact offici
 
 test('Phase 4 P1 import wrapper exposes only safe upstream diagnostics from the authenticated dry-run', async () => {
   const wrapper = await readFile(wrapperPath, 'utf8');
-  for (const field of ['http_status', 'final_url', 'final_domain', 'redirected', 'content_type', 'content_encoding', 'response_headers', 'response_bytes', 'response_sha256', 'html_title', 'meta_refresh_target', 'script_src_count', 'script_src_hosts', 'client_side_redirect_detected', 'body_container_found', 'title_found', 'document_number_found', 'publication_date_found', 'response_classification', 'failure_reason']) {
+  for (const field of ['http_status', 'final_url', 'final_domain', 'redirected', 'content_type', 'content_encoding', 'response_headers', 'response_bytes', 'response_sha256', 'html_title', 'meta_refresh_target', 'script_src_count', 'script_src_hosts', 'client_side_redirect_detected', 'body_container_found', 'title_found', 'document_number_found', 'publication_date_found', 'response_classification', 'failure_reason', 'retrieval', 'attempt_count', 'retried', 'retry_reason', 'initial_response_classification', 'initial_response_sha256']) {
     assert.match(wrapper, new RegExp(`diagnostic[\\s\\S]{0,1200}${field}`), `missing safe diagnostic field: ${field}`);
   }
   const safeCandidate = wrapper.slice(wrapper.indexOf('function Safe-DryRunCandidate'), wrapper.indexOf('function Get-DryRunImportDecision'));
@@ -62,6 +62,22 @@ test('Phase 4 P1 import wrapper requires a second GUI confirmation and POSTs onl
   assert.doesNotMatch(wrapper, /Get-ExpectedImportItems -Candidates @\(\$dryRun\.candidates\)/);
   assert.match(wrapper, /固定批次：10 条官方 URL；本次可导入 \$ReadyCount 条，已明确跳过 \$SkippedCount 条失败项/);
   assert.doesNotMatch(wrapper, /Invoke-WebRequest -Method (Put|Patch|Delete)/i);
+});
+
+test('Phase 4 P1 import wrapper has a dry-run-only mode that returns before baseline reads, confirmation, and POST', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const mode = wrapper.indexOf('if ($DryRunOnly)');
+  const expected = wrapper.indexOf('$expectedItems = Get-ExpectedImportItems', mode);
+  const safeReturn = wrapper.indexOf('return', mode);
+  const baseline = wrapper.indexOf("$stage = 'read_baseline'", mode);
+  const confirmation = wrapper.indexOf('Confirm-ProductionCandidateImport', mode);
+  const post = wrapper.indexOf('Invoke-WebRequest -Method Post -Uri $importUrl', mode);
+  assert.ok(mode >= 0 && expected > mode && safeReturn > expected);
+  assert.ok(baseline > safeReturn && confirmation > safeReturn && post > safeReturn);
+  assert.match(wrapper, /execution = 'DRY_RUN_ONLY'/);
+  assert.match(wrapper, /prewrite_consistency_gate = 'pending_revalidation_before_any_write'/);
+  assert.match(wrapper, /production_post_sent = \$false/);
+  assert.match(wrapper, /business_production_writes = 0/);
 });
 
 test('Phase 4 P1 import wrapper clears Token and never persists, prints, or serializes credentials', async () => {

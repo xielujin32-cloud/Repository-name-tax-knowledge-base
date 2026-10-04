@@ -1,7 +1,8 @@
 ﻿[CmdletBinding()]
 param(
   [switch]$SelfTest,
-  [switch]$ReadOnlyIntakeStatus
+  [switch]$ReadOnlyIntakeStatus,
+  [switch]$DryRunOnly
 )
 
 # Local-only operator wrapper. It is deliberately fixed to the reviewed Phase 4
@@ -176,6 +177,13 @@ function Safe-DryRunCandidate {
       publication_date_found = ($Candidate.diagnostic.publication_date_found -eq $true)
       response_classification = $Candidate.diagnostic.response_classification
       failure_reason = $Candidate.diagnostic.failure_reason
+      retrieval = [ordered]@{
+        attempt_count = Safe-Number $Candidate.diagnostic.retrieval.attempt_count
+        retried = ($Candidate.diagnostic.retrieval.retried -eq $true)
+        retry_reason = $Candidate.diagnostic.retrieval.retry_reason
+        initial_response_classification = $Candidate.diagnostic.retrieval.initial_response_classification
+        initial_response_sha256 = $Candidate.diagnostic.retrieval.initial_response_sha256
+      }
     }
     relation_proposals = @($Candidate.relation_proposals | ForEach-Object {
       [ordered]@{ relation_type = $_.relation_type; target_reference = $_.target_reference; confidence = $_.confidence }
@@ -404,6 +412,19 @@ function Invoke-Phase4P1ProductionImport {
     Write-SafeJson $dryRunSummary
     if (-not $dryRunDecision.ready) {
       Write-SafeJson ([ordered]@{ event = 'phase4p1_production_import'; error = 'dry_run_not_ready'; stage = $stage; production_post_sent = $false; business_production_writes = 0 })
+      return
+    }
+    if ($DryRunOnly) {
+      $expectedItems = Get-ExpectedImportItems -Candidates @($dryRunDecision.import_candidates)
+      Write-SafeJson ([ordered]@{
+        event = 'phase4p1_production_dry_run'
+        execution = 'DRY_RUN_ONLY'
+        expected_items = @($expectedItems)
+        expected_item_count = @($expectedItems).Count
+        prewrite_consistency_gate = 'pending_revalidation_before_any_write'
+        production_post_sent = $false
+        business_production_writes = 0
+      })
       return
     }
 
