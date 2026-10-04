@@ -13,6 +13,7 @@ test('Phase 4 P1 import wrapper is fixed to exactly ten STA official URLs and on
   const urls = wrapper.match(/https:\/\/fgk\.chinatax\.gov\.cn\/zcfgk\/[^']+\/content\.html/g) || [];
   assert.equal(new Set(urls).size, 10);
   assert.match(wrapper, /\$dryRunUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/pilot-dry-run"/);
+  assert.match(wrapper, /\$transportDiagnosticUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/pilot-transport-diagnostic"/);
   assert.match(wrapper, /\$importUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/candidates"/);
   assert.match(wrapper, /\$pilotIntakeStatusUrl = "\$productionOrigin\/api\/admin\/evidence\/sources\/chinatax\/pilot-intake-status"/);
   assert.match(wrapper, /\$confirmationPhrase = 'INGEST_PHASE4_STA_REVIEW_CANDIDATES'/);
@@ -78,6 +79,20 @@ test('Phase 4 P1 import wrapper has a dry-run-only mode that returns before base
   assert.match(wrapper, /prewrite_consistency_gate = 'pending_revalidation_before_any_write'/);
   assert.match(wrapper, /production_post_sent = \$false/);
   assert.match(wrapper, /business_production_writes = 0/);
+});
+
+test('Phase 4 P1 transport diagnostic wrapper is a fixed read-only GET and never enters import confirmation or POST', async () => {
+  const wrapper = await readFile(wrapperPath, 'utf8');
+  const functionStart = wrapper.indexOf('function Invoke-Phase4P1TransportDiagnostic');
+  const functionEnd = wrapper.indexOf('function Invoke-Phase4P1ProductionImport');
+  const branch = wrapper.indexOf('if ($TransportDiagnostic)');
+  const body = wrapper.slice(functionStart, functionEnd);
+  assert.ok(functionStart >= 0 && functionEnd > functionStart && branch > functionEnd);
+  assert.match(body, /Get-Json -Uri \$transportDiagnosticUrl -Headers \$headers/);
+  assert.match(body, /execution = 'READ_ONLY'/);
+  assert.match(body, /production_post_sent = \$false/);
+  assert.match(body, /business_production_writes = 0/);
+  assert.doesNotMatch(body, /Invoke-WebRequest -Method Post|Confirm-ProductionCandidateImport|raw_html|cookie|authorization\s*:/i);
 });
 
 test('Phase 4 P1 import wrapper clears Token and never persists, prints, or serializes credentials', async () => {

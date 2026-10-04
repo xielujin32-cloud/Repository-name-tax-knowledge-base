@@ -15,6 +15,7 @@ const DETAIL_REQUEST_HEADERS = Object.freeze({
 // the read-only preparation phase: a second incomplete response still fails
 // closed and never reaches a repository write.
 const SHORT_SHELL_RETRY_DELAY_MS = 1_250;
+const TRANSPORT_DIAGNOSTIC_DELAY_MS = 1_250;
 
 // This Phase 2B collector is deliberately allow-listed. It cannot be pointed at
 // the legacy dataset, a search result, or another official/third-party URL.
@@ -294,13 +295,33 @@ function diagnosticHeadersSubset(headers) {
   // Never expose set-cookie, authorization, location query strings, or any
   // arbitrary upstream header. These fields are sufficient to distinguish a
   // CDN/WAF response variant from a normal official detail response.
-  const keys = ['content-encoding', 'content-length', 'server', 'via', 'x-cache', 'cf-cache-status', 'etag', 'last-modified', 'date'];
+  const keys = ['content-encoding', 'content-length', 'transfer-encoding', 'server', 'via', 'x-cache', 'cf-cache-status', 'etag', 'last-modified', 'date'];
   const subset = {};
   for (const key of keys) {
     const value = typeof headers?.get === 'function' ? headers.get(key) : headers?.[key];
     if (value) subset[key] = String(value).replace(/[\r\n]+/g, ' ').slice(0, 240);
   }
   return Object.freeze(subset);
+}
+
+function safeStatusText(value) {
+  const text = String(value || '').replace(/[\r\n]+/g, ' ').trim();
+  return text ? text.slice(0, 160) : null;
+}
+
+function safeShortResponseFingerprint(html) {
+  const source = String(html || '');
+  const byteLength = Buffer.byteLength(source, 'utf8');
+  if (byteLength > 1024) return null;
+  const plainText = htmlToText(source).replace(/\s+/g, ' ').trim();
+  return Object.freeze({
+    html_tag_present: /<html\b/i.test(source),
+    head_tag_present: /<head\b/i.test(source),
+    body_tag_present: /<body\b/i.test(source),
+    meta_tag_count: Math.min((source.match(/<meta\b/gi) || []).length, 20),
+    script_tag_count: Math.min((source.match(/<script\b/gi) || []).length, 20),
+    rendered_text_length: Math.min(plainText.length, 1024)
+  });
 }
 
 function safeResponseTitle(html) {
@@ -369,6 +390,7 @@ function safeDetailDiagnostic(response, officialUrl, rawHtml, { parsed = null, f
   const hasResponseHeaders = typeof response?.headers?.get === 'function';
   return Object.freeze({
     http_status: httpStatus,
+    status_text: safeStatusText(response?.statusText || inherited.status_text),
     final_url: finalUrl,
     final_domain: finalUrl ? new URL(finalUrl).hostname : null,
     redirected: Boolean(response?.redirected ?? inherited.redirected),
@@ -377,6 +399,7 @@ function safeDetailDiagnostic(response, officialUrl, rawHtml, { parsed = null, f
     response_headers: hasResponseHeaders ? diagnosticHeadersSubset(response.headers) : (inherited.response_headers || Object.freeze({})),
     response_bytes: Buffer.byteLength(String(rawHtml || ''), 'utf8'),
     response_sha256: sha256(rawHtml),
+    short_response_fingerprint: safeShortResponseFingerprint(rawHtml),
     html_title: safeResponseTitle(rawHtml),
     meta_refresh_target: safeMetaRefreshTarget(rawHtml),
     script_src_count: scripts.count,
@@ -526,6 +549,78 @@ async function fetchAndParseOfficialDetail(fetchImpl, officialUrl, { retryDelayM
     }
   }
   throw new Error('OFFICIAL_DETAIL_RETRY_EXHAUSTED');
+}
+
+function transportDiagnosticScenarios() {
+  // This is intentionally a fixed, bounded sequence. It cannot be used to
+  // probe arbitrary URLs or expand official-page discovery.
+  return Object.freeze([
+    Object.freeze({ name: 'ordinal_10_alone', ordinals: Object.freeze([10]), delay_after_request_index: null }),
+    Object.freeze({ name: 'ordinal_10_retry_after_fixed_delay', ordinals: Object.freeze([10, 10]), delay_after_request_index: 1 }),
+    Object.freeze({ name: 'ordinal_10_first_then_1', ordinals: Object.freeze([10, 1]), delay_after_request_index: null }),
+    Object.freeze({ name: 'ordinal_1_then_10', ordinals: Object.freeze([1, 10]), delay_after_request_index: null }),
+    Object.freeze({ name: 'ordinal_9_then_10', ordinals: Object.freeze([9, 10]), delay_after_request_index: null })
+  ]);
+}
+
+async function inspectOfficialDetailTransport(fetchImpl, ordinal) {
+  const officialUrl = PHASE4_P1_PILOT_OFFICIAL_URLS[ordinal - 1];
+  let response = null;
+  try {
+    response = await fetchOfficialDetail(fetchImpl, officialUrl);
+    let parsed = null;
+    let failureReason = null;
+    try { parsed = parseChinaTaxPolicyEvidence(response.raw_html); } catch (error) { failureReason = officialDetailFailureCode(error); }
+    return Object.freeze({
+      ordinal,
+      official_url: officialUrl,
+      parse_succeeded: Boolean(parsed),
+      diagnostic: safeDetailDiagnostic(response, officialUrl, response.raw_html, { parsed, failureReason })
+    });
+  } catch (error) {
+    const failureReason = officialDetailFailureCode(error);
+    return Object.freeze({
+      ordinal,
+      official_url: officialUrl,
+      parse_succeeded: false,
+      diagnostic: error?.fetch_diagnostic
+        || (response ? safeDetailDiagnostic(response, officialUrl, response.raw_html, { failureReason }) : Object.freeze({ failure_reason: failureReason }))
+    });
+  }
+}
+
+/**
+ * A bounded, read-only transport diagnostic for the fixed Phase 4 pilot.
+ * It deliberately does not call the repository, object store, or candidate
+ * collector. The response has only safe transport/structure summaries.
+ */
+export async function diagnoseChinaTaxPilotTransport({
+  fetchImpl = fetch,
+  delayMs = TRANSPORT_DIAGNOSTIC_DELAY_MS,
+  waitImpl = waitForOfficialDetailRetry
+} = {}) {
+  const scenarios = [];
+  for (const definition of transportDiagnosticScenarios()) {
+    const requests = [];
+    for (const [index, ordinal] of definition.ordinals.entries()) {
+      requests.push(await inspectOfficialDetailTransport(fetchImpl, ordinal));
+      if (definition.delay_after_request_index === index + 1) await waitImpl(delayMs);
+    }
+    scenarios.push(Object.freeze({ name: definition.name, requests: Object.freeze(requests) }));
+  }
+  const targetRequests = scenarios.flatMap((scenario) => scenario.requests).filter((request) => request.ordinal === 10);
+  const targetHashes = [...new Set(targetRequests.map((request) => request.diagnostic?.response_sha256).filter(Boolean))];
+  return Object.freeze({
+    mode: 'read_only_transport_diagnostic',
+    source: Object.freeze({ source_id: CHINA_TAX_POLICY_SOURCE.source_id, source_domain: CHINA_TAX_POLICY_SOURCE.official_domain }),
+    fixed_url_count: PHASE4_P1_PILOT_OFFICIAL_URLS.length,
+    target: Object.freeze({ ordinal: 10, official_url: PHASE4_P1_PILOT_OFFICIAL_URLS[9] }),
+    scenarios: Object.freeze(scenarios),
+    target_response_hashes: Object.freeze(targetHashes),
+    target_response_hash_stable: targetHashes.length === 1,
+    request_count: scenarios.reduce((total, scenario) => total + scenario.requests.length, 0),
+    writes: Object.freeze({ raw_snapshots: 0, evidence: 0, candidates: 0, collection_runs: 0, risk: 0, relation: 0, policies: 0, policy_versions: 0, public_projections: 0, business_production_writes: 0 })
+  });
 }
 
 function sha256(value) {

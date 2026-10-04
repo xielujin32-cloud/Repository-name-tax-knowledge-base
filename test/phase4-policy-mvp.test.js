@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
-import { collectChinaTaxPolicyCandidates, dryRunChinaTaxPolicyPilot } from '../src/chinatax-evidence-collection.js';
+import { collectChinaTaxPolicyCandidates, diagnoseChinaTaxPilotTransport, dryRunChinaTaxPolicyPilot } from '../src/chinatax-evidence-collection.js';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
 import { createEvidenceAdminHandler, PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION, reviewEvidenceCandidate } from '../netlify/lib/evidence-ingestion.mjs';
@@ -113,6 +113,7 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
   const failed = result.candidates.find((item) => item.official_url === secondUrl);
   assert.deepEqual(ready.diagnostic, {
     http_status: 200,
+    status_text: null,
     final_url: primaryUrl,
     final_domain: 'fgk.chinatax.gov.cn',
     redirected: false,
@@ -121,6 +122,7 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     response_headers: {},
     response_bytes: Buffer.byteLength(validHtml, 'utf8'),
     response_sha256: createHash('sha256').update(validHtml).digest('hex'),
+    short_response_fingerprint: null,
     html_title: null,
     meta_refresh_target: null,
     script_src_count: 0,
@@ -144,6 +146,7 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
   assert.equal(failed.dry_run_error, 'POLICY_BODY_CONTAINER_MISSING');
   assert.deepEqual(failed.diagnostic, {
     http_status: 200,
+    status_text: null,
     final_url: secondUrl,
     final_domain: 'fgk.chinatax.gov.cn',
     redirected: false,
@@ -152,6 +155,14 @@ test('Phase 4 pilot dry-run returns safe per-page transport and structure diagno
     response_headers: {},
     response_bytes: Buffer.byteLength(missingContainerHtml, 'utf8'),
     response_sha256: createHash('sha256').update(missingContainerHtml).digest('hex'),
+    short_response_fingerprint: {
+      html_tag_present: true,
+      head_tag_present: true,
+      body_tag_present: true,
+      meta_tag_count: 1,
+      script_tag_count: 0,
+      rendered_text_length: '网关响应页面'.length
+    },
     html_title: null,
     meta_refresh_target: null,
     script_src_count: 0,
@@ -229,6 +240,43 @@ test('Phase 4 pilot classifies challenge and client-side redirect shells without
   assert.equal(redirect.meta_refresh_target, 'fgk.chinatax.gov.cn/zcfgk/c100027/next/content.html');
   assert.equal(redirect.client_side_redirect_detected, true);
   assert.doesNotMatch(JSON.stringify(result), /Security verification required|raw_html|authorization|cookie/i);
+});
+
+test('Phase 4 P1 transport diagnostic keeps a fixed sequence and exposes only safe order-sensitive response summaries', async () => {
+  const targetUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247077/content.html';
+  const shortShell = '<html><head></head><body>temporary gateway shell</body></html>';
+  const seen = [];
+  const result = await diagnoseChinaTaxPilotTransport({
+    delayMs: 0,
+    waitImpl: async () => {},
+    fetchImpl: async (url) => {
+      seen.push(String(url));
+      return new Response(String(url) === targetUrl ? shortShell : page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', 'transfer-encoding': 'chunked', server: 'safe-test-gateway' }
+      });
+    }
+  });
+  assert.equal(result.mode, 'read_only_transport_diagnostic');
+  assert.equal(result.fixed_url_count, 10);
+  assert.equal(result.request_count, 9);
+  assert.equal(seen.length, 9);
+  assert.deepEqual(result.scenarios.map((item) => [item.name, item.requests.map((request) => request.ordinal)]), [
+    ['ordinal_10_alone', [10]],
+    ['ordinal_10_retry_after_fixed_delay', [10, 10]],
+    ['ordinal_10_first_then_1', [10, 1]],
+    ['ordinal_1_then_10', [1, 10]],
+    ['ordinal_9_then_10', [9, 10]]
+  ]);
+  const targetRequests = result.scenarios.flatMap((item) => item.requests).filter((item) => item.ordinal === 10);
+  assert.equal(targetRequests.length, 6);
+  assert.ok(targetRequests.every((item) => item.parse_succeeded === false && item.diagnostic.response_classification === 'short_html_shell_or_error_page'));
+  assert.equal(result.target_response_hashes.length, 1);
+  assert.equal(result.target_response_hash_stable, true);
+  assert.equal(result.writes.business_production_writes, 0);
+  const encoded = JSON.stringify(result);
+  assert.doesNotMatch(encoded, /temporary gateway shell|raw_html|normalized_text|cookie|authorization/i);
+  assert.equal(result.scenarios[0].requests[0].diagnostic.response_headers['transfer-encoding'], 'chunked');
 });
 
 test('Phase 4 pilot retries one transient short official shell and remains fail-closed if the retry is also incomplete', async () => {
@@ -678,6 +726,46 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
     assert.equal(relation.status, 200);
     assert.deepEqual(relationSteps, ['read', 'suppress:policy-version-a,policy-version-b', 'confirm']);
     assert.equal((await relation.json()).public_visibility_suppression.suppressed, 2);
+  } finally {
+    if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+    else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;
+  }
+});
+
+test('Phase 4 P1 transport diagnostic is admin-only, fixed, query-free, and repository-free', async () => {
+  const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
+  process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase4-transport-token';
+  let repositoryCalls = 0;
+  let diagnosticCalls = 0;
+  const handler = createEvidenceAdminHandler({
+    repositoryFactory: () => { repositoryCalls += 1; throw new Error('transport diagnostic must not read repository'); },
+    chinaTaxTransportDiagnosticFactory: async ({ fetchImpl }) => {
+      diagnosticCalls += 1;
+      assert.equal(typeof fetchImpl, 'function');
+      return {
+        mode: 'read_only_transport_diagnostic', fixed_url_count: 10,
+        target: { ordinal: 10, official_url: 'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247077/content.html' },
+        scenarios: [], target_response_hashes: [], target_response_hash_stable: false, request_count: 0,
+        writes: { raw_snapshots: 0, evidence: 0, candidates: 0, collection_runs: 0, risk: 0, relation: 0, policies: 0, policy_versions: 0, public_projections: 0, business_production_writes: 0 }
+      };
+    }
+  });
+  const invoke = (suffix = '', token = '') => handler(
+    new Request(`https://taxkb.example/api/admin/evidence/sources/chinatax/pilot-transport-diagnostic${suffix}`, { headers: token ? { authorization: `Bearer ${token}` } : {} }),
+    '/api/admin/evidence/sources/chinatax/pilot-transport-diagnostic',
+    new URL(`https://taxkb.example/api/admin/evidence/sources/chinatax/pilot-transport-diagnostic${suffix}`)
+  );
+  try {
+    assert.equal((await invoke()).status, 401);
+    const rejectedQuery = await invoke('?url=https://example.invalid/', process.env.NETLIFY_TAXKB_ADMIN_TOKEN);
+    assert.equal(rejectedQuery.status, 400);
+    const response = await invoke('', process.env.NETLIFY_TAXKB_ADMIN_TOKEN);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.mode, 'read_only_transport_diagnostic');
+    assert.equal(body.writes.business_production_writes, 0);
+    assert.equal(diagnosticCalls, 1);
+    assert.equal(repositoryCalls, 0);
   } finally {
     if (previous === undefined) delete process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
     else process.env.NETLIFY_TAXKB_ADMIN_TOKEN = previous;

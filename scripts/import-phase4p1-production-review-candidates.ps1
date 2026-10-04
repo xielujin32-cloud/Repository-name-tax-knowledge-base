@@ -2,7 +2,8 @@
 param(
   [switch]$SelfTest,
   [switch]$ReadOnlyIntakeStatus,
-  [switch]$DryRunOnly
+  [switch]$DryRunOnly,
+  [switch]$TransportDiagnostic
 )
 
 # Local-only operator wrapper. It is deliberately fixed to the reviewed Phase 4
@@ -13,6 +14,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = $OutputEncoding
 $productionOrigin = 'https://xielujin-tax-knowledge-base.netlify.app'
 $dryRunUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/pilot-dry-run"
+$transportDiagnosticUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/pilot-transport-diagnostic"
 $importUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/candidates"
 $pilotIntakeStatusUrl = "$productionOrigin/api/admin/evidence/sources/chinatax/pilot-intake-status"
 $statusUrl = "$productionOrigin/api/admin/evidence/status"
@@ -190,6 +192,56 @@ function Safe-DryRunCandidate {
     })
     intake_ready = ($Candidate.intake_ready -eq $true)
     dry_run_error = $Candidate.dry_run_error
+  }
+}
+
+function Safe-TransportDiagnostic {
+  param([Parameter(Mandatory = $true)]$Diagnostic)
+  return [ordered]@{
+    mode = $Diagnostic.mode
+    source = [ordered]@{ source_id = $Diagnostic.source.source_id; source_domain = $Diagnostic.source.source_domain }
+    fixed_url_count = Safe-Number $Diagnostic.fixed_url_count
+    target = [ordered]@{ ordinal = Safe-Number $Diagnostic.target.ordinal; official_url = $Diagnostic.target.official_url }
+    request_count = Safe-Number $Diagnostic.request_count
+    target_response_hashes = @($Diagnostic.target_response_hashes)
+    target_response_hash_stable = ($Diagnostic.target_response_hash_stable -eq $true)
+    scenarios = @($Diagnostic.scenarios | ForEach-Object {
+      [ordered]@{
+        name = $_.name
+        requests = @($_.requests | ForEach-Object {
+          [ordered]@{
+            ordinal = Safe-Number $_.ordinal
+            official_url = $_.official_url
+            parse_succeeded = ($_.parse_succeeded -eq $true)
+            diagnostic = [ordered]@{
+              http_status = $_.diagnostic.http_status
+              status_text = $_.diagnostic.status_text
+              final_url = $_.diagnostic.final_url
+              final_domain = $_.diagnostic.final_domain
+              redirected = ($_.diagnostic.redirected -eq $true)
+              content_type = $_.diagnostic.content_type
+              content_encoding = $_.diagnostic.content_encoding
+              response_headers = $_.diagnostic.response_headers
+              response_bytes = $_.diagnostic.response_bytes
+              response_sha256 = $_.diagnostic.response_sha256
+              html_title = $_.diagnostic.html_title
+              meta_refresh_target = $_.diagnostic.meta_refresh_target
+              script_src_count = $_.diagnostic.script_src_count
+              script_src_hosts = @($_.diagnostic.script_src_hosts)
+              client_side_redirect_detected = ($_.diagnostic.client_side_redirect_detected -eq $true)
+              body_container = $_.diagnostic.body_container
+              body_container_found = ($_.diagnostic.body_container_found -eq $true)
+              title_found = ($_.diagnostic.title_found -eq $true)
+              document_number_found = ($_.diagnostic.document_number_found -eq $true)
+              publication_date_found = ($_.diagnostic.publication_date_found -eq $true)
+              response_classification = $_.diagnostic.response_classification
+              failure_reason = $_.diagnostic.failure_reason
+              short_response_fingerprint = $_.diagnostic.short_response_fingerprint
+            }
+          }
+        })
+      }
+    })
   }
 }
 
@@ -375,6 +427,45 @@ function Invoke-Phase4P1ReadOnlyIntakeStatus {
   }
 }
 
+function Invoke-Phase4P1TransportDiagnostic {
+  $secureToken = $null
+  $token = $null
+  $tokenBstr = [IntPtr]::Zero
+  $stage = 'token_input'
+  try {
+    $secureToken = Read-GuiSecureString -Prompt 'Enter administrator Token to run the read-only Phase 4 P1 transport diagnostic. No import request will be sent.'
+    $tokenBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenBstr).Trim()
+    if ([string]::IsNullOrWhiteSpace($token)) { throw [System.InvalidOperationException]::new('token_empty_after_secure_input') }
+    if ($token.ToCharArray() | Where-Object { ([int][char]$_) -lt 32 -or ([int][char]$_) -eq 127 }) { throw [System.InvalidOperationException]::new('token_contains_control_character') }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ Authorization = "Bearer $token"; 'Cache-Control' = 'no-store' }
+    $stage = 'read_only_transport_diagnostic'
+    $result = Get-Json -Uri $transportDiagnosticUrl -Headers $headers
+    Write-SafeJson ([ordered]@{
+      event = 'phase4p1_production_transport_diagnostic'
+      execution = 'READ_ONLY'
+      http_status = [int]$result.response.StatusCode
+      diagnostic = Safe-TransportDiagnostic $result.body
+      production_post_sent = $false
+      business_production_writes = 0
+    })
+  } catch {
+    $tokenInputCodes = @('token_input_cancelled', 'token_empty_after_secure_input', 'token_contains_control_character')
+    if ($stage -eq 'token_input' -and $tokenInputCodes -contains $_.Exception.Message) {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_transport_diagnostic'; error = 'local_token_input_error'; reason = $_.Exception.Message; production_post_sent = $false; business_production_writes = 0 })
+    } elseif ($_.Exception.Response) {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_transport_diagnostic'; error = 'read_only_transport_http_error'; stage = $stage; http_status = [int]$_.Exception.Response.StatusCode; production_post_sent = $false; business_production_writes = 0 })
+    } else {
+      Write-SafeJson ([ordered]@{ event = 'phase4p1_production_transport_diagnostic'; error = 'read_only_transport_request_failed'; stage = $stage; exception_type = $_.Exception.GetType().Name; production_post_sent = $false; business_production_writes = 0 })
+    }
+  } finally {
+    if ($tokenBstr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenBstr) }
+    if ($secureToken) { $secureToken.Dispose() }
+    $token = $null
+  }
+}
+
 function Invoke-Phase4P1ProductionImport {
   $secureToken = $null
   $token = $null
@@ -551,6 +642,10 @@ if ($SelfTest) {
 }
 if ($ReadOnlyIntakeStatus) {
   Invoke-Phase4P1ReadOnlyIntakeStatus
+  return
+}
+if ($TransportDiagnostic) {
+  Invoke-Phase4P1TransportDiagnostic
   return
 }
 Invoke-Phase4P1ProductionImport
