@@ -22,9 +22,9 @@ test('Phase 4 P1 import wrapper is fixed to exactly ten STA official URLs and on
   assert.doesNotMatch(wrapper, /discoverChinaTax|\/apply|import-preview|preflight/i);
 });
 
-test('Phase 4 P1 import wrapper accepts only the safe subset of the exact official ten and exposes a bounded failed item', async () => {
+test('Phase 4 P1 import wrapper accepts only the fixed first-nine batch and the explicit ordinal-ten failure', async () => {
   const wrapper = await readFile(wrapperPath, 'utf8');
-  for (const required of ['candidate_count) -ne 10', 'business_production_writes', 'Test-ExactOfficialUrls', 'official_primary', 'dry_run_error', 'intake_ready', 'DUPLICATE_', 'pending_verification', '$ready.Count -lt 9', '$skipped.Count -gt 1', 'OFFICIAL_DETAIL_']) {
+  for (const required of ['candidate_count) -ne 10', 'business_production_writes', 'Test-ExactOfficialUrls', 'official_primary', 'dry_run_error', 'intake_ready', 'DUPLICATE_', 'pending_verification', '$ready.Count -ne 9', '$skipped.Count -ne 1', '$excludedPilotUrl', "$excludedPilotReason = 'POLICY_BODY_CONTAINER_MISSING'"]) {
     assert.ok(wrapper.includes(required), `missing dry-run gate: ${required}`);
   }
   const gate = wrapper.indexOf('if (-not $dryRunDecision.ready)');
@@ -61,7 +61,11 @@ test('Phase 4 P1 import wrapper requires a second GUI confirmation and POSTs onl
   assert.match(wrapper, /official_urls = @\(\$expectedItems \| ForEach-Object \{ \$_.official_url \}\)/);
   assert.match(wrapper, /\$expectedItems = Get-ExpectedImportItems -Candidates @\(\$dryRunDecision\.import_candidates\)/);
   assert.doesNotMatch(wrapper, /Get-ExpectedImportItems -Candidates @\(\$dryRun\.candidates\)/);
-  assert.match(wrapper, /固定批次：10 条官方 URL；本次可导入 \$ReadyCount 条，已明确跳过 \$SkippedCount 条失败项/);
+  assert.match(wrapper, /固定独立批次：前 9 条官方 URL；第 10 条保持排除/);
+  assert.match(wrapper, /function New-FirstNineBatchManifest/);
+  assert.match(wrapper, /batch_id = \$firstNineBatchId/);
+  assert.match(wrapper, /batch_hash = \$batchHash/);
+  assert.match(wrapper, /batch_manifest = \$batchManifest/);
   assert.doesNotMatch(wrapper, /Invoke-WebRequest -Method (Put|Patch|Delete)/i);
 });
 
@@ -76,6 +80,7 @@ test('Phase 4 P1 import wrapper has a dry-run-only mode that returns before base
   assert.ok(mode >= 0 && expected > mode && safeReturn > expected);
   assert.ok(baseline > safeReturn && confirmation > safeReturn && post > safeReturn);
   assert.match(wrapper, /execution = 'DRY_RUN_ONLY'/);
+  assert.match(wrapper, /batch_manifest = \$batchManifest/);
   assert.match(wrapper, /prewrite_consistency_gate = 'pending_revalidation_before_any_write'/);
   assert.match(wrapper, /production_post_sent = \$false/);
   assert.match(wrapper, /business_production_writes = 0/);

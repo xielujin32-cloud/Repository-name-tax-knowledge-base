@@ -1639,7 +1639,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
    * deleted if the database transaction does not commit, so a failed batch
    * cannot leave a visible Raw Snapshot, Candidate, Risk or Relation record.
    */
-  async function importChinaTaxPolicyCandidateBatchAtomic({ source = CHINA_TAX_POLICY_SOURCE, mode = 'mvp-official-candidate-intake', items = [] } = {}) {
+  async function importChinaTaxPolicyCandidateBatchAtomic({ source = CHINA_TAX_POLICY_SOURCE, mode = 'mvp-official-candidate-intake', items = [], batchManifest = null } = {}) {
     if (mode !== 'mvp-official-candidate-intake') throw new Error('Phase 4 P1 atomic intake 只允许受控 pilot mode。');
     if (!Array.isArray(items) || !items.length || items.length > 20) throw new Error('Phase 4 P1 atomic intake 只接受 1 至 20 条已验证材料。');
     const sourceId = required(source.source_id, 'source_id');
@@ -1789,7 +1789,7 @@ export function createPostgresEvidenceRepository({ pool = getDatabase().pool, ob
             }
             results.push({ official_url: item.officialUrl, candidate_id: item.candidateId, candidate_created: true, verification_state: 'pending_review', legal_status: 'pending', title_present: Boolean(item.parsed.title), document_no_present: Boolean(item.parsed.document_no), metadata_suggestion_created: true, risk_level: risk.risk_level, risk_score: risk.risk_score, relation_proposals_created: createdProposalIds.length });
           }
-          await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'collection_run', runId, 'phase4p1_atomic_intake_completed', JSON.stringify({ item_count: records.length, mode, policy_writes: 0, policy_version_writes: 0, public_projection_writes: 0, level3_approvals: 0 }), timestamp]);
+          await client.query('INSERT INTO audit_events (audit_event_id,entity_type,entity_id,event_type,payload,created_at) VALUES ($1,$2,$3,$4,$5,$6)', [id('audit'), 'collection_run', runId, 'phase4p1_atomic_intake_completed', JSON.stringify({ item_count: records.length, mode, batch_id: batchManifest?.batch_id || null, batch_hash: batchManifest?.batch_hash || null, excluded_item: batchManifest?.excluded_item || null, policy_writes: 0, policy_version_writes: 0, public_projection_writes: 0, level3_approvals: 0 }), timestamp]);
           return { mode, run: { collection_run_id: runId, source_id: sourceId }, results, skipped: [], failed: [], created: { raw_snapshots: records.length, candidates: records.length, risk_assessments: riskCount, relation_proposals: relationCount, policies: 0, policy_versions: 0, public_projections: 0 } };
         });
         return Object.freeze(result);

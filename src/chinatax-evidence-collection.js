@@ -49,6 +49,17 @@ export const PHASE4_P1_PILOT_OFFICIAL_URLS = Object.freeze([
   'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247077/content.html' // enterprise-income-tax and VAT policy, 2026 No. 5
 ]);
 
+// The first production review batch is deliberately immutable in scope.  The
+// tenth pilot URL remains outside this batch until it can be read reliably in
+// Production; it must never be substituted with another policy.
+export const PHASE4_P1_FIRST_NINE_BATCH_ID = 'phase4-p1-first-nine-review-candidates-v1';
+export const PHASE4_P1_FIRST_NINE_OFFICIAL_URLS = Object.freeze(PHASE4_P1_PILOT_OFFICIAL_URLS.slice(0, 9));
+export const PHASE4_P1_FIRST_NINE_EXCLUDED_ITEM = Object.freeze({
+  ordinal: 10,
+  official_url: PHASE4_P1_PILOT_OFFICIAL_URLS[9],
+  reason: 'POLICY_BODY_CONTAINER_MISSING'
+});
+
 export const PHASE4_P1_PILOT_TOPIC_LABELS = Object.freeze([
   '增值税', '小规模纳税人', '一般纳税人', '小型微利企业', '企业所得税', '出口退税', '出口免税', '跨境电商出口'
 ]);
@@ -639,6 +650,22 @@ function sha256(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+function firstNineBatchHash(items) {
+  const serialized = items.map((item) => [
+    item.official_url,
+    item.body_hash,
+    item.policy_title,
+    item.document_number,
+    item.publication_date
+  ].join('\u001f')).join('\n');
+  return sha256([
+    PHASE4_P1_FIRST_NINE_BATCH_ID,
+    PHASE4_P1_FIRST_NINE_EXCLUDED_ITEM.official_url,
+    PHASE4_P1_FIRST_NINE_EXCLUDED_ITEM.reason,
+    serialized
+  ].join('\n'));
+}
+
 function topicMatches(title, normalizedText) {
   const corpus = `${title || ''}\n${normalizedText || ''}`;
   const rules = [
@@ -779,6 +806,53 @@ function expectedItemsByOfficialUrl(selectedUrls, expectedItems) {
     prewriteFailure('PREWRITE_URL_SET_MISMATCH');
   }
   return byUrl;
+}
+
+/**
+ * Builds the only permitted first-production intake manifest.  Its contents
+ * are supplied by the authenticated dry-run, but its URL set and the excluded
+ * tenth item are fixed in code so an operator cannot silently substitute a
+ * different policy into this batch.
+ */
+export function buildPhase4P1FirstNineBatchManifest(expectedItems) {
+  const byUrl = expectedItemsByOfficialUrl(PHASE4_P1_FIRST_NINE_OFFICIAL_URLS, expectedItems);
+  const items = Object.freeze(PHASE4_P1_FIRST_NINE_OFFICIAL_URLS.map((officialUrl) => Object.freeze({ ...byUrl.get(officialUrl) })));
+  return Object.freeze({
+    batch_id: PHASE4_P1_FIRST_NINE_BATCH_ID,
+    item_count: items.length,
+    items,
+    excluded_item: PHASE4_P1_FIRST_NINE_EXCLUDED_ITEM,
+    batch_hash: firstNineBatchHash(items)
+  });
+}
+
+export function verifyPhase4P1FirstNineBatchManifest({ urls = [], expectedItems = [], batchManifest = null } = {}) {
+  const selectedUrls = selectedChinaTaxPolicyUrls(urls, 20);
+  if (selectedUrls.length !== PHASE4_P1_FIRST_NINE_OFFICIAL_URLS.length
+    || selectedUrls.some((officialUrl, index) => officialUrl !== PHASE4_P1_FIRST_NINE_OFFICIAL_URLS[index])) {
+    prewriteFailure('PREWRITE_BATCH_URL_SET_MISMATCH');
+  }
+  const expected = buildPhase4P1FirstNineBatchManifest(expectedItems);
+  if (!batchManifest || typeof batchManifest !== 'object' || Array.isArray(batchManifest)
+    || batchManifest.batch_id !== expected.batch_id
+    || Number(batchManifest.item_count) !== expected.item_count
+    || String(batchManifest.batch_hash || '').toLowerCase() !== expected.batch_hash
+    || String(batchManifest.excluded_item?.official_url || '') !== expected.excluded_item.official_url
+    || String(batchManifest.excluded_item?.reason || '') !== expected.excluded_item.reason
+    || !Array.isArray(batchManifest.items)
+    || batchManifest.items.length !== expected.items.length
+    || batchManifest.items.some((item, index) => {
+      const actual = item || {};
+      const wanted = expected.items[index];
+      return actual.official_url !== wanted.official_url
+        || String(actual.body_hash || '').toLowerCase() !== wanted.body_hash
+        || actual.policy_title !== wanted.policy_title
+        || actual.document_number !== wanted.document_number
+        || actual.publication_date !== wanted.publication_date;
+    })) {
+    prewriteFailure('PREWRITE_BATCH_MANIFEST_MISMATCH');
+  }
+  return expected;
 }
 
 /**
@@ -1011,10 +1085,15 @@ export function addChinaTaxPolicySource(repository) {
  * Policy, Policy Version, or public Blob projection. Production callers must
  * supply an explicit reviewed selection and confirmation at the API layer.
  */
-export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake', retryDelayMs = null } = {}) {
+export async function collectChinaTaxPolicyCandidates({ repository, urls = [], expectedItems = null, batchManifest = null, fetchImpl = fetch, source = CHINA_TAX_POLICY_SOURCE, maxCandidates = 20, mode = 'mvp-official-candidate-intake', retryDelayMs = null } = {}) {
   if (!repository) throw new Error('官方 Candidate 收集必须提供 Evidence Repository。');
   const cap = Math.min(Math.max(Number(maxCandidates) || 20, 1), 20);
   const selectedUrls = selectedChinaTaxPolicyUrls(urls, cap);
+  const verifiedBatchManifest = batchManifest === null ? null : verifyPhase4P1FirstNineBatchManifest({
+    urls: selectedUrls,
+    expectedItems,
+    batchManifest
+  });
   // An expected set is present only on the protected Production endpoint. It
   // is fully read and attested before addSource/createCollectionRun, so no
   // snapshot, Evidence, Candidate, Risk or Relation write can precede it.
@@ -1035,7 +1114,8 @@ export async function collectChinaTaxPolicyCandidates({ repository, urls = [], e
     return repository.importChinaTaxPolicyCandidateBatchAtomic({
       source,
       mode,
-      items: prepared
+      items: prepared,
+      batchManifest: verifiedBatchManifest
     });
   }
   const sourceRecord = await addChinaTaxPolicySource(repository);

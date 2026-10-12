@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { NetlifyDB } from '@netlify/database-dev';
-import { collectChinaTaxPolicyCandidates, diagnoseChinaTaxPilotTransport, dryRunChinaTaxPolicyPilot } from '../src/chinatax-evidence-collection.js';
+import { buildPhase4P1FirstNineBatchManifest, collectChinaTaxPolicyCandidates, diagnoseChinaTaxPilotTransport, dryRunChinaTaxPolicyPilot, PHASE4_P1_FIRST_NINE_OFFICIAL_URLS, PHASE4_P1_PILOT_OFFICIAL_URLS, verifyPhase4P1FirstNineBatchManifest } from '../src/chinatax-evidence-collection.js';
 import { createLocalEvidenceObjectStore } from '../src/evidence-object-store.js';
 import { createPostgresEvidenceRepository } from '../src/postgres-evidence-repository.js';
 import { createEvidenceAdminHandler, PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION, reviewEvidenceCandidate } from '../netlify/lib/evidence-ingestion.mjs';
@@ -20,6 +20,14 @@ const expectedItem = (officialUrl, title, documentNumber, content = body) => ({
   policy_title: title,
   document_number: documentNumber,
   publication_date: '2026-09-01'
+});
+
+const firstNineBatchFixture = () => PHASE4_P1_FIRST_NINE_OFFICIAL_URLS.map((officialUrl, index) => {
+  const ordinal = index + 1;
+  const title = `国家税务总局关于增值税批次测试事项${ordinal}的公告`;
+  const documentNumber = `国家税务总局公告2026年第${ordinal}号`;
+  const content = `${body}${ordinal}`;
+  return { officialUrl, title, documentNumber, content };
 });
 
 async function fixture() {
@@ -402,14 +410,68 @@ test('Phase 4 protected intake attests all 9 expected items before any Candidate
   } finally { await dispose(value); }
 });
 
+test('Phase 4 P1 fixed first-nine manifest excludes ordinal ten, is deterministic, and is retained in the completed-run audit', async () => {
+  const value = await fixture();
+  try {
+    const firstNine = firstNineBatchFixture();
+    const expectedItems = firstNine.map((item) => expectedItem(item.officialUrl, item.title, item.documentNumber, item.content));
+    const manifest = buildPhase4P1FirstNineBatchManifest(expectedItems);
+    assert.equal(manifest.batch_id, 'phase4-p1-first-nine-review-candidates-v1');
+    assert.equal(manifest.item_count, 9);
+    assert.equal(manifest.excluded_item.ordinal, 10);
+    assert.equal(manifest.excluded_item.official_url, PHASE4_P1_PILOT_OFFICIAL_URLS[9]);
+    assert.equal(manifest.excluded_item.reason, 'POLICY_BODY_CONTAINER_MISSING');
+    assert.match(manifest.batch_hash, /^[a-f0-9]{64}$/);
+    assert.deepEqual(verifyPhase4P1FirstNineBatchManifest({ urls: firstNine.map((item) => item.officialUrl), expectedItems, batchManifest: manifest }), manifest);
+    await assert.throws(
+      () => verifyPhase4P1FirstNineBatchManifest({ urls: [...firstNine.map((item) => item.officialUrl), PHASE4_P1_PILOT_OFFICIAL_URLS[9]], expectedItems: [...expectedItems, expectedItem(PHASE4_P1_PILOT_OFFICIAL_URLS[9], '不应替补', '国家税务总局公告2026年第99号')], batchManifest: manifest }),
+      (error) => error?.code === 'PREWRITE_BATCH_URL_SET_MISMATCH'
+    );
+    const pages = new Map(firstNine.map((item) => [item.officialUrl, page(item.title, item.documentNumber, item.content)]));
+    const result = await collectChinaTaxPolicyCandidates({
+      repository: value.repository,
+      urls: firstNine.map((item) => item.officialUrl),
+      expectedItems,
+      batchManifest: manifest,
+      fetchImpl: async (url) => new Response(pages.get(String(url)), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+    });
+    assert.equal(result.created.raw_snapshots, 9);
+    assert.equal(result.created.candidates, 9);
+    const audit = (await value.database.query("SELECT payload FROM audit_events WHERE event_type='phase4p1_atomic_intake_completed' ORDER BY created_at DESC LIMIT 1")).rows[0];
+    const auditPayload = typeof audit.payload === 'string' ? JSON.parse(audit.payload) : audit.payload;
+    assert.equal(auditPayload.batch_hash, manifest.batch_hash);
+    assert.equal(auditPayload.excluded_item.official_url, PHASE4_P1_PILOT_OFFICIAL_URLS[9]);
+    const beforeRepeat = (await value.database.query('SELECT COUNT(*)::int AS count FROM candidates')).rows[0].count;
+    await assert.rejects(
+      () => collectChinaTaxPolicyCandidates({
+        repository: value.repository,
+        urls: firstNine.map((item) => item.officialUrl),
+        expectedItems,
+        batchManifest: manifest,
+        fetchImpl: async (url) => new Response(pages.get(String(url)), { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } })
+      }),
+      (error) => error?.code === 'PILOT_EXISTING_EVIDENCE_CONFLICT'
+    );
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM candidates')).rows[0].count, beforeRepeat);
+    assert.equal((await value.database.query('SELECT COUNT(*)::int AS count FROM policies')).rows[0].count, 0);
+  } finally { await dispose(value); }
+});
+
 test('Phase 4 protected candidate route returns a safe 409 and zero writes when a pre-write hash changes', async () => {
   const value = await fixture();
   const previous = process.env.NETLIFY_TAXKB_ADMIN_TOKEN;
   process.env.NETLIFY_TAXKB_ADMIN_TOKEN = 'phase4-prewrite-token';
   try {
+    const firstNine = firstNineBatchFixture();
+    const expectedItems = firstNine.map((item) => expectedItem(item.officialUrl, item.title, item.documentNumber, item.content));
+    const mismatchedExpectedItems = [{ ...expectedItems[0], body_hash: 'f'.repeat(64) }, ...expectedItems.slice(1)];
+    const batchManifest = buildPhase4P1FirstNineBatchManifest(mismatchedExpectedItems);
     const handler = createEvidenceAdminHandler({
       repositoryFactory: () => value.repository,
-      fetchImpl: async () => new Response(page('国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), { status: 200, headers: { 'content-type': 'text/html' } })
+      fetchImpl: async (url) => {
+        const item = firstNine.find((entry) => entry.officialUrl === String(url));
+        return new Response(page(item.title, item.documentNumber, item.content), { status: 200, headers: { 'content-type': 'text/html' } });
+      }
     });
     const response = await handler(new Request('https://taxkb.test/api/admin/evidence/sources/chinatax/candidates', {
       method: 'POST',
@@ -417,8 +479,9 @@ test('Phase 4 protected candidate route returns a safe 409 and zero writes when 
       body: JSON.stringify({
         apply: true,
         confirmation: PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION,
-        official_urls: [primaryUrl],
-        expected_items: [{ ...expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号'), body_hash: 'f'.repeat(64) }]
+        official_urls: firstNine.map((item) => item.officialUrl),
+        expected_items: mismatchedExpectedItems,
+        batch_manifest: batchManifest
       })
     }), '/api/admin/evidence/sources/chinatax/candidates', new URL('https://taxkb.test/api/admin/evidence/sources/chinatax/candidates'));
     assert.equal(response.status, 409);
@@ -428,10 +491,10 @@ test('Phase 4 protected candidate route returns a safe 409 and zero writes when 
     assert.equal(rejected.business_production_writes, 0);
     assert.equal(rejected.partial_write_detected, false);
     assert.equal(rejected.mismatch.ordinal, 1);
-    assert.equal(rejected.mismatch.official_url, primaryUrl);
+    assert.equal(rejected.mismatch.official_url, firstNine[0].officialUrl);
     assert.equal(rejected.mismatch.mismatch_reason, 'BODY_HASH_MISMATCH');
     assert.equal(rejected.mismatch.expected.body_hash, 'f'.repeat(64));
-    assert.equal(rejected.mismatch.actual.policy_title, '国家税务总局关于增值税测试事项的公告');
+    assert.equal(rejected.mismatch.actual.policy_title, firstNine[0].title);
     assert.equal(rejected.mismatch.actual.document_number, '国家税务总局公告2026年第1号');
     assert.equal(rejected.mismatch.actual.publication_date, '2026-09-01');
     for (const table of ['collection_runs', 'raw_snapshots', 'candidates', 'candidate_risk_assessments', 'candidate_relation_proposals']) {
@@ -698,9 +761,10 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
       discoveryOptions = options;
       return { mode: 'dry-run', candidates: [{ official_url: primaryUrl, title: '安全摘要' }], writes: { raw_snapshots: 0, candidates: 0, policies: 0, netlify_blobs: 0 } };
     },
-    chinaTaxCandidateCollector: async ({ urls, expectedItems }) => {
+    chinaTaxCandidateCollector: async ({ urls, expectedItems, batchManifest }) => {
       intakeCalls += 1;
       assert.equal(expectedItems.length, urls.length);
+      assert.equal(batchManifest.batch_id, 'test-batch');
       return { selected_count: urls.length, created: { raw_snapshots: 1, candidates: 1, policies: 0, policy_versions: 0, public_projections: 0 } };
     }
   });
@@ -723,7 +787,7 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
     assert.equal(discoveryOptions.maxPages, 5);
 
     const rejected = await invoke('/api/admin/evidence/sources/chinatax/candidates', {
-      method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN, body: { apply: true, confirmation: 'wrong', official_urls: [primaryUrl], expected_items: [] }
+      method: 'POST', token: process.env.NETLIFY_TAXKB_ADMIN_TOKEN, body: { apply: true, confirmation: 'wrong', official_urls: [primaryUrl], expected_items: [], batch_manifest: {} }
     });
     assert.equal(rejected.status, 400);
     assert.equal(intakeCalls, 0);
@@ -734,7 +798,8 @@ test('Phase 4 STA discovery 只读且 Candidate intake 需要固定确认，不�
         apply: true,
         confirmation: PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION,
         official_urls: [primaryUrl],
-        expected_items: [expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号')]
+        expected_items: [expectedItem(primaryUrl, '国家税务总局关于增值税测试事项的公告', '国家税务总局公告2026年第1号')],
+        batch_manifest: { batch_id: 'test-batch' }
       }
     });
     const intakeBody = await intake.json();

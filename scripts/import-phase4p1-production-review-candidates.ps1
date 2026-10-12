@@ -23,6 +23,9 @@ $publicPoliciesUrl = "$productionOrigin/api/policies?limit=1&offset=0"
 $confirmationPhrase = 'INGEST_PHASE4_STA_REVIEW_CANDIDATES'
 $expectedSourceId = 'source-sta-policy-regulations'
 $expectedSourceDomain = 'fgk.chinatax.gov.cn'
+$firstNineBatchId = 'phase4-p1-first-nine-review-candidates-v1'
+$excludedPilotUrl = 'https://fgk.chinatax.gov.cn/zcfgk/c102416/c5247077/content.html'
+$excludedPilotReason = 'POLICY_BODY_CONTAINER_MISSING'
 $expectedOfficialUrls = @(
   'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5246538/content.html',
   'https://fgk.chinatax.gov.cn/zcfgk/c100012/c5247426/content.html',
@@ -108,8 +111,8 @@ function Read-GuiSecureString {
 }
 
 function Confirm-ProductionCandidateImport {
-  param([Parameter(Mandatory = $true)][int]$ReadyCount, [Parameter(Mandatory = $true)][int]$SkippedCount)
-  $message = "下一步将向 Production 写入 Candidate/Evidence 审核数据，但不会公开政策。`n`n固定批次：10 条官方 URL；本次可导入 $ReadyCount 条，已明确跳过 $SkippedCount 条失败项。`n将创建 Raw Snapshot、Candidate、风险和关系提案；不会创建 Policy、Policy Version 或公开投影。`n`n是否继续执行唯一一次导入？"
+  param([Parameter(Mandatory = $true)][int]$ReadyCount, [Parameter(Mandatory = $true)][int]$SkippedCount, [Parameter(Mandatory = $true)][string]$BatchHash)
+  $message = "下一步将向 Production 写入 Candidate/Evidence 审核数据，但不会公开政策。`n`n固定独立批次：前 9 条官方 URL；第 10 条保持排除。`n本次可导入 $ReadyCount 条，已明确跳过 $SkippedCount 条失败项。`n批次哈希：$BatchHash`n将创建 Raw Snapshot、Candidate、风险和关系提案；不会创建 Policy、Policy Version 或公开投影。`n`n是否继续执行唯一一次导入？"
   $choice = [System.Windows.Forms.MessageBox]::Show(
     $message,
     'Phase 4 P1 - 最终人工确认',
@@ -129,6 +132,17 @@ function Safe-Number {
   param($Value)
   if ($null -eq $Value) { return 0 }
   try { return [int]$Value } catch { return 0 }
+}
+
+function Get-Sha256Hex {
+  param([Parameter(Mandatory = $true)][string]$Text)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+  } finally {
+    $sha.Dispose()
+  }
 }
 
 function Short-Summary {
@@ -274,7 +288,11 @@ function Get-DryRunImportDecision {
     if (@($candidate.risk_flags | Where-Object { [string]$_ -match '^DUPLICATE_' }).Count -gt 0) { $blocked = $true; continue }
     $ready += $candidate
   }
-  if ($ready.Count -lt 9 -or $ready.Count -gt 10 -or $skipped.Count -gt 1) { $blocked = $true }
+  $firstNineUrls = @($expectedOfficialUrls[0..8])
+  $readyUrls = @($ready | ForEach-Object { [string]$_.official_url } | Sort-Object -Unique)
+  $expectedFirstNineUrls = @($firstNineUrls | Sort-Object -Unique)
+  $excluded = @($skipped | Where-Object { [string]$_.official_url -eq $excludedPilotUrl -and [string]$_.dry_run_error -eq $excludedPilotReason })
+  if ($ready.Count -ne 9 -or $skipped.Count -ne 1 -or $excluded.Count -ne 1 -or (@(Compare-Object -ReferenceObject $expectedFirstNineUrls -DifferenceObject $readyUrls).Count -ne 0)) { $blocked = $true }
   return [pscustomobject]@{ ready = (-not $blocked); import_candidates = @($ready); skipped_candidates = @($skipped) }
 }
 
@@ -303,6 +321,27 @@ function Get-ExpectedImportItems {
     }
   }
   return $items
+}
+
+function New-FirstNineBatchManifest {
+  param([Parameter(Mandatory = $true)][object[]]$Candidates)
+  $items = @(Get-ExpectedImportItems -Candidates $Candidates)
+  $batchUrls = @($expectedOfficialUrls[0..8])
+  if ($items.Count -ne 9 -or (@(Compare-Object -ReferenceObject ($batchUrls | Sort-Object) -DifferenceObject ($items | ForEach-Object { $_.official_url } | Sort-Object)).Count -ne 0)) {
+    throw [System.InvalidOperationException]::new('first_nine_batch_url_set_invalid')
+  }
+  $itemsByUrl = @{}
+  foreach ($item in $items) { $itemsByUrl[[string]$item.official_url] = $item }
+  $orderedItems = @($batchUrls | ForEach-Object { $itemsByUrl[$_] })
+  $serialized = (($orderedItems | ForEach-Object { "$($_.official_url)$([char]31)$($_.body_hash)$([char]31)$($_.policy_title)$([char]31)$($_.document_number)$([char]31)$($_.publication_date)" }) -join "`n")
+  $batchHash = Get-Sha256Hex -Text "$firstNineBatchId`n$excludedPilotUrl`n$excludedPilotReason`n$serialized"
+  return [ordered]@{
+    batch_id = $firstNineBatchId
+    item_count = $orderedItems.Count
+    items = @($orderedItems)
+    excluded_item = [ordered]@{ ordinal = 10; official_url = $excludedPilotUrl; reason = $excludedPilotReason }
+    batch_hash = $batchHash
+  }
 }
 
 function Get-Json {
@@ -361,6 +400,9 @@ function Safe-ImportCandidate {
     verification_state = $ListedCandidate.verification_state
     legal_status = $ListedCandidate.legal_status
     validity_status_suggestion = $ListedCandidate.parsed_fields.validity_status_suggestion
+    stored_title = $ListedCandidate.parsed_fields.title
+    stored_document_number = $ListedCandidate.parsed_fields.document_no
+    stored_publication_date = $ListedCandidate.parsed_fields.publish_date
     risk_level = $Result.risk_level
     relation_proposals_created = Safe-Number $Result.relation_proposals_created
     duplicate = -not [bool]$Result.candidate_created
@@ -507,11 +549,13 @@ function Invoke-Phase4P1ProductionImport {
     }
     if ($DryRunOnly) {
       $expectedItems = Get-ExpectedImportItems -Candidates @($dryRunDecision.import_candidates)
+      $batchManifest = New-FirstNineBatchManifest -Candidates @($dryRunDecision.import_candidates)
       Write-SafeJson ([ordered]@{
         event = 'phase4p1_production_dry_run'
         execution = 'DRY_RUN_ONLY'
         expected_items = @($expectedItems)
         expected_item_count = @($expectedItems).Count
+        batch_manifest = $batchManifest
         prewrite_consistency_gate = 'pending_revalidation_before_any_write'
         production_post_sent = $false
         business_production_writes = 0
@@ -523,7 +567,8 @@ function Invoke-Phase4P1ProductionImport {
     $beforeCounts = Get-StatusCounts -Headers $headers
     $beforePublicPolicies = Get-PublicPolicyTotal
     $stage = 'human_confirmation'
-    if (-not (Confirm-ProductionCandidateImport -ReadyCount @($dryRunDecision.import_candidates).Count -SkippedCount @($dryRunDecision.skipped_candidates).Count)) {
+    $batchManifest = New-FirstNineBatchManifest -Candidates @($dryRunDecision.import_candidates)
+    if (-not (Confirm-ProductionCandidateImport -ReadyCount @($dryRunDecision.import_candidates).Count -SkippedCount @($dryRunDecision.skipped_candidates).Count -BatchHash $batchManifest.batch_hash)) {
       Write-SafeJson ([ordered]@{ event = 'phase4p1_production_import'; execution = 'cancelled_by_operator'; production_post_sent = $false; business_production_writes = 0 })
       return
     }
@@ -535,6 +580,7 @@ function Invoke-Phase4P1ProductionImport {
       confirmation = $confirmationPhrase
       official_urls = @($expectedItems | ForEach-Object { $_.official_url })
       expected_items = @($expectedItems)
+      batch_manifest = $batchManifest
     } | ConvertTo-Json -Depth 4 -Compress
     $productionPostSent = $true
     $importResponse = Invoke-WebRequest -Method Post -Uri $importUrl -Headers $headers -ContentType 'application/json' -Body $requestBody -UseBasicParsing -ErrorAction Stop
@@ -557,6 +603,7 @@ function Invoke-Phase4P1ProductionImport {
       $listedCandidate = $listedById[[string]$result.candidate_id]
       if ($null -eq $dryRunCandidate -or $null -eq $listedCandidate) { throw [System.InvalidOperationException]::new('post_import_candidate_missing') }
       if ($listedCandidate.verification_state -ne 'pending_review' -or $listedCandidate.legal_status -ne 'pending' -or $listedCandidate.parsed_fields.validity_status_suggestion -ne 'pending_verification') { throw [System.InvalidOperationException]::new('post_import_candidate_state_not_pending') }
+      if ($listedCandidate.parsed_fields.title -ne $dryRunCandidate.policy_title -or $listedCandidate.parsed_fields.document_no -ne $dryRunCandidate.document_number -or $listedCandidate.parsed_fields.publish_date -ne $dryRunCandidate.publication_date) { throw [System.InvalidOperationException]::new('post_import_stored_metadata_mismatch') }
       $traceUrl = "$productionOrigin/api/admin/evidence/candidates/$([uri]::EscapeDataString([string]$result.candidate_id))/trace"
       $trace = (Get-Json -Uri $traceUrl -Headers $headers).body.trace
       if ($trace.snapshot.official_url -ne $officialUrl -or $trace.snapshot.normalized_text_sha256 -ne $dryRunCandidate.body_hash) { throw [System.InvalidOperationException]::new('post_import_evidence_trace_mismatch') }
@@ -568,6 +615,7 @@ function Invoke-Phase4P1ProductionImport {
       event = 'phase4p1_production_candidate_evidence_import'
       http_status = [int]$importResponse.StatusCode
       execution = 'completed'
+      batch_manifest = $batchManifest
       candidates = $accepted
       writes = [ordered]@{
         raw_snapshots_created = (Safe-Number $afterCounts.raw_snapshots) - (Safe-Number $beforeCounts.raw_snapshots)

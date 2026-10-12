@@ -725,13 +725,14 @@ export function createEvidenceAdminHandler({ repositoryFactory = defaultReposito
     if (request.method === 'POST' && pathname === '/api/admin/evidence/sources/chinatax/candidates') {
       const input = await requestBody(request);
       if (!input || typeof input !== 'object' || Array.isArray(input)
-        || Object.keys(input).length !== 4 || input.apply !== true
+        || Object.keys(input).length !== 5 || input.apply !== true
         || input.confirmation !== PHASE4_STA_CANDIDATE_INGEST_CONFIRMATION
-        || !Array.isArray(input.official_urls) || !Array.isArray(input.expected_items)) {
-        return json({ error: 'Phase 4 官方 Candidate 收集只接受已验证的官方详情 URL、正文哈希、固定 apply 与确认短语；不会创建 Policy 或公开投影。' }, 400);
+        || !Array.isArray(input.official_urls) || !Array.isArray(input.expected_items)
+        || !input.batch_manifest || typeof input.batch_manifest !== 'object' || Array.isArray(input.batch_manifest)) {
+        return json({ error: 'Phase 4 官方 Candidate 收集只接受固定九条批次清单、已验证的官方详情 URL、正文哈希、固定 apply 与确认短语；不会创建 Policy 或公开投影。' }, 400);
       }
       try {
-        const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls, expectedItems: input.expected_items });
+        const result = await chinaTaxCandidateCollector({ repository: repositoryFactory(), fetchImpl, urls: input.official_urls, expectedItems: input.expected_items, batchManifest: input.batch_manifest });
         return json({ mode: 'review_candidate_intake', ...result }, 201);
       } catch (error) {
         if (error instanceof ChinaTaxCandidatePrewriteValidationError || /^PILOT_/.test(String(error?.code || ''))) {
